@@ -4,7 +4,7 @@
  *	  WAL replay logic for GiST.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -16,9 +16,12 @@
 #include "access/bufmask.h"
 #include "access/gist_private.h"
 #include "access/gistxlog.h"
+#include "access/transam.h"
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
+#include "storage/standby.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
 
 static MemoryContext opCtx;		/* working memory for operations */
 
@@ -76,11 +79,11 @@ gistRedoPageUpdateRecord(XLogReaderState *record)
 		char	   *begin;
 		char	   *data;
 		Size		datalen;
-		int			ninserted = 0;
+		int			ninserted PG_USED_FOR_ASSERTS_ONLY = 0;
 
 		data = begin = XLogRecGetBlockData(record, 0, &datalen);
 
-		page = (Page) BufferGetPage(buffer);
+		page = BufferGetPage(buffer);
 
 		if (xldata->ntodelete == 1 && xldata->ntoinsert == 1)
 		{
@@ -95,9 +98,8 @@ gistRedoPageUpdateRecord(XLogReaderState *record)
 			data += sizeof(OffsetNumber);
 			itup = (IndexTuple) data;
 			itupsize = IndexTupleSize(itup);
-			if (!PageIndexTupleOverwrite(page, offnum, (Item) itup, itupsize))
-				elog(ERROR, "failed to add item to GiST index page, size %d bytes",
-					 (int) itupsize);
+			if (!PageIndexTupleOverwrite(page, offnum, itup, itupsize))
+				elog(ERROR, "failed to add item to GiST index page, size %zu bytes", itupsize);
 			data += itupsize;
 			/* should be nothing left after consuming 1 tuple */
 			Assert(data - begin == datalen);
@@ -112,15 +114,13 @@ gistRedoPageUpdateRecord(XLogReaderState *record)
 			data += sizeof(OffsetNumber) * xldata->ntodelete;
 
 			PageIndexMultiDelete(page, todelete, xldata->ntodelete);
-			if (GistPageIsLeaf(page))
-				GistMarkTuplesDeleted(page);
 		}
 
 		/* Add new tuples if any */
 		if (data - begin < datalen)
 		{
 			OffsetNumber off = (PageIsEmpty(page)) ? FirstOffsetNumber :
-			OffsetNumberNext(PageGetMaxOffsetNumber(page));
+				OffsetNumberNext(PageGetMaxOffsetNumber(page));
 
 			while (data - begin < datalen)
 			{
@@ -130,10 +130,9 @@ gistRedoPageUpdateRecord(XLogReaderState *record)
 
 				data += sz;
 
-				l = PageAddItem(page, (Item) itup, sz, off, false, false);
+				l = PageAddItem(page, itup, sz, off, false, false);
 				if (l == InvalidOffsetNumber)
-					elog(ERROR, "failed to add item to GiST index page, size %d bytes",
-						 (int) sz);
+					elog(ERROR, "failed to add item to GiST index page, size %zu bytes", sz);
 				off++;
 				ninserted++;
 			}
@@ -160,6 +159,58 @@ gistRedoPageUpdateRecord(XLogReaderState *record)
 		UnlockReleaseBuffer(buffer);
 }
 
+
+/*
+ * redo delete on gist index page to remove tuples marked as DEAD during index
+ * tuple insertion
+ */
+static void
+gistRedoDeleteRecord(XLogReaderState *record)
+{
+	XLogRecPtr	lsn = record->EndRecPtr;
+	gistxlogDelete *xldata = (gistxlogDelete *) XLogRecGetData(record);
+	Buffer		buffer;
+	Page		page;
+	OffsetNumber *toDelete = xldata->offsets;
+
+	/*
+	 * If we have any conflict processing to do, it must happen before we
+	 * update the page.
+	 *
+	 * GiST delete records can conflict with standby queries.  You might think
+	 * that vacuum records would conflict as well, but we've handled that
+	 * already.  XLOG_HEAP2_PRUNE_VACUUM_SCAN records provide the highest xid
+	 * cleaned by the vacuum of the heap and so we can resolve any conflicts
+	 * just once when that arrives.  After that we know that no conflicts
+	 * exist from individual gist vacuum records on that index.
+	 */
+	if (InHotStandby)
+	{
+		RelFileLocator rlocator;
+
+		XLogRecGetBlockTag(record, 0, &rlocator, NULL, NULL);
+
+		ResolveRecoveryConflictWithSnapshot(xldata->snapshotConflictHorizon,
+											xldata->isCatalogRel,
+											rlocator);
+	}
+
+	if (XLogReadBufferForRedo(record, 0, &buffer) == BLK_NEEDS_REDO)
+	{
+		page = BufferGetPage(buffer);
+
+		PageIndexMultiDelete(page, toDelete, xldata->ntodelete);
+
+		GistClearPageHasGarbage(page);
+
+		PageSetLSN(page, lsn);
+		MarkBufferDirty(buffer);
+	}
+
+	if (BufferIsValid(buffer))
+		UnlockReleaseBuffer(buffer);
+}
+
 /*
  * Returns an array of index pointers.
  */
@@ -174,7 +225,7 @@ decodePageSplitRecord(char *begin, int len, int *n)
 	memcpy(n, begin, sizeof(int));
 	ptr = begin + sizeof(int);
 
-	tuples = palloc(*n * sizeof(IndexTuple));
+	tuples = palloc_array(IndexTuple, *n);
 
 	for (i = 0; i < *n; i++)
 	{
@@ -224,7 +275,7 @@ gistRedoPageSplitRecord(XLogReaderState *record)
 		}
 
 		buffer = XLogInitBufferForRedo(record, i + 1);
-		page = (Page) BufferGetPage(buffer);
+		page = BufferGetPage(buffer);
 		data = XLogRecGetBlockData(record, i + 1, &datalen);
 
 		tuples = decodePageSplitRecord(data, datalen, &num);
@@ -281,23 +332,60 @@ gistRedoPageSplitRecord(XLogReaderState *record)
 	UnlockReleaseBuffer(firstbuffer);
 }
 
+/* redo page deletion */
 static void
-gistRedoCreateIndex(XLogReaderState *record)
+gistRedoPageDelete(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
-	Buffer		buffer;
-	Page		page;
+	gistxlogPageDelete *xldata = (gistxlogPageDelete *) XLogRecGetData(record);
+	Buffer		parentBuffer;
+	Buffer		leafBuffer;
 
-	buffer = XLogInitBufferForRedo(record, 0);
-	Assert(BufferGetBlockNumber(buffer) == GIST_ROOT_BLKNO);
-	page = (Page) BufferGetPage(buffer);
+	if (XLogReadBufferForRedo(record, 0, &leafBuffer) == BLK_NEEDS_REDO)
+	{
+		Page		page = BufferGetPage(leafBuffer);
 
-	GISTInitBuffer(buffer, F_LEAF);
+		GistPageSetDeleted(page, xldata->deleteXid);
 
-	PageSetLSN(page, lsn);
+		PageSetLSN(page, lsn);
+		MarkBufferDirty(leafBuffer);
+	}
 
-	MarkBufferDirty(buffer);
-	UnlockReleaseBuffer(buffer);
+	if (XLogReadBufferForRedo(record, 1, &parentBuffer) == BLK_NEEDS_REDO)
+	{
+		Page		page = BufferGetPage(parentBuffer);
+
+		PageIndexTupleDelete(page, xldata->downlinkOffset);
+
+		PageSetLSN(page, lsn);
+		MarkBufferDirty(parentBuffer);
+	}
+
+	if (BufferIsValid(parentBuffer))
+		UnlockReleaseBuffer(parentBuffer);
+	if (BufferIsValid(leafBuffer))
+		UnlockReleaseBuffer(leafBuffer);
+}
+
+static void
+gistRedoPageReuse(XLogReaderState *record)
+{
+	gistxlogPageReuse *xlrec = (gistxlogPageReuse *) XLogRecGetData(record);
+
+	/*
+	 * PAGE_REUSE records exist to provide a conflict point when we reuse
+	 * pages in the index via the FSM.  That's all they do though.
+	 *
+	 * snapshotConflictHorizon was the page's deleteXid.  The
+	 * GlobalVisCheckRemovableFullXid(deleteXid) test in gistPageRecyclable()
+	 * conceptually mirrors the PGPROC->xmin > limitXmin test in
+	 * GetConflictingVirtualXIDs().  Consequently, one XID value achieves the
+	 * same exclusion effect on primary and standby.
+	 */
+	if (InHotStandby)
+		ResolveRecoveryConflictWithSnapshotFullXid(xlrec->snapshotConflictHorizon,
+												   xlrec->isCatalogRel,
+												   xlrec->locator);
 }
 
 void
@@ -318,11 +406,17 @@ gist_redo(XLogReaderState *record)
 		case XLOG_GIST_PAGE_UPDATE:
 			gistRedoPageUpdateRecord(record);
 			break;
+		case XLOG_GIST_DELETE:
+			gistRedoDeleteRecord(record);
+			break;
+		case XLOG_GIST_PAGE_REUSE:
+			gistRedoPageReuse(record);
+			break;
 		case XLOG_GIST_PAGE_SPLIT:
 			gistRedoPageSplitRecord(record);
 			break;
-		case XLOG_GIST_CREATE_INDEX:
-			gistRedoCreateIndex(record);
+		case XLOG_GIST_PAGE_DELETE:
+			gistRedoPageDelete(record);
 			break;
 		default:
 			elog(PANIC, "gist_redo: unknown op code %u", info);
@@ -391,12 +485,12 @@ gist_mask(char *pagedata, BlockNumber blkno)
  */
 XLogRecPtr
 gistXLogSplit(bool page_is_leaf,
-			  SplitedPageLayout *dist,
+			  SplitPageLayout *dist,
 			  BlockNumber origrlink, GistNSN orignsn,
 			  Buffer leftchildbuf, bool markfollowright)
 {
 	gistxlogPageSplit xlrec;
-	SplitedPageLayout *ptr;
+	SplitPageLayout *ptr;
 	int			npage = 0;
 	XLogRecPtr	recptr;
 	int			i;
@@ -426,20 +520,72 @@ gistXLogSplit(bool page_is_leaf,
 	 * of buffer or data registrations here, make sure you modify the
 	 * XLogEnsureRecordSpace() calls accordingly!
 	 */
-	XLogRegisterData((char *) &xlrec, sizeof(gistxlogPageSplit));
+	XLogRegisterData(&xlrec, sizeof(gistxlogPageSplit));
 
 	i = 1;
 	for (ptr = dist; ptr; ptr = ptr->next)
 	{
 		XLogRegisterBuffer(i, ptr->buffer, REGBUF_WILL_INIT);
-		XLogRegisterBufData(i, (char *) &(ptr->block.num), sizeof(int));
-		XLogRegisterBufData(i, (char *) ptr->list, ptr->lenlist);
+		XLogRegisterBufData(i, &(ptr->block.num), sizeof(int));
+		XLogRegisterBufData(i, ptr->list, ptr->lenlist);
 		i++;
 	}
 
 	recptr = XLogInsert(RM_GIST_ID, XLOG_GIST_PAGE_SPLIT);
 
 	return recptr;
+}
+
+/*
+ * Write XLOG record describing a page deletion. This also includes removal of
+ * downlink from the parent page.
+ */
+XLogRecPtr
+gistXLogPageDelete(Buffer buffer, FullTransactionId xid,
+				   Buffer parentBuffer, OffsetNumber downlinkOffset)
+{
+	gistxlogPageDelete xlrec;
+	XLogRecPtr	recptr;
+
+	xlrec.deleteXid = xid;
+	xlrec.downlinkOffset = downlinkOffset;
+
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, SizeOfGistxlogPageDelete);
+
+	XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
+	XLogRegisterBuffer(1, parentBuffer, REGBUF_STANDARD);
+
+	recptr = XLogInsert(RM_GIST_ID, XLOG_GIST_PAGE_DELETE);
+
+	return recptr;
+}
+
+/*
+ * Write XLOG record about reuse of a deleted page.
+ */
+void
+gistXLogPageReuse(Relation rel, Relation heaprel,
+				  BlockNumber blkno, FullTransactionId deleteXid)
+{
+	gistxlogPageReuse xlrec_reuse;
+
+	/*
+	 * Note that we don't register the buffer with the record, because this
+	 * operation doesn't modify the page. This record only exists to provide a
+	 * conflict point for Hot Standby.
+	 */
+
+	/* XLOG stuff */
+	xlrec_reuse.isCatalogRel = RelationIsAccessibleInLogicalDecoding(heaprel);
+	xlrec_reuse.locator = rel->rd_locator;
+	xlrec_reuse.block = blkno;
+	xlrec_reuse.snapshotConflictHorizon = deleteXid;
+
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec_reuse, SizeOfGistxlogPageReuse);
+
+	XLogInsert(RM_GIST_ID, XLOG_GIST_PAGE_REUSE);
 }
 
 /*
@@ -467,14 +613,14 @@ gistXLogUpdate(Buffer buffer,
 	xlrec.ntoinsert = ituplen;
 
 	XLogBeginInsert();
-	XLogRegisterData((char *) &xlrec, sizeof(gistxlogPageUpdate));
+	XLogRegisterData(&xlrec, sizeof(gistxlogPageUpdate));
 
 	XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
-	XLogRegisterBufData(0, (char *) todelete, sizeof(OffsetNumber) * ntodelete);
+	XLogRegisterBufData(0, todelete, sizeof(OffsetNumber) * ntodelete);
 
 	/* new tuples */
 	for (i = 0; i < ituplen; i++)
-		XLogRegisterBufData(0, (char *) (itup[i]), IndexTupleSize(itup[i]));
+		XLogRegisterBufData(0, itup[i], IndexTupleSize(itup[i]));
 
 	/*
 	 * Include a full page image of the child buf. (only necessary if a
@@ -484,6 +630,40 @@ gistXLogUpdate(Buffer buffer,
 		XLogRegisterBuffer(1, leftchildbuf, REGBUF_STANDARD);
 
 	recptr = XLogInsert(RM_GIST_ID, XLOG_GIST_PAGE_UPDATE);
+
+	return recptr;
+}
+
+/*
+ * Write XLOG record describing a delete of leaf index tuples marked as DEAD
+ * during new tuple insertion.  One may think that this case is already covered
+ * by gistXLogUpdate().  But deletion of index tuples might conflict with
+ * standby queries and needs special handling.
+ */
+XLogRecPtr
+gistXLogDelete(Buffer buffer, OffsetNumber *todelete, int ntodelete,
+			   TransactionId snapshotConflictHorizon, Relation heaprel)
+{
+	gistxlogDelete xlrec;
+	XLogRecPtr	recptr;
+
+	xlrec.isCatalogRel = RelationIsAccessibleInLogicalDecoding(heaprel);
+	xlrec.snapshotConflictHorizon = snapshotConflictHorizon;
+	xlrec.ntodelete = ntodelete;
+
+	XLogBeginInsert();
+	XLogRegisterData(&xlrec, SizeOfGistxlogDelete);
+
+	/*
+	 * We need the target-offsets array whether or not we store the whole
+	 * buffer, to allow us to find the snapshotConflictHorizon on a standby
+	 * server.
+	 */
+	XLogRegisterData(todelete, ntodelete * sizeof(OffsetNumber));
+
+	XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
+
+	recptr = XLogInsert(RM_GIST_ID, XLOG_GIST_DELETE);
 
 	return recptr;
 }

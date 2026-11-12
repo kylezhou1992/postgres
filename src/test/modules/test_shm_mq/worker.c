@@ -9,7 +9,7 @@
  *		but it should be possible to use much of the control logic just
  *		as presented here.
  *
- * Copyright (c) 2013-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2013-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/test/modules/test_shm_mq/worker.c
@@ -21,16 +21,18 @@
 
 #include "miscadmin.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
+#include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/shm_mq.h"
 #include "storage/shm_toc.h"
+#include "tcop/tcopprot.h"
 
 #include "test_shm_mq.h"
 
-static void handle_sigterm(SIGNAL_ARGS);
 static void attach_to_queues(dsm_segment *seg, shm_toc *toc,
-				 int myworkernumber, shm_mq_handle **inqhp,
-				 shm_mq_handle **outqhp);
+							 int myworkernumber, shm_mq_handle **inqhp,
+							 shm_mq_handle **outqhp);
 static void copy_messages(shm_mq_handle *inqh, shm_mq_handle *outqh);
 
 /*
@@ -50,18 +52,11 @@ test_shm_mq_main(Datum main_arg)
 	shm_toc    *toc;
 	shm_mq_handle *inqh;
 	shm_mq_handle *outqh;
-	volatile test_shm_mq_header *hdr;
+	test_shm_mq_header *hdr;
 	int			myworkernumber;
 	PGPROC	   *registrant;
 
-	/*
-	 * Establish signal handlers.
-	 *
-	 * We want CHECK_FOR_INTERRUPTS() to kill off this worker process just as
-	 * it would a normal user backend.  To make that happen, we establish a
-	 * signal handler that is a stripped-down version of die().
-	 */
-	pqsignal(SIGTERM, handle_sigterm);
+	/* Unblock signals.  The standard signal handlers are OK for us. */
 	BackgroundWorkerUnblockSignals();
 
 	/*
@@ -78,7 +73,7 @@ test_shm_mq_main(Datum main_arg)
 	 * exit, which is fine.  If there were a ResourceOwner, it would acquire
 	 * ownership of the mapping, but we have no need for that.
 	 */
-	seg = dsm_attach(DatumGetInt32(main_arg));
+	seg = dsm_attach(DatumGetUInt32(main_arg));
 	if (seg == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -191,29 +186,8 @@ copy_messages(shm_mq_handle *inqh, shm_mq_handle *outqh)
 			break;
 
 		/* Send it back out. */
-		res = shm_mq_send(outqh, len, data, false);
+		res = shm_mq_send(outqh, len, data, false, true);
 		if (res != SHM_MQ_SUCCESS)
 			break;
 	}
-}
-
-/*
- * When we receive a SIGTERM, we set InterruptPending and ProcDiePending just
- * like a normal backend.  The next CHECK_FOR_INTERRUPTS() will do the right
- * thing.
- */
-static void
-handle_sigterm(SIGNAL_ARGS)
-{
-	int			save_errno = errno;
-
-	SetLatch(MyLatch);
-
-	if (!proc_exit_inprogress)
-	{
-		InterruptPending = true;
-		ProcDiePending = true;
-	}
-
-	errno = save_errno;
 }

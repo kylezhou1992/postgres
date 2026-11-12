@@ -35,15 +35,34 @@ include $(top_builddir)/src/Makefile.global
 override CPPFLAGS := -I$(top_builddir)/src/port -DFRONTEND $(CPPFLAGS)
 LIBS += $(PTHREAD_LIBS)
 
-OBJS = $(LIBOBJS) $(PG_CRC32C_OBJS) chklocale.o erand48.o inet_net_ntop.o \
-	noblock.o path.o pgcheckdir.o pgmkdirp.o pgsleep.o \
-	pgstrcasecmp.o pqsignal.o \
-	qsort.o qsort_arg.o quotes.o snprintf.o sprompt.o strerror.o \
-	tar.o thread.o
-
-ifeq ($(enable_strong_random), yes)
-OBJS += pg_strong_random.o
-endif
+OBJS = \
+	$(LIBOBJS) \
+	$(PG_CRC32C_OBJS) \
+	bsearch_arg.o \
+	chklocale.o \
+	inet_net_ntop.o \
+	noblock.o \
+	path.o \
+	pg_bitutils.o \
+	pg_cpu_x86.o \
+	pg_getopt_ctx.o \
+	pg_localeconv_r.o \
+	pg_numa.o \
+	pg_popcount_aarch64.o \
+	pg_popcount_x86.o \
+	pg_strong_random.o \
+	pgcheckdir.o \
+	pgmkdirp.o \
+	pgsleep.o \
+	pgstrcasecmp.o \
+	pgstrsignal.o \
+	pqsignal.o \
+	qsort.o \
+	qsort_arg.o \
+	quotes.o \
+	snprintf.o \
+	strerror.o \
+	tar.o
 
 # libpgport.a, libpgport_shlib.a, and libpgport_srv.a contain the same files
 # foo.o, foo_shlib.o, and foo_srv.o are all built from foo.c
@@ -68,19 +87,10 @@ libpgport.a: $(OBJS)
 	rm -f $@
 	$(AR) $(AROPT) $@ $^
 
-# thread.o and thread_shlib.o need PTHREAD_CFLAGS (but thread_srv.o does not)
-thread.o: CFLAGS+=$(PTHREAD_CFLAGS)
-thread_shlib.o: CFLAGS+=$(PTHREAD_CFLAGS)
-
-# all versions of pg_crc32c_sse42.o need CFLAGS_SSE42
-pg_crc32c_sse42.o: CFLAGS+=$(CFLAGS_SSE42)
-pg_crc32c_sse42_shlib.o: CFLAGS+=$(CFLAGS_SSE42)
-pg_crc32c_sse42_srv.o: CFLAGS+=$(CFLAGS_SSE42)
-
-# all versions of pg_crc32c_armv8.o need CFLAGS_ARMV8_CRC32C
-pg_crc32c_armv8.o: CFLAGS+=$(CFLAGS_ARMV8_CRC32C)
-pg_crc32c_armv8_shlib.o: CFLAGS+=$(CFLAGS_ARMV8_CRC32C)
-pg_crc32c_armv8_srv.o: CFLAGS+=$(CFLAGS_ARMV8_CRC32C)
+# all versions of pg_crc32c_armv8.o need CFLAGS_CRC
+pg_crc32c_armv8.o: CFLAGS+=$(CFLAGS_CRC)
+pg_crc32c_armv8_shlib.o: CFLAGS+=$(CFLAGS_CRC)
+pg_crc32c_armv8_srv.o: CFLAGS+=$(CFLAGS_CRC)
 
 #
 # Shared library versions of object files
@@ -142,6 +152,6 @@ pg_config_paths.h: $(top_builddir)/src/Makefile.global
 	echo "#define HTMLDIR \"$(htmldir)\"" >>$@
 	echo "#define MANDIR \"$(mandir)\"" >>$@
 
-clean distclean maintainer-clean:
+clean distclean:
 	rm -f libpgport.a libpgport_shlib.a libpgport_srv.a
 	rm -f $(OBJS) $(OBJS_SHLIB) $(OBJS_SRV) pg_config_paths.h

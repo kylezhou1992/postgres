@@ -3,7 +3,7 @@
  * syscache.c
  *	  System cache management routines
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,85 +21,41 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
-#include "access/sysattr.h"
-#include "catalog/indexing.h"
-#include "catalog/pg_aggregate.h"
-#include "catalog/pg_am.h"
-#include "catalog/pg_amop.h"
-#include "catalog/pg_amproc.h"
-#include "catalog/pg_auth_members.h"
-#include "catalog/pg_authid.h"
-#include "catalog/pg_cast.h"
-#include "catalog/pg_collation.h"
-#include "catalog/pg_constraint.h"
-#include "catalog/pg_conversion.h"
-#include "catalog/pg_database.h"
-#include "catalog/pg_db_role_setting.h"
-#include "catalog/pg_default_acl.h"
-#include "catalog/pg_depend.h"
-#include "catalog/pg_description.h"
-#include "catalog/pg_enum.h"
-#include "catalog/pg_event_trigger.h"
-#include "catalog/pg_foreign_data_wrapper.h"
-#include "catalog/pg_foreign_server.h"
-#include "catalog/pg_foreign_table.h"
-#include "catalog/pg_language.h"
-#include "catalog/pg_namespace.h"
-#include "catalog/pg_opclass.h"
-#include "catalog/pg_operator.h"
-#include "catalog/pg_opfamily.h"
-#include "catalog/pg_partitioned_table.h"
-#include "catalog/pg_proc.h"
-#include "catalog/pg_publication.h"
-#include "catalog/pg_publication_rel.h"
-#include "catalog/pg_range.h"
-#include "catalog/pg_rewrite.h"
-#include "catalog/pg_seclabel.h"
-#include "catalog/pg_sequence.h"
-#include "catalog/pg_shdepend.h"
-#include "catalog/pg_shdescription.h"
-#include "catalog/pg_shseclabel.h"
-#include "catalog/pg_replication_origin.h"
-#include "catalog/pg_statistic.h"
-#include "catalog/pg_statistic_ext.h"
-#include "catalog/pg_subscription.h"
-#include "catalog/pg_subscription_rel.h"
-#include "catalog/pg_tablespace.h"
-#include "catalog/pg_transform.h"
-#include "catalog/pg_ts_config.h"
-#include "catalog/pg_ts_config_map.h"
-#include "catalog/pg_ts_dict.h"
-#include "catalog/pg_ts_parser.h"
-#include "catalog/pg_ts_template.h"
-#include "catalog/pg_type.h"
-#include "catalog/pg_user_mapping.h"
-#include "utils/rel.h"
+#include "catalog/pg_db_role_setting_d.h"
+#include "catalog/pg_depend_d.h"
+#include "catalog/pg_description_d.h"
+#include "catalog/pg_seclabel_d.h"
+#include "catalog/pg_shdepend_d.h"
+#include "catalog/pg_shdescription_d.h"
+#include "catalog/pg_shseclabel_d.h"
+#include "common/int.h"
+#include "lib/qunique.h"
+#include "miscadmin.h"
+#include "storage/lmgr.h"
+#include "storage/lock.h"
 #include "utils/catcache.h"
+#include "utils/inval.h"
+#include "utils/lsyscache.h"
+#include "utils/rel.h"
 #include "utils/syscache.h"
-
 
 /*---------------------------------------------------------------------------
 
 	Adding system caches:
 
-	Add your new cache to the list in include/utils/syscache.h.
-	Keep the list sorted alphabetically.
+	There must be a unique index underlying each syscache (ie, an index
+	whose key is the same as that of the cache).  If there is not one
+	already, add the definition for it to include/catalog/pg_*.h using
+	DECLARE_UNIQUE_INDEX.
+	(Adding an index requires a catversion.h update, while simply
+	adding/deleting caches only requires a recompile.)
 
-	Add your entry to the cacheinfo[] array below. All cache lists are
-	alphabetical, so add it in the proper place.  Specify the relation OID,
-	index OID, number of keys, key attribute numbers, and initial number of
-	hash buckets.
+	Add a MAKE_SYSCACHE call to the same pg_*.h file specifying the name of
+	your cache, the underlying index, and the initial number of hash buckets.
 
 	The number of hash buckets must be a power of 2.  It's reasonable to
 	set this to the number of entries that might be in the particular cache
 	in a medium-size database.
-
-	There must be a unique index underlying each syscache (ie, an index
-	whose key is the same as that of the cache).  If there is not one
-	already, add definitions for it to include/catalog/indexing.h: you need
-	to add a DECLARE_UNIQUE_INDEX macro and a #define for the index OID.
-	(Adding an index requires a catversion.h update, while simply
-	adding/deleting caches only requires a recompile.)
 
 	Finally, any place your relation gets heap_insert() or
 	heap_update() calls, use CatalogTupleInsert() or CatalogTupleUpdate()
@@ -120,860 +76,17 @@ struct cachedesc
 	int			nbuckets;		/* number of hash buckets for this cache */
 };
 
-static const struct cachedesc cacheinfo[] = {
-	{AggregateRelationId,		/* AGGFNOID */
-		AggregateFnoidIndexId,
-		1,
-		{
-			Anum_pg_aggregate_aggfnoid,
-			0,
-			0,
-			0
-		},
-		16
-	},
-	{AccessMethodRelationId,	/* AMNAME */
-		AmNameIndexId,
-		1,
-		{
-			Anum_pg_am_amname,
-			0,
-			0,
-			0
-		},
-		4
-	},
-	{AccessMethodRelationId,	/* AMOID */
-		AmOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		4
-	},
-	{AccessMethodOperatorRelationId,	/* AMOPOPID */
-		AccessMethodOperatorIndexId,
-		3,
-		{
-			Anum_pg_amop_amopopr,
-			Anum_pg_amop_amoppurpose,
-			Anum_pg_amop_amopfamily,
-			0
-		},
-		64
-	},
-	{AccessMethodOperatorRelationId,	/* AMOPSTRATEGY */
-		AccessMethodStrategyIndexId,
-		4,
-		{
-			Anum_pg_amop_amopfamily,
-			Anum_pg_amop_amoplefttype,
-			Anum_pg_amop_amoprighttype,
-			Anum_pg_amop_amopstrategy
-		},
-		64
-	},
-	{AccessMethodProcedureRelationId,	/* AMPROCNUM */
-		AccessMethodProcedureIndexId,
-		4,
-		{
-			Anum_pg_amproc_amprocfamily,
-			Anum_pg_amproc_amproclefttype,
-			Anum_pg_amproc_amprocrighttype,
-			Anum_pg_amproc_amprocnum
-		},
-		16
-	},
-	{AttributeRelationId,		/* ATTNAME */
-		AttributeRelidNameIndexId,
-		2,
-		{
-			Anum_pg_attribute_attrelid,
-			Anum_pg_attribute_attname,
-			0,
-			0
-		},
-		32
-	},
-	{AttributeRelationId,		/* ATTNUM */
-		AttributeRelidNumIndexId,
-		2,
-		{
-			Anum_pg_attribute_attrelid,
-			Anum_pg_attribute_attnum,
-			0,
-			0
-		},
-		128
-	},
-	{AuthMemRelationId,			/* AUTHMEMMEMROLE */
-		AuthMemMemRoleIndexId,
-		2,
-		{
-			Anum_pg_auth_members_member,
-			Anum_pg_auth_members_roleid,
-			0,
-			0
-		},
-		8
-	},
-	{AuthMemRelationId,			/* AUTHMEMROLEMEM */
-		AuthMemRoleMemIndexId,
-		2,
-		{
-			Anum_pg_auth_members_roleid,
-			Anum_pg_auth_members_member,
-			0,
-			0
-		},
-		8
-	},
-	{AuthIdRelationId,			/* AUTHNAME */
-		AuthIdRolnameIndexId,
-		1,
-		{
-			Anum_pg_authid_rolname,
-			0,
-			0,
-			0
-		},
-		8
-	},
-	{AuthIdRelationId,			/* AUTHOID */
-		AuthIdOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		8
-	},
-	{
-		CastRelationId,			/* CASTSOURCETARGET */
-		CastSourceTargetIndexId,
-		2,
-		{
-			Anum_pg_cast_castsource,
-			Anum_pg_cast_casttarget,
-			0,
-			0
-		},
-		256
-	},
-	{OperatorClassRelationId,	/* CLAAMNAMENSP */
-		OpclassAmNameNspIndexId,
-		3,
-		{
-			Anum_pg_opclass_opcmethod,
-			Anum_pg_opclass_opcname,
-			Anum_pg_opclass_opcnamespace,
-			0
-		},
-		8
-	},
-	{OperatorClassRelationId,	/* CLAOID */
-		OpclassOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		8
-	},
-	{CollationRelationId,		/* COLLNAMEENCNSP */
-		CollationNameEncNspIndexId,
-		3,
-		{
-			Anum_pg_collation_collname,
-			Anum_pg_collation_collencoding,
-			Anum_pg_collation_collnamespace,
-			0
-		},
-		8
-	},
-	{CollationRelationId,		/* COLLOID */
-		CollationOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		8
-	},
-	{ConversionRelationId,		/* CONDEFAULT */
-		ConversionDefaultIndexId,
-		4,
-		{
-			Anum_pg_conversion_connamespace,
-			Anum_pg_conversion_conforencoding,
-			Anum_pg_conversion_contoencoding,
-			ObjectIdAttributeNumber,
-		},
-		8
-	},
-	{ConversionRelationId,		/* CONNAMENSP */
-		ConversionNameNspIndexId,
-		2,
-		{
-			Anum_pg_conversion_conname,
-			Anum_pg_conversion_connamespace,
-			0,
-			0
-		},
-		8
-	},
-	{ConstraintRelationId,		/* CONSTROID */
-		ConstraintOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		16
-	},
-	{ConversionRelationId,		/* CONVOID */
-		ConversionOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		8
-	},
-	{DatabaseRelationId,		/* DATABASEOID */
-		DatabaseOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		4
-	},
-	{DefaultAclRelationId,		/* DEFACLROLENSPOBJ */
-		DefaultAclRoleNspObjIndexId,
-		3,
-		{
-			Anum_pg_default_acl_defaclrole,
-			Anum_pg_default_acl_defaclnamespace,
-			Anum_pg_default_acl_defaclobjtype,
-			0
-		},
-		8
-	},
-	{EnumRelationId,			/* ENUMOID */
-		EnumOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		8
-	},
-	{EnumRelationId,			/* ENUMTYPOIDNAME */
-		EnumTypIdLabelIndexId,
-		2,
-		{
-			Anum_pg_enum_enumtypid,
-			Anum_pg_enum_enumlabel,
-			0,
-			0
-		},
-		8
-	},
-	{EventTriggerRelationId,	/* EVENTTRIGGERNAME */
-		EventTriggerNameIndexId,
-		1,
-		{
-			Anum_pg_event_trigger_evtname,
-			0,
-			0,
-			0
-		},
-		8
-	},
-	{EventTriggerRelationId,	/* EVENTTRIGGEROID */
-		EventTriggerOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		8
-	},
-	{ForeignDataWrapperRelationId,	/* FOREIGNDATAWRAPPERNAME */
-		ForeignDataWrapperNameIndexId,
-		1,
-		{
-			Anum_pg_foreign_data_wrapper_fdwname,
-			0,
-			0,
-			0
-		},
-		2
-	},
-	{ForeignDataWrapperRelationId,	/* FOREIGNDATAWRAPPEROID */
-		ForeignDataWrapperOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		2
-	},
-	{ForeignServerRelationId,	/* FOREIGNSERVERNAME */
-		ForeignServerNameIndexId,
-		1,
-		{
-			Anum_pg_foreign_server_srvname,
-			0,
-			0,
-			0
-		},
-		2
-	},
-	{ForeignServerRelationId,	/* FOREIGNSERVEROID */
-		ForeignServerOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		2
-	},
-	{ForeignTableRelationId,	/* FOREIGNTABLEREL */
-		ForeignTableRelidIndexId,
-		1,
-		{
-			Anum_pg_foreign_table_ftrelid,
-			0,
-			0,
-			0
-		},
-		4
-	},
-	{IndexRelationId,			/* INDEXRELID */
-		IndexRelidIndexId,
-		1,
-		{
-			Anum_pg_index_indexrelid,
-			0,
-			0,
-			0
-		},
-		64
-	},
-	{LanguageRelationId,		/* LANGNAME */
-		LanguageNameIndexId,
-		1,
-		{
-			Anum_pg_language_lanname,
-			0,
-			0,
-			0
-		},
-		4
-	},
-	{LanguageRelationId,		/* LANGOID */
-		LanguageOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		4
-	},
-	{NamespaceRelationId,		/* NAMESPACENAME */
-		NamespaceNameIndexId,
-		1,
-		{
-			Anum_pg_namespace_nspname,
-			0,
-			0,
-			0
-		},
-		4
-	},
-	{NamespaceRelationId,		/* NAMESPACEOID */
-		NamespaceOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		16
-	},
-	{OperatorRelationId,		/* OPERNAMENSP */
-		OperatorNameNspIndexId,
-		4,
-		{
-			Anum_pg_operator_oprname,
-			Anum_pg_operator_oprleft,
-			Anum_pg_operator_oprright,
-			Anum_pg_operator_oprnamespace
-		},
-		256
-	},
-	{OperatorRelationId,		/* OPEROID */
-		OperatorOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		32
-	},
-	{OperatorFamilyRelationId,	/* OPFAMILYAMNAMENSP */
-		OpfamilyAmNameNspIndexId,
-		3,
-		{
-			Anum_pg_opfamily_opfmethod,
-			Anum_pg_opfamily_opfname,
-			Anum_pg_opfamily_opfnamespace,
-			0
-		},
-		8
-	},
-	{OperatorFamilyRelationId,	/* OPFAMILYOID */
-		OpfamilyOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		8
-	},
-	{PartitionedRelationId,		/* PARTRELID */
-		PartitionedRelidIndexId,
-		1,
-		{
-			Anum_pg_partitioned_table_partrelid,
-			0,
-			0,
-			0
-		},
-		32
-	},
-	{ProcedureRelationId,		/* PROCNAMEARGSNSP */
-		ProcedureNameArgsNspIndexId,
-		3,
-		{
-			Anum_pg_proc_proname,
-			Anum_pg_proc_proargtypes,
-			Anum_pg_proc_pronamespace,
-			0
-		},
-		128
-	},
-	{ProcedureRelationId,		/* PROCOID */
-		ProcedureOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		128
-	},
-	{PublicationRelationId,		/* PUBLICATIONNAME */
-		PublicationNameIndexId,
-		1,
-		{
-			Anum_pg_publication_pubname,
-			0,
-			0,
-			0
-		},
-		8
-	},
-	{PublicationRelationId,		/* PUBLICATIONOID */
-		PublicationObjectIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		8
-	},
-	{PublicationRelRelationId,	/* PUBLICATIONREL */
-		PublicationRelObjectIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		64
-	},
-	{PublicationRelRelationId,	/* PUBLICATIONRELMAP */
-		PublicationRelPrrelidPrpubidIndexId,
-		2,
-		{
-			Anum_pg_publication_rel_prrelid,
-			Anum_pg_publication_rel_prpubid,
-			0,
-			0
-		},
-		64
-	},
-	{RangeRelationId,			/* RANGETYPE */
-		RangeTypidIndexId,
-		1,
-		{
-			Anum_pg_range_rngtypid,
-			0,
-			0,
-			0
-		},
-		4
-	},
-	{RelationRelationId,		/* RELNAMENSP */
-		ClassNameNspIndexId,
-		2,
-		{
-			Anum_pg_class_relname,
-			Anum_pg_class_relnamespace,
-			0,
-			0
-		},
-		128
-	},
-	{RelationRelationId,		/* RELOID */
-		ClassOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		128
-	},
-	{ReplicationOriginRelationId,	/* REPLORIGIDENT */
-		ReplicationOriginIdentIndex,
-		1,
-		{
-			Anum_pg_replication_origin_roident,
-			0,
-			0,
-			0
-		},
-		16
-	},
-	{ReplicationOriginRelationId,	/* REPLORIGNAME */
-		ReplicationOriginNameIndex,
-		1,
-		{
-			Anum_pg_replication_origin_roname,
-			0,
-			0,
-			0
-		},
-		16
-	},
-	{RewriteRelationId,			/* RULERELNAME */
-		RewriteRelRulenameIndexId,
-		2,
-		{
-			Anum_pg_rewrite_ev_class,
-			Anum_pg_rewrite_rulename,
-			0,
-			0
-		},
-		8
-	},
-	{SequenceRelationId,		/* SEQRELID */
-		SequenceRelidIndexId,
-		1,
-		{
-			Anum_pg_sequence_seqrelid,
-			0,
-			0,
-			0
-		},
-		32
-	},
-	{StatisticExtRelationId,	/* STATEXTNAMENSP */
-		StatisticExtNameIndexId,
-		2,
-		{
-			Anum_pg_statistic_ext_stxname,
-			Anum_pg_statistic_ext_stxnamespace,
-			0,
-			0
-		},
-		4
-	},
-	{StatisticExtRelationId,	/* STATEXTOID */
-		StatisticExtOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		4
-	},
-	{StatisticRelationId,		/* STATRELATTINH */
-		StatisticRelidAttnumInhIndexId,
-		3,
-		{
-			Anum_pg_statistic_starelid,
-			Anum_pg_statistic_staattnum,
-			Anum_pg_statistic_stainherit,
-			0
-		},
-		128
-	},
-	{SubscriptionRelationId,	/* SUBSCRIPTIONNAME */
-		SubscriptionNameIndexId,
-		2,
-		{
-			Anum_pg_subscription_subdbid,
-			Anum_pg_subscription_subname,
-			0,
-			0
-		},
-		4
-	},
-	{SubscriptionRelationId,	/* SUBSCRIPTIONOID */
-		SubscriptionObjectIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		4
-	},
-	{SubscriptionRelRelationId, /* SUBSCRIPTIONRELMAP */
-		SubscriptionRelSrrelidSrsubidIndexId,
-		2,
-		{
-			Anum_pg_subscription_rel_srrelid,
-			Anum_pg_subscription_rel_srsubid,
-			0,
-			0
-		},
-		64
-	},
-	{TableSpaceRelationId,		/* TABLESPACEOID */
-		TablespaceOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0,
-		},
-		4
-	},
-	{TransformRelationId,		/* TRFOID */
-		TransformOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0,
-		},
-		16
-	},
-	{TransformRelationId,		/* TRFTYPELANG */
-		TransformTypeLangIndexId,
-		2,
-		{
-			Anum_pg_transform_trftype,
-			Anum_pg_transform_trflang,
-			0,
-			0,
-		},
-		16
-	},
-	{TSConfigMapRelationId,		/* TSCONFIGMAP */
-		TSConfigMapIndexId,
-		3,
-		{
-			Anum_pg_ts_config_map_mapcfg,
-			Anum_pg_ts_config_map_maptokentype,
-			Anum_pg_ts_config_map_mapseqno,
-			0
-		},
-		2
-	},
-	{TSConfigRelationId,		/* TSCONFIGNAMENSP */
-		TSConfigNameNspIndexId,
-		2,
-		{
-			Anum_pg_ts_config_cfgname,
-			Anum_pg_ts_config_cfgnamespace,
-			0,
-			0
-		},
-		2
-	},
-	{TSConfigRelationId,		/* TSCONFIGOID */
-		TSConfigOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		2
-	},
-	{TSDictionaryRelationId,	/* TSDICTNAMENSP */
-		TSDictionaryNameNspIndexId,
-		2,
-		{
-			Anum_pg_ts_dict_dictname,
-			Anum_pg_ts_dict_dictnamespace,
-			0,
-			0
-		},
-		2
-	},
-	{TSDictionaryRelationId,	/* TSDICTOID */
-		TSDictionaryOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		2
-	},
-	{TSParserRelationId,		/* TSPARSERNAMENSP */
-		TSParserNameNspIndexId,
-		2,
-		{
-			Anum_pg_ts_parser_prsname,
-			Anum_pg_ts_parser_prsnamespace,
-			0,
-			0
-		},
-		2
-	},
-	{TSParserRelationId,		/* TSPARSEROID */
-		TSParserOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		2
-	},
-	{TSTemplateRelationId,		/* TSTEMPLATENAMENSP */
-		TSTemplateNameNspIndexId,
-		2,
-		{
-			Anum_pg_ts_template_tmplname,
-			Anum_pg_ts_template_tmplnamespace,
-			0,
-			0
-		},
-		2
-	},
-	{TSTemplateRelationId,		/* TSTEMPLATEOID */
-		TSTemplateOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		2
-	},
-	{TypeRelationId,			/* TYPENAMENSP */
-		TypeNameNspIndexId,
-		2,
-		{
-			Anum_pg_type_typname,
-			Anum_pg_type_typnamespace,
-			0,
-			0
-		},
-		64
-	},
-	{TypeRelationId,			/* TYPEOID */
-		TypeOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		64
-	},
-	{UserMappingRelationId,		/* USERMAPPINGOID */
-		UserMappingOidIndexId,
-		1,
-		{
-			ObjectIdAttributeNumber,
-			0,
-			0,
-			0
-		},
-		2
-	},
-	{UserMappingRelationId,		/* USERMAPPINGUSERSERVER */
-		UserMappingUserServerIndexId,
-		2,
-		{
-			Anum_pg_user_mapping_umuser,
-			Anum_pg_user_mapping_umserver,
-			0,
-			0
-		},
-		2
-	}
-};
+/* Macro to provide nkeys and key array with convenient syntax. */
+#define KEY(...) VA_ARGS_NARGS(__VA_ARGS__), { __VA_ARGS__ }
+
+#include "catalog/syscache_info.h"
+
+StaticAssertDecl(lengthof(cacheinfo) == SysCacheSize,
+				 "SysCacheSize does not match syscache.c's array");
 
 static CatCache *SysCache[SysCacheSize];
 
-static bool CacheInitialized = false;
+static bool CacheInitialized PG_USED_FOR_ASSERTS_ONLY = false;
 
 /* Sorted array of OIDs of tables that have caches on them */
 static Oid	SysCacheRelationOid[SysCacheSize];
@@ -997,12 +110,7 @@ static int	oid_compare(const void *a, const void *b);
 void
 InitCatalogCache(void)
 {
-	int			cacheId;
-	int			i,
-				j;
-
-	StaticAssertStmt(SysCacheSize == (int) lengthof(cacheinfo),
-					 "SysCacheSize does not match syscache.c's array");
+	SysCacheIdentifier cacheId;
 
 	Assert(!CacheInitialized);
 
@@ -1010,13 +118,21 @@ InitCatalogCache(void)
 
 	for (cacheId = 0; cacheId < SysCacheSize; cacheId++)
 	{
+		/*
+		 * Assert that every enumeration value defined in syscache.h has been
+		 * populated in the cacheinfo array.
+		 */
+		Assert(OidIsValid(cacheinfo[cacheId].reloid));
+		Assert(OidIsValid(cacheinfo[cacheId].indoid));
+		/* .nbuckets and .key[] are checked by InitCatCache() */
+
 		SysCache[cacheId] = InitCatCache(cacheId,
 										 cacheinfo[cacheId].reloid,
 										 cacheinfo[cacheId].indoid,
 										 cacheinfo[cacheId].nkeys,
 										 cacheinfo[cacheId].key,
 										 cacheinfo[cacheId].nbuckets);
-		if (!PointerIsValid(SysCache[cacheId]))
+		if (!SysCache[cacheId])
 			elog(ERROR, "could not initialize cache %u (%d)",
 				 cacheinfo[cacheId].reloid, cacheId);
 		/* Accumulate data for OID lists, too */
@@ -1034,23 +150,17 @@ InitCatalogCache(void)
 	Assert(SysCacheSupportingRelOidSize <= lengthof(SysCacheSupportingRelOid));
 
 	/* Sort and de-dup OID arrays, so we can use binary search. */
-	pg_qsort(SysCacheRelationOid, SysCacheRelationOidSize,
-			 sizeof(Oid), oid_compare);
-	for (i = 1, j = 0; i < SysCacheRelationOidSize; i++)
-	{
-		if (SysCacheRelationOid[i] != SysCacheRelationOid[j])
-			SysCacheRelationOid[++j] = SysCacheRelationOid[i];
-	}
-	SysCacheRelationOidSize = j + 1;
+	qsort(SysCacheRelationOid, SysCacheRelationOidSize,
+		  sizeof(Oid), oid_compare);
+	SysCacheRelationOidSize =
+		qunique(SysCacheRelationOid, SysCacheRelationOidSize, sizeof(Oid),
+				oid_compare);
 
-	pg_qsort(SysCacheSupportingRelOid, SysCacheSupportingRelOidSize,
-			 sizeof(Oid), oid_compare);
-	for (i = 1, j = 0; i < SysCacheSupportingRelOidSize; i++)
-	{
-		if (SysCacheSupportingRelOid[i] != SysCacheSupportingRelOid[j])
-			SysCacheSupportingRelOid[++j] = SysCacheSupportingRelOid[i];
-	}
-	SysCacheSupportingRelOidSize = j + 1;
+	qsort(SysCacheSupportingRelOid, SysCacheSupportingRelOidSize,
+		  sizeof(Oid), oid_compare);
+	SysCacheSupportingRelOidSize =
+		qunique(SysCacheSupportingRelOid, SysCacheSupportingRelOidSize,
+				sizeof(Oid), oid_compare);
 
 	CacheInitialized = true;
 }
@@ -1070,7 +180,7 @@ InitCatalogCache(void)
 void
 InitCatalogCachePhase2(void)
 {
-	int			cacheId;
+	SysCacheIdentifier cacheId;
 
 	Assert(CacheInitialized);
 
@@ -1096,57 +206,52 @@ InitCatalogCachePhase2(void)
  *	CAUTION: The tuple that is returned must NOT be freed by the caller!
  */
 HeapTuple
-SearchSysCache(int cacheId,
+SearchSysCache(SysCacheIdentifier cacheId,
 			   Datum key1,
 			   Datum key2,
 			   Datum key3,
 			   Datum key4)
 {
-	Assert(cacheId >= 0 && cacheId < SysCacheSize &&
-		   PointerIsValid(SysCache[cacheId]));
+	Assert(cacheId >= 0 && cacheId < SysCacheSize && SysCache[cacheId]);
 
 	return SearchCatCache(SysCache[cacheId], key1, key2, key3, key4);
 }
 
 HeapTuple
-SearchSysCache1(int cacheId,
+SearchSysCache1(SysCacheIdentifier cacheId,
 				Datum key1)
 {
-	Assert(cacheId >= 0 && cacheId < SysCacheSize &&
-		   PointerIsValid(SysCache[cacheId]));
+	Assert(cacheId >= 0 && cacheId < SysCacheSize && SysCache[cacheId]);
 	Assert(SysCache[cacheId]->cc_nkeys == 1);
 
 	return SearchCatCache1(SysCache[cacheId], key1);
 }
 
 HeapTuple
-SearchSysCache2(int cacheId,
+SearchSysCache2(SysCacheIdentifier cacheId,
 				Datum key1, Datum key2)
 {
-	Assert(cacheId >= 0 && cacheId < SysCacheSize &&
-		   PointerIsValid(SysCache[cacheId]));
+	Assert(cacheId >= 0 && cacheId < SysCacheSize && SysCache[cacheId]);
 	Assert(SysCache[cacheId]->cc_nkeys == 2);
 
 	return SearchCatCache2(SysCache[cacheId], key1, key2);
 }
 
 HeapTuple
-SearchSysCache3(int cacheId,
+SearchSysCache3(SysCacheIdentifier cacheId,
 				Datum key1, Datum key2, Datum key3)
 {
-	Assert(cacheId >= 0 && cacheId < SysCacheSize &&
-		   PointerIsValid(SysCache[cacheId]));
+	Assert(cacheId >= 0 && cacheId < SysCacheSize && SysCache[cacheId]);
 	Assert(SysCache[cacheId]->cc_nkeys == 3);
 
 	return SearchCatCache3(SysCache[cacheId], key1, key2, key3);
 }
 
 HeapTuple
-SearchSysCache4(int cacheId,
+SearchSysCache4(SysCacheIdentifier cacheId,
 				Datum key1, Datum key2, Datum key3, Datum key4)
 {
-	Assert(cacheId >= 0 && cacheId < SysCacheSize &&
-		   PointerIsValid(SysCache[cacheId]));
+	Assert(cacheId >= 0 && cacheId < SysCacheSize && SysCache[cacheId]);
 	Assert(SysCache[cacheId]->cc_nkeys == 4);
 
 	return SearchCatCache4(SysCache[cacheId], key1, key2, key3, key4);
@@ -1163,6 +268,102 @@ ReleaseSysCache(HeapTuple tuple)
 }
 
 /*
+ * SearchSysCacheLocked1
+ *
+ * Combine SearchSysCache1() with acquiring a LOCKTAG_TUPLE at mode
+ * InplaceUpdateTupleLock.  This is a tool for complying with the
+ * README.tuplock section "Locking to write inplace-updated tables".  After
+ * the caller's heap_update(), it should UnlockTuple(InplaceUpdateTupleLock)
+ * and ReleaseSysCache().
+ *
+ * The returned tuple may be the subject of an uncommitted update, so this
+ * doesn't prevent the "tuple concurrently updated" error.
+ */
+HeapTuple
+SearchSysCacheLocked1(SysCacheIdentifier cacheId,
+					  Datum key1)
+{
+	CatCache   *cache = SysCache[cacheId];
+	ItemPointerData tid;
+	LOCKTAG		tag;
+
+	/*----------
+	 * Since inplace updates may happen just before our LockTuple(), we must
+	 * return content acquired after LockTuple() of the TID we return.  If we
+	 * just fetched twice instead of looping, the following sequence would
+	 * defeat our locking:
+	 *
+	 * GRANT:   SearchSysCache1() = TID (1,5)
+	 * GRANT:   LockTuple(pg_class, (1,5))
+	 * [no more inplace update of (1,5) until we release the lock]
+	 * CLUSTER: SearchSysCache1() = TID (1,5)
+	 * CLUSTER: heap_update() = TID (1,8)
+	 * CLUSTER: COMMIT
+	 * GRANT:   SearchSysCache1() = TID (1,8)
+	 * GRANT:   return (1,8) from SearchSysCacheLocked1()
+	 * VACUUM:  SearchSysCache1() = TID (1,8)
+	 * VACUUM:  LockTuple(pg_class, (1,8))  # two TIDs now locked for one rel
+	 * VACUUM:  inplace update
+	 * GRANT:   heap_update() = (1,9)  # lose inplace update
+	 *
+	 * In the happy case, this takes two fetches, one to determine the TID to
+	 * lock and another to get the content and confirm the TID didn't change.
+	 *
+	 * This is valid even if the row gets updated to a new TID, the old TID
+	 * becomes LP_UNUSED, and the row gets updated back to its old TID.  We'd
+	 * still hold the right LOCKTAG_TUPLE and a copy of the row captured after
+	 * the LOCKTAG_TUPLE.
+	 */
+	ItemPointerSetInvalid(&tid);
+	for (;;)
+	{
+		HeapTuple	tuple;
+		LOCKMODE	lockmode = InplaceUpdateTupleLock;
+
+		tuple = SearchSysCache1(cacheId, key1);
+		if (ItemPointerIsValid(&tid))
+		{
+			if (!HeapTupleIsValid(tuple))
+			{
+				LockRelease(&tag, lockmode, false);
+				return tuple;
+			}
+			if (ItemPointerEquals(&tid, &tuple->t_self))
+				return tuple;
+			LockRelease(&tag, lockmode, false);
+		}
+		else if (!HeapTupleIsValid(tuple))
+			return tuple;
+
+		tid = tuple->t_self;
+		ReleaseSysCache(tuple);
+
+		/*
+		 * Do like LockTuple(rel, &tid, lockmode).  While cc_relisshared won't
+		 * change from one iteration to another, it may have been a temporary
+		 * "false" until our first SearchSysCache1().
+		 */
+		SET_LOCKTAG_TUPLE(tag,
+						  cache->cc_relisshared ? InvalidOid : MyDatabaseId,
+						  cache->cc_reloid,
+						  ItemPointerGetBlockNumber(&tid),
+						  ItemPointerGetOffsetNumber(&tid));
+		(void) LockAcquire(&tag, lockmode, false, false);
+
+		/*
+		 * If an inplace update just finished, ensure we process the syscache
+		 * inval.
+		 *
+		 * If a heap_update() call just released its LOCKTAG_TUPLE, we'll
+		 * probably find the old tuple and reach "tuple concurrently updated".
+		 * If that heap_update() aborts, our LOCKTAG_TUPLE blocks inplace
+		 * updates while our caller works.
+		 */
+		AcceptInvalidationMessages();
+	}
+}
+
+/*
  * SearchSysCacheCopy
  *
  * A convenience routine that does SearchSysCache and (if successful)
@@ -1171,7 +372,7 @@ ReleaseSysCache(HeapTuple tuple)
  * heap_freetuple() the result when done with it.
  */
 HeapTuple
-SearchSysCacheCopy(int cacheId,
+SearchSysCacheCopy(SysCacheIdentifier cacheId,
 				   Datum key1,
 				   Datum key2,
 				   Datum key3,
@@ -1189,13 +390,35 @@ SearchSysCacheCopy(int cacheId,
 }
 
 /*
+ * SearchSysCacheLockedCopy1
+ *
+ * Meld SearchSysCacheLocked1 with SearchSysCacheCopy().  After the
+ * caller's heap_update(), it should UnlockTuple(InplaceUpdateTupleLock) and
+ * heap_freetuple().
+ */
+HeapTuple
+SearchSysCacheLockedCopy1(SysCacheIdentifier cacheId,
+						  Datum key1)
+{
+	HeapTuple	tuple,
+				newtuple;
+
+	tuple = SearchSysCacheLocked1(cacheId, key1);
+	if (!HeapTupleIsValid(tuple))
+		return tuple;
+	newtuple = heap_copytuple(tuple);
+	ReleaseSysCache(tuple);
+	return newtuple;
+}
+
+/*
  * SearchSysCacheExists
  *
  * A convenience routine that just probes to see if a tuple can be found.
  * No lock is retained on the syscache entry.
  */
 bool
-SearchSysCacheExists(int cacheId,
+SearchSysCacheExists(SysCacheIdentifier cacheId,
 					 Datum key1,
 					 Datum key2,
 					 Datum key3,
@@ -1213,24 +436,29 @@ SearchSysCacheExists(int cacheId,
 /*
  * GetSysCacheOid
  *
- * A convenience routine that does SearchSysCache and returns the OID
- * of the found tuple, or InvalidOid if no tuple could be found.
+ * A convenience routine that does SearchSysCache and returns the OID in the
+ * oidcol column of the found tuple, or InvalidOid if no tuple could be found.
  * No lock is retained on the syscache entry.
  */
 Oid
-GetSysCacheOid(int cacheId,
+GetSysCacheOid(SysCacheIdentifier cacheId,
+			   AttrNumber oidcol,
 			   Datum key1,
 			   Datum key2,
 			   Datum key3,
 			   Datum key4)
 {
 	HeapTuple	tuple;
+	bool		isNull;
 	Oid			result;
 
 	tuple = SearchSysCache(cacheId, key1, key2, key3, key4);
 	if (!HeapTupleIsValid(tuple))
 		return InvalidOid;
-	result = HeapTupleGetOid(tuple);
+	result = DatumGetObjectId(heap_getattr(tuple, oidcol,
+										   SysCache[cacheId]->cc_tupdesc,
+										   &isNull));
+	Assert(!isNull);			/* columns used as oids should never be NULL */
 	ReleaseSysCache(tuple);
 	return result;
 }
@@ -1365,7 +593,7 @@ SearchSysCacheCopyAttNum(Oid relid, int16 attnum)
  * a different cache for the same catalog the tuple was fetched from.
  */
 Datum
-SysCacheGetAttr(int cacheId, HeapTuple tup,
+SysCacheGetAttr(SysCacheIdentifier cacheId, HeapTuple tup,
 				AttrNumber attributeNumber,
 				bool *isNull)
 {
@@ -1375,18 +603,43 @@ SysCacheGetAttr(int cacheId, HeapTuple tup,
 	 * valid (because the caller recently fetched the tuple via this same
 	 * cache), but there are cases where we have to initialize the cache here.
 	 */
-	if (cacheId < 0 || cacheId >= SysCacheSize ||
-		!PointerIsValid(SysCache[cacheId]))
+	if (cacheId < 0 || cacheId >= SysCacheSize || !SysCache[cacheId])
 		elog(ERROR, "invalid cache ID: %d", cacheId);
-	if (!PointerIsValid(SysCache[cacheId]->cc_tupdesc))
+	if (!SysCache[cacheId]->cc_tupdesc)
 	{
 		InitCatCachePhase2(SysCache[cacheId], false);
-		Assert(PointerIsValid(SysCache[cacheId]->cc_tupdesc));
+		Assert(SysCache[cacheId]->cc_tupdesc);
 	}
 
 	return heap_getattr(tup, attributeNumber,
 						SysCache[cacheId]->cc_tupdesc,
 						isNull);
+}
+
+/*
+ * SysCacheGetAttrNotNull
+ *
+ * As above, a version of SysCacheGetAttr which knows that the attr cannot
+ * be NULL.
+ */
+Datum
+SysCacheGetAttrNotNull(SysCacheIdentifier cacheId, HeapTuple tup,
+					   AttrNumber attributeNumber)
+{
+	bool		isnull;
+	Datum		attr;
+
+	attr = SysCacheGetAttr(cacheId, tup, attributeNumber, &isnull);
+
+	if (isnull)
+	{
+		elog(ERROR,
+			 "unexpected null value in cached tuple for catalog %s column %s",
+			 get_rel_name(cacheinfo[cacheId].reloid),
+			 NameStr(TupleDescAttr(SysCache[cacheId]->cc_tupdesc, attributeNumber - 1)->attname));
+	}
+
+	return attr;
 }
 
 /*
@@ -1400,14 +653,13 @@ SysCacheGetAttr(int cacheId, HeapTuple tup,
  * catcache code that need to be able to compute the hash values.
  */
 uint32
-GetSysCacheHashValue(int cacheId,
+GetSysCacheHashValue(SysCacheIdentifier cacheId,
 					 Datum key1,
 					 Datum key2,
 					 Datum key3,
 					 Datum key4)
 {
-	if (cacheId < 0 || cacheId >= SysCacheSize ||
-		!PointerIsValid(SysCache[cacheId]))
+	if (cacheId < 0 || cacheId >= SysCacheSize || !SysCache[cacheId])
 		elog(ERROR, "invalid cache ID: %d", cacheId);
 
 	return GetCatCacheHashValue(SysCache[cacheId], key1, key2, key3, key4);
@@ -1417,11 +669,10 @@ GetSysCacheHashValue(int cacheId,
  * List-search interface
  */
 struct catclist *
-SearchSysCacheList(int cacheId, int nkeys,
+SearchSysCacheList(SysCacheIdentifier cacheId, int nkeys,
 				   Datum key1, Datum key2, Datum key3)
 {
-	if (cacheId < 0 || cacheId >= SysCacheSize ||
-		!PointerIsValid(SysCache[cacheId]))
+	if (cacheId < 0 || cacheId >= SysCacheSize || !SysCache[cacheId])
 		elog(ERROR, "invalid cache ID: %d", cacheId);
 
 	return SearchCatCacheList(SysCache[cacheId], nkeys,
@@ -1437,13 +688,13 @@ SearchSysCacheList(int cacheId, int nkeys,
  *	This routine is only quasi-public: it should only be used by inval.c.
  */
 void
-SysCacheInvalidate(int cacheId, uint32 hashValue)
+SysCacheInvalidate(SysCacheIdentifier cacheId, uint32 hashValue)
 {
 	if (cacheId < 0 || cacheId >= SysCacheSize)
 		elog(ERROR, "invalid cache ID: %d", cacheId);
 
 	/* if this cache isn't initialized yet, no need to do anything */
-	if (!PointerIsValid(SysCache[cacheId]))
+	if (!SysCache[cacheId])
 		return;
 
 	CatCacheInvalidate(SysCache[cacheId], hashValue);
@@ -1531,7 +782,7 @@ RelationSupportsSysCache(Oid relid)
 
 
 /*
- * OID comparator for pg_qsort
+ * OID comparator for qsort
  */
 static int
 oid_compare(const void *a, const void *b)
@@ -1539,7 +790,5 @@ oid_compare(const void *a, const void *b)
 	Oid			oa = *((const Oid *) a);
 	Oid			ob = *((const Oid *) b);
 
-	if (oa == ob)
-		return 0;
-	return (oa > ob) ? 1 : -1;
+	return pg_cmp_u32(oa, ob);
 }

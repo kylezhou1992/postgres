@@ -19,6 +19,7 @@ gbt_num_compress(GISTENTRY *entry, const gbtree_ninfo *tinfo)
 	{
 		union
 		{
+			bool		bo;
 			int16		i2;
 			int32		i4;
 			int64		i8;
@@ -30,11 +31,15 @@ gbt_num_compress(GISTENTRY *entry, const gbtree_ninfo *tinfo)
 			Cash		ch;
 		}			v;
 
-		GBT_NUMKEY *r = (GBT_NUMKEY *) palloc0(tinfo->indexsize);
+		GBT_NUMKEY *r = palloc0_array(GBT_NUMKEY, tinfo->indexsize);
 		void	   *leaf = NULL;
 
 		switch (tinfo->t)
 		{
+			case gbt_t_bool:
+				v.bo = DatumGetBool(entry->key);
+				leaf = &v.bo;
+				break;
 			case gbt_t_int2:
 				v.i2 = DatumGetInt16(entry->key);
 				leaf = &v.i2;
@@ -82,9 +87,9 @@ gbt_num_compress(GISTENTRY *entry, const gbtree_ninfo *tinfo)
 
 		Assert(tinfo->indexsize >= 2 * tinfo->size);
 
-		memcpy((void *) &r[0], leaf, tinfo->size);
-		memcpy((void *) &r[tinfo->size], leaf, tinfo->size);
-		retval = palloc(sizeof(GISTENTRY));
+		memcpy(&r[0], leaf, tinfo->size);
+		memcpy(&r[tinfo->size], leaf, tinfo->size);
+		retval = palloc_object(GISTENTRY);
 		gistentryinit(*retval, PointerGetDatum(r), entry->rel, entry->page,
 					  entry->offset, false);
 	}
@@ -113,42 +118,45 @@ gbt_num_fetch(GISTENTRY *entry, const gbtree_ninfo *tinfo)
 	 */
 	switch (tinfo->t)
 	{
+		case gbt_t_bool:
+			datum = BoolGetDatum(*(bool *) DatumGetPointer(entry->key));
+			break;
 		case gbt_t_int2:
-			datum = Int16GetDatum(*(int16 *) entry->key);
+			datum = Int16GetDatum(*(int16 *) DatumGetPointer(entry->key));
 			break;
 		case gbt_t_int4:
-			datum = Int32GetDatum(*(int32 *) entry->key);
+			datum = Int32GetDatum(*(int32 *) DatumGetPointer(entry->key));
 			break;
 		case gbt_t_int8:
-			datum = Int64GetDatum(*(int64 *) entry->key);
+			datum = Int64GetDatum(*(int64 *) DatumGetPointer(entry->key));
 			break;
 		case gbt_t_oid:
 		case gbt_t_enum:
-			datum = ObjectIdGetDatum(*(Oid *) entry->key);
+			datum = ObjectIdGetDatum(*(Oid *) DatumGetPointer(entry->key));
 			break;
 		case gbt_t_float4:
-			datum = Float4GetDatum(*(float4 *) entry->key);
+			datum = Float4GetDatum(*(float4 *) DatumGetPointer(entry->key));
 			break;
 		case gbt_t_float8:
-			datum = Float8GetDatum(*(float8 *) entry->key);
+			datum = Float8GetDatum(*(float8 *) DatumGetPointer(entry->key));
 			break;
 		case gbt_t_date:
-			datum = DateADTGetDatum(*(DateADT *) entry->key);
+			datum = DateADTGetDatum(*(DateADT *) DatumGetPointer(entry->key));
 			break;
 		case gbt_t_time:
-			datum = TimeADTGetDatum(*(TimeADT *) entry->key);
+			datum = TimeADTGetDatum(*(TimeADT *) DatumGetPointer(entry->key));
 			break;
 		case gbt_t_ts:
-			datum = TimestampGetDatum(*(Timestamp *) entry->key);
+			datum = TimestampGetDatum(*(Timestamp *) DatumGetPointer(entry->key));
 			break;
 		case gbt_t_cash:
-			datum = CashGetDatum(*(Cash *) entry->key);
+			datum = CashGetDatum(*(Cash *) DatumGetPointer(entry->key));
 			break;
 		default:
-			datum = PointerGetDatum(entry->key);
+			datum = entry->key;
 	}
 
-	retval = palloc(sizeof(GISTENTRY));
+	retval = palloc_object(GISTENTRY);
 	gistentryinit(*retval, datum, entry->rel, entry->page, entry->offset,
 				  false);
 	return retval;
@@ -157,8 +165,8 @@ gbt_num_fetch(GISTENTRY *entry, const gbtree_ninfo *tinfo)
 
 
 /*
-** The GiST union method for numerical values
-*/
+ * The GiST union method for numerical values
+ */
 
 void *
 gbt_num_union(GBT_NUMKEY *out, const GistEntryVector *entryvec, const gbtree_ninfo *tinfo, FmgrInfo *flinfo)
@@ -173,10 +181,10 @@ gbt_num_union(GBT_NUMKEY *out, const GistEntryVector *entryvec, const gbtree_nin
 	cur = (GBT_NUMKEY *) DatumGetPointer((entryvec->vector[0].key));
 
 
-	o.lower = &((GBT_NUMKEY *) out)[0];
-	o.upper = &((GBT_NUMKEY *) out)[tinfo->size];
+	o.lower = &out[0];
+	o.upper = &out[tinfo->size];
 
-	memcpy((void *) out, (void *) cur, 2 * tinfo->size);
+	memcpy(out, cur, 2 * tinfo->size);
 
 	for (i = 1; i < numranges; i++)
 	{
@@ -185,10 +193,10 @@ gbt_num_union(GBT_NUMKEY *out, const GistEntryVector *entryvec, const gbtree_nin
 		c.upper = &cur[tinfo->size];
 		/* if out->lower > cur->lower, adopt cur as lower */
 		if (tinfo->f_gt(o.lower, c.lower, flinfo))
-			memcpy((void *) o.lower, (void *) c.lower, tinfo->size);
+			memcpy(unconstify(GBT_NUMKEY *, o.lower), c.lower, tinfo->size);
 		/* if out->upper < cur->upper, adopt cur as upper */
 		if (tinfo->f_lt(o.upper, c.upper, flinfo))
-			memcpy((void *) o.upper, (void *) c.upper, tinfo->size);
+			memcpy(unconstify(GBT_NUMKEY *, o.upper), c.upper, tinfo->size);
 	}
 
 	return out;
@@ -197,8 +205,8 @@ gbt_num_union(GBT_NUMKEY *out, const GistEntryVector *entryvec, const gbtree_nin
 
 
 /*
-** The GiST same method for numerical values
-*/
+ * The GiST same method for numerical values
+ */
 
 bool
 gbt_num_same(const GBT_NUMKEY *a, const GBT_NUMKEY *b, const gbtree_ninfo *tinfo, FmgrInfo *flinfo)
@@ -206,10 +214,10 @@ gbt_num_same(const GBT_NUMKEY *a, const GBT_NUMKEY *b, const gbtree_ninfo *tinfo
 	GBT_NUMKEY_R b1,
 				b2;
 
-	b1.lower = &(((GBT_NUMKEY *) a)[0]);
-	b1.upper = &(((GBT_NUMKEY *) a)[tinfo->size]);
-	b2.lower = &(((GBT_NUMKEY *) b)[0]);
-	b2.upper = &(((GBT_NUMKEY *) b)[tinfo->size]);
+	b1.lower = &(a[0]);
+	b1.upper = &(a[tinfo->size]);
+	b2.lower = &(b[0]);
+	b2.upper = &(b[tinfo->size]);
 
 	return (tinfo->f_eq(b1.lower, b2.lower, flinfo) &&
 			tinfo->f_eq(b1.upper, b2.upper, flinfo));
@@ -227,8 +235,8 @@ gbt_num_bin_union(Datum *u, GBT_NUMKEY *e, const gbtree_ninfo *tinfo, FmgrInfo *
 	if (!DatumGetPointer(*u))
 	{
 		*u = PointerGetDatum(palloc0(tinfo->indexsize));
-		memcpy((void *) &(((GBT_NUMKEY *) DatumGetPointer(*u))[0]), (void *) rd.lower, tinfo->size);
-		memcpy((void *) &(((GBT_NUMKEY *) DatumGetPointer(*u))[tinfo->size]), (void *) rd.upper, tinfo->size);
+		memcpy(&(((GBT_NUMKEY *) DatumGetPointer(*u))[0]), rd.lower, tinfo->size);
+		memcpy(&(((GBT_NUMKEY *) DatumGetPointer(*u))[tinfo->size]), rd.upper, tinfo->size);
 	}
 	else
 	{
@@ -236,10 +244,10 @@ gbt_num_bin_union(Datum *u, GBT_NUMKEY *e, const gbtree_ninfo *tinfo, FmgrInfo *
 
 		ur.lower = &(((GBT_NUMKEY *) DatumGetPointer(*u))[0]);
 		ur.upper = &(((GBT_NUMKEY *) DatumGetPointer(*u))[tinfo->size]);
-		if (tinfo->f_gt((void *) ur.lower, (void *) rd.lower, flinfo))
-			memcpy((void *) ur.lower, (void *) rd.lower, tinfo->size);
-		if (tinfo->f_lt((void *) ur.upper, (void *) rd.upper, flinfo))
-			memcpy((void *) ur.upper, (void *) rd.upper, tinfo->size);
+		if (tinfo->f_gt(ur.lower, rd.lower, flinfo))
+			memcpy(unconstify(GBT_NUMKEY *, ur.lower), rd.lower, tinfo->size);
+		if (tinfo->f_lt(ur.upper, rd.upper, flinfo))
+			memcpy(unconstify(GBT_NUMKEY *, ur.upper), rd.upper, tinfo->size);
 	}
 }
 
@@ -254,55 +262,87 @@ gbt_num_bin_union(Datum *u, GBT_NUMKEY *e, const gbtree_ninfo *tinfo, FmgrInfo *
 bool
 gbt_num_consistent(const GBT_NUMKEY_R *key,
 				   const void *query,
-				   const StrategyNumber *strategy,
+				   StrategyNumber strategy,
 				   bool is_leaf,
 				   const gbtree_ninfo *tinfo,
 				   FmgrInfo *flinfo)
 {
 	bool		retval;
 
-	switch (*strategy)
+	/*
+	 * On leaf pages we directly apply the check "key->lower OP query"; we
+	 * need not consider key->upper since it will be equal to key->lower.
+	 *
+	 * On internal pages we mostly need to check "is lower bound below query?"
+	 * and/or "is upper bound above query?", where we must allow equality in
+	 * both cases.
+	 */
+#define lower_is_below_query() \
+	tinfo->f_le(key->lower, query, flinfo)
+#define upper_is_above_query() \
+	tinfo->f_ge(key->upper, query, flinfo)
+
+	switch (strategy)
 	{
 		case BTLessEqualStrategyNumber:
-			retval = tinfo->f_ge(query, key->lower, flinfo);
+			if (is_leaf)
+				retval = tinfo->f_le(key->lower, query, flinfo);
+			else
+				retval = lower_is_below_query();
 			break;
 		case BTLessStrategyNumber:
 			if (is_leaf)
-				retval = tinfo->f_gt(query, key->lower, flinfo);
+				retval = tinfo->f_lt(key->lower, query, flinfo);
 			else
-				retval = tinfo->f_ge(query, key->lower, flinfo);
+				retval = lower_is_below_query();
 			break;
 		case BTEqualStrategyNumber:
 			if (is_leaf)
-				retval = tinfo->f_eq(query, key->lower, flinfo);
+				retval = tinfo->f_eq(key->lower, query, flinfo);
 			else
-				retval = (tinfo->f_le(key->lower, query, flinfo) &&
-						  tinfo->f_le(query, key->upper, flinfo));
+				retval = lower_is_below_query() && upper_is_above_query();
 			break;
 		case BTGreaterStrategyNumber:
 			if (is_leaf)
-				retval = tinfo->f_lt(query, key->upper, flinfo);
+				retval = tinfo->f_gt(key->lower, query, flinfo);
 			else
-				retval = tinfo->f_le(query, key->upper, flinfo);
+				retval = upper_is_above_query();
 			break;
 		case BTGreaterEqualStrategyNumber:
-			retval = tinfo->f_le(query, key->upper, flinfo);
+			if (is_leaf)
+				retval = tinfo->f_ge(key->lower, query, flinfo);
+			else
+				retval = upper_is_above_query();
 			break;
 		case BtreeGistNotEqualStrategyNumber:
-			retval = (!(tinfo->f_eq(query, key->lower, flinfo) &&
-						tinfo->f_eq(query, key->upper, flinfo)));
+			if (is_leaf)
+				retval = !(tinfo->f_eq(key->lower, query, flinfo));
+			else
+			{
+				/*
+				 * If the upper/lower bounds are equal, then all entries below
+				 * this node must have exactly that value.  So we can avoid
+				 * descending if the query equals both bounds.  In all other
+				 * cases, we must descend.
+				 */
+				retval = !(tinfo->f_eq(key->lower, query, flinfo) &&
+						   tinfo->f_eq(key->upper, query, flinfo));
+			}
 			break;
 		default:
 			retval = false;
 	}
+
+#undef lower_is_below_query
+#undef upper_is_above_query
 
 	return retval;
 }
 
 
 /*
-** The GiST distance method (for KNN-Gist)
-*/
+ * The GiST distance method (for KNN-Gist)
+ */
 
 float8
 gbt_num_distance(const GBT_NUMKEY_R *key,
@@ -334,12 +374,12 @@ gbt_num_picksplit(const GistEntryVector *entryvec, GIST_SPLITVEC *v,
 	OffsetNumber i,
 				maxoff = entryvec->n - 1;
 	Nsrt	   *arr;
-	int			nbytes;
+	int			noffsets;
 
-	arr = (Nsrt *) palloc((maxoff + 1) * sizeof(Nsrt));
-	nbytes = (maxoff + 2) * sizeof(OffsetNumber);
-	v->spl_left = (OffsetNumber *) palloc(nbytes);
-	v->spl_right = (OffsetNumber *) palloc(nbytes);
+	arr = palloc_array(Nsrt, maxoff + 1);
+	noffsets = maxoff + 2;
+	v->spl_left = palloc_array(OffsetNumber, noffsets);
+	v->spl_right = palloc_array(OffsetNumber, noffsets);
 	v->spl_ldatum = PointerGetDatum(0);
 	v->spl_rdatum = PointerGetDatum(0);
 	v->spl_nleft = 0;
@@ -352,7 +392,7 @@ gbt_num_picksplit(const GistEntryVector *entryvec, GIST_SPLITVEC *v,
 		arr[i].t = (GBT_NUMKEY *) DatumGetPointer((entryvec->vector[i].key));
 		arr[i].i = i;
 	}
-	qsort_arg((void *) &arr[FirstOffsetNumber], maxoff - FirstOffsetNumber + 1, sizeof(Nsrt), (qsort_arg_comparator) tinfo->f_cmp, (void *) flinfo);
+	qsort_arg(&arr[FirstOffsetNumber], maxoff - FirstOffsetNumber + 1, sizeof(Nsrt), (qsort_arg_comparator) tinfo->f_cmp, flinfo);
 
 	/* We do simply create two parts */
 

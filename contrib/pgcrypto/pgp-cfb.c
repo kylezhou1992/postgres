@@ -31,8 +31,8 @@
 
 #include "postgres.h"
 
-#include "px.h"
 #include "pgp.h"
+#include "px.h"
 
 typedef int (*mix_data_t) (PGP_CFB *ctx, const uint8 *data, int len, uint8 *dst);
 
@@ -43,6 +43,7 @@ struct PGP_CFB
 	int			pos;
 	int			block_no;
 	int			resync;
+	int			ignore_decrypt_cipher_failure;	/* for CVE-2026-14663 recovery */
 	uint8		fr[PGP_MAX_BLOCK];
 	uint8		fre[PGP_MAX_BLOCK];
 	uint8		encbuf[PGP_MAX_BLOCK];
@@ -50,7 +51,7 @@ struct PGP_CFB
 
 int
 pgp_cfb_create(PGP_CFB **ctx_p, int algo, const uint8 *key, int key_len,
-			   int resync, uint8 *iv)
+			   int resync, uint8 *iv, int ignore_decrypt_cipher_failure)
 {
 	int			res;
 	PX_Cipher  *ciph;
@@ -67,11 +68,11 @@ pgp_cfb_create(PGP_CFB **ctx_p, int algo, const uint8 *key, int key_len,
 		return res;
 	}
 
-	ctx = px_alloc(sizeof(*ctx));
-	memset(ctx, 0, sizeof(*ctx));
+	ctx = palloc0_object(PGP_CFB);
 	ctx->ciph = ciph;
 	ctx->block_size = px_cipher_block_size(ciph);
 	ctx->resync = resync;
+	ctx->ignore_decrypt_cipher_failure = ignore_decrypt_cipher_failure;
 
 	if (iv)
 		memcpy(ctx->fr, iv, ctx->block_size);
@@ -84,8 +85,8 @@ void
 pgp_cfb_free(PGP_CFB *ctx)
 {
 	px_cipher_free(ctx->ciph);
-	px_memset(ctx, 0, sizeof(*ctx));
-	px_free(ctx);
+	explicit_bzero(ctx, sizeof(*ctx));
+	pfree(ctx);
 }
 
 /*
@@ -196,7 +197,7 @@ mix_decrypt_resync(PGP_CFB *ctx, const uint8 *data, int len, uint8 *dst)
  */
 static int
 cfb_process(PGP_CFB *ctx, const uint8 *data, int len, uint8 *dst,
-			mix_data_t mix_data)
+			mix_data_t mix_data, int ignore_cipher_failure)
 {
 	int			n;
 	int			res;
@@ -221,7 +222,22 @@ cfb_process(PGP_CFB *ctx, const uint8 *data, int len, uint8 *dst,
 
 	while (len > 0)
 	{
-		px_cipher_encrypt(ctx->ciph, ctx->fr, ctx->block_size, ctx->fre);
+		unsigned	rlen;
+		int			err;
+
+		err = px_cipher_encrypt(ctx->ciph, 0, ctx->fr, ctx->block_size, ctx->fre, &rlen);
+
+		/*
+		 * XXX Ignoring cipher failures is dangerous, but we allow it during
+		 * decryption to return to the behavior prior to the fix for
+		 * CVE-2026-14663. This lets users recover data from a badly-encrypted
+		 * message.
+		 */
+		if (err && !ignore_cipher_failure)
+			ereport(ERROR,
+					(errcode(ERRCODE_EXTERNAL_ROUTINE_INVOCATION_EXCEPTION),
+					 errmsg("encrypt error: %s", px_strerror(err))));
+
 		if (ctx->block_no < 5)
 			ctx->block_no++;
 
@@ -252,7 +268,8 @@ pgp_cfb_encrypt(PGP_CFB *ctx, const uint8 *data, int len, uint8 *dst)
 {
 	mix_data_t	mix = ctx->resync ? mix_encrypt_resync : mix_encrypt_normal;
 
-	return cfb_process(ctx, data, len, dst, mix);
+	return cfb_process(ctx, data, len, dst, mix,
+					   0 /* never ignore cipher failures for encrypt */ );
 }
 
 int
@@ -260,5 +277,6 @@ pgp_cfb_decrypt(PGP_CFB *ctx, const uint8 *data, int len, uint8 *dst)
 {
 	mix_data_t	mix = ctx->resync ? mix_decrypt_resync : mix_decrypt_normal;
 
-	return cfb_process(ctx, data, len, dst, mix);
+	return cfb_process(ctx, data, len, dst, mix,
+					   ctx->ignore_decrypt_cipher_failure);
 }

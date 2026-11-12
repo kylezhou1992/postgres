@@ -1,15 +1,17 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  *
  * src/bin/psql/variables.c
  */
 #include "postgres_fe.h"
 
-#include "common.h"
-#include "variables.h"
+#include <math.h>
 
+#include "common.h"
+#include "common/logging.h"
+#include "variables.h"
 
 /*
  * Check whether a variable's name is allowed.
@@ -45,14 +47,14 @@ valid_variable_name(const char *name)
  * that serves as list header.
  *
  * The list entries are kept in name order (according to strcmp).  This
- * is mainly to make the results of PrintVariables() more pleasing.
+ * is mainly to make the output of PrintVariables() more pleasing.
  */
 VariableSpace
 CreateVariableSpace(void)
 {
 	struct _variable *ptr;
 
-	ptr = pg_malloc(sizeof *ptr);
+	ptr = pg_malloc_object(struct _variable);
 	ptr->name = NULL;
 	ptr->value = NULL;
 	ptr->substitute_hook = NULL;
@@ -136,8 +138,8 @@ ParseVariableBool(const char *value, const char *name, bool *result)
 	{
 		/* string is not recognized; don't clobber *result */
 		if (name)
-			psql_error("unrecognized value \"%s\" for \"%s\": Boolean expected\n",
-					   value, name);
+			pg_log_error("unrecognized value \"%s\" for \"%s\": Boolean expected",
+						 value, name);
 		valid = false;
 	}
 	return valid;
@@ -173,8 +175,77 @@ ParseVariableNum(const char *value, const char *name, int *result)
 	{
 		/* string is not recognized; don't clobber *result */
 		if (name)
-			psql_error("invalid value \"%s\" for \"%s\": integer expected\n",
-					   value, name);
+			pg_log_error("invalid value \"%s\" for \"%s\": integer expected",
+						 value, name);
+		return false;
+	}
+}
+
+/*
+ * Try to interpret "value" as a double value, and if successful store it in
+ * *result. If unsuccessful, *result isn't clobbered. "name" is the variable
+ * which is being assigned, the value of which is only used to produce a good
+ * error message. Pass NULL as the name to suppress the error message.  The
+ * value must be within the range [min,max] in order to be considered valid.
+ *
+ * Returns true, with *result containing the interpreted value, if "value" is
+ * syntactically valid, else false (with *result unchanged).
+ */
+bool
+ParseVariableDouble(const char *value, const char *name, double *result, double min, double max)
+{
+	char	   *end;
+	double		dblval;
+
+	/*
+	 * Empty-string input has historically been treated differently by strtod
+	 * on various platforms, so handle that by specifically checking for it.
+	 */
+	if ((value == NULL) || (*value == '\0'))
+	{
+		if (name)
+			pg_log_error("invalid input syntax for variable \"%s\"", name);
+		return false;
+	}
+
+	errno = 0;
+	dblval = strtod(value, &end);
+	if (errno == 0 && *end == '\0' && end != value)
+	{
+		if (dblval < min)
+		{
+			if (name)
+				pg_log_error("invalid value \"%s\" for variable \"%s\": must be greater than %.2f",
+							 value, name, min);
+			return false;
+		}
+		else if (dblval > max)
+		{
+			if (name)
+				pg_log_error("invalid value \"%s\" for variable \"%s\": must be less than %.2f",
+							 value, name, max);
+			return false;
+		}
+		*result = dblval;
+		return true;
+	}
+
+	/*
+	 * Cater for platforms which treat values which aren't zero, but that are
+	 * too close to zero to have full precision, by checking for zero or real
+	 * out-of-range values.
+	 */
+	else if ((errno == ERANGE) &&
+			 (dblval == 0.0 || dblval >= HUGE_VAL || dblval <= -HUGE_VAL))
+	{
+		if (name)
+			pg_log_error("value \"%s\" is out of range for variable \"%s\"", value, name);
+		return false;
+	}
+	else
+	{
+		if (name)
+			pg_log_error("invalid value \"%s\" for variable \"%s\"", value, name);
 		return false;
 	}
 }
@@ -221,7 +292,7 @@ SetVariable(VariableSpace space, const char *name, const char *value)
 		/* Deletion of non-existent variable is not an error */
 		if (!value)
 			return true;
-		psql_error("invalid variable name: \"%s\"\n", name);
+		pg_log_error("invalid variable name: \"%s\"", name);
 		return false;
 	}
 
@@ -255,8 +326,7 @@ SetVariable(VariableSpace space, const char *name, const char *value)
 
 			if (confirmed)
 			{
-				if (current->value)
-					pg_free(current->value);
+				pg_free(current->value);
 				current->value = new_value;
 
 				/*
@@ -272,7 +342,7 @@ SetVariable(VariableSpace space, const char *name, const char *value)
 					free(current);
 				}
 			}
-			else if (new_value)
+			else
 				pg_free(new_value); /* current->value is left unchanged */
 
 			return confirmed;
@@ -284,7 +354,7 @@ SetVariable(VariableSpace space, const char *name, const char *value)
 	/* not present, make new entry ... unless we were asked to delete */
 	if (value)
 	{
-		current = pg_malloc(sizeof *current);
+		current = pg_malloc_object(struct _variable);
 		current->name = pg_strdup(name);
 		current->value = pg_strdup(value);
 		current->substitute_hook = NULL;
@@ -347,7 +417,7 @@ SetVariableHooks(VariableSpace space, const char *name,
 	}
 
 	/* not present, make new entry */
-	current = pg_malloc(sizeof *current);
+	current = pg_malloc_object(struct _variable);
 	current->name = pg_strdup(name);
 	current->value = NULL;
 	current->substitute_hook = shook;
@@ -358,6 +428,32 @@ SetVariableHooks(VariableSpace space, const char *name,
 		current->value = (*shook) (current->value);
 	if (ahook)
 		(void) (*ahook) (current->value);
+}
+
+/*
+ * Return true iff the named variable has substitute and/or assign hook
+ * functions.
+ */
+bool
+VariableHasHook(VariableSpace space, const char *name)
+{
+	struct _variable *current;
+
+	Assert(space);
+	Assert(name);
+
+	for (current = space->next; current; current = current->next)
+	{
+		int			cmp = strcmp(current->name, name);
+
+		if (cmp == 0)
+			return (current->substitute_hook != NULL ||
+					current->assign_hook != NULL);
+		if (cmp > 0)
+			break;				/* it's not there */
+	}
+
+	return false;
 }
 
 /*
@@ -390,6 +486,7 @@ DeleteVariable(VariableSpace space, const char *name)
 void
 PsqlVarEnumError(const char *name, const char *value, const char *suggestions)
 {
-	psql_error("unrecognized value \"%s\" for \"%s\"\nAvailable values are: %s.\n",
-			   value, name, suggestions);
+	pg_log_error("unrecognized value \"%s\" for \"%s\"\n"
+				 "Available values are: %s.",
+				 value, name, suggestions);
 }

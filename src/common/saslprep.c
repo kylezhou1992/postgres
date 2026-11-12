@@ -12,7 +12,7 @@
  *	  http://www.ietf.org/rfc/rfc4013.txt
  *
  *
- * Portions Copyright (c) 2017-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2017-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/common/saslprep.c
@@ -21,25 +21,15 @@
  */
 #ifndef FRONTEND
 #include "postgres.h"
+#include "utils/memutils.h"
 #else
 #include "postgres_fe.h"
 #endif
 
 #include "common/saslprep.h"
+#include "common/string.h"
 #include "common/unicode_norm.h"
-
-/*
- * Note: The functions in this file depend on functions from
- * src/backend/utils/mb/wchar.c, so in order to use this in frontend
- * code, you will need to link that in, too.
- */
 #include "mb/pg_wchar.h"
-
-/*
- * Limit on how large password's we will try to process.  A password
- * larger than this will be treated the same as out-of-memory.
- */
-#define MAX_PASSWORD_LENGTH		1024
 
 /*
  * In backend, we will use palloc/pfree.  In frontend, use malloc, and
@@ -57,9 +47,8 @@
 
 /* Prototypes for local functions */
 static int	codepoint_range_cmp(const void *a, const void *b);
-static bool is_code_in_table(pg_wchar code, const pg_wchar *map, int mapsize);
+static bool is_code_in_table(char32_t code, const char32_t *map, int mapsize);
 static int	pg_utf8_string_len(const char *source);
-static bool pg_is_ascii_string(const char *p);
 
 /*
  * Stringprep Mapping Tables.
@@ -73,9 +62,9 @@ static bool pg_is_ascii_string(const char *p);
 /*
  * C.1.2 Non-ASCII space characters
  *
- * These are all mapped to the ASCII space character (U+00A0).
+ * These are all mapped to the ASCII space character (U+0020).
  */
-static const pg_wchar non_ascii_space_ranges[] =
+static const char32_t non_ascii_space_ranges[] =
 {
 	0x00A0, 0x00A0,
 	0x1680, 0x1680,
@@ -90,7 +79,7 @@ static const pg_wchar non_ascii_space_ranges[] =
  *
  * If any of these appear in the input, they are removed.
  */
-static const pg_wchar commonly_mapped_to_nothing_ranges[] =
+static const char32_t commonly_mapped_to_nothing_ranges[] =
 {
 	0x00AD, 0x00AD,
 	0x034F, 0x034F,
@@ -125,7 +114,7 @@ static const pg_wchar commonly_mapped_to_nothing_ranges[] =
  * tables, so one code might originate from multiple source tables.
  * Adjacent ranges have also been merged together, to save space.
  */
-static const pg_wchar prohibited_output_ranges[] =
+static const char32_t prohibited_output_ranges[] =
 {
 	0x0000, 0x001F,				/* C.2.1 */
 	0x007F, 0x00A0,				/* C.1.2, C.2.1, C.2.2 */
@@ -166,7 +155,7 @@ static const pg_wchar prohibited_output_ranges[] =
 };
 
 /* A.1 Unassigned code points in Unicode 3.2 */
-static const pg_wchar unassigned_codepoint_ranges[] =
+static const char32_t unassigned_codepoint_ranges[] =
 {
 	0x0221, 0x0221,
 	0x0234, 0x024F,
@@ -567,7 +556,7 @@ static const pg_wchar unassigned_codepoint_ranges[] =
 };
 
 /* D.1 Characters with bidirectional property "R" or "AL" */
-static const pg_wchar RandALCat_codepoint_ranges[] =
+static const char32_t RandALCat_codepoint_ranges[] =
 {
 	0x05BE, 0x05BE,
 	0x05C0, 0x05C0,
@@ -606,7 +595,7 @@ static const pg_wchar RandALCat_codepoint_ranges[] =
 };
 
 /* D.2 Characters with bidirectional property "L" */
-static const pg_wchar LCat_codepoint_ranges[] =
+static const char32_t LCat_codepoint_ranges[] =
 {
 	0x0041, 0x005A,
 	0x0061, 0x007A,
@@ -979,8 +968,8 @@ static const pg_wchar LCat_codepoint_ranges[] =
 static int
 codepoint_range_cmp(const void *a, const void *b)
 {
-	const pg_wchar *key = (const pg_wchar *) a;
-	const pg_wchar *range = (const pg_wchar *) b;
+	const char32_t *key = (const char32_t *) a;
+	const char32_t *range = (const char32_t *) b;
 
 	if (*key < range[0])
 		return -1;				/* less than lower bound */
@@ -991,14 +980,14 @@ codepoint_range_cmp(const void *a, const void *b)
 }
 
 static bool
-is_code_in_table(pg_wchar code, const pg_wchar *map, int mapsize)
+is_code_in_table(char32_t code, const char32_t *map, int mapsize)
 {
 	Assert(mapsize % 2 == 0);
 
 	if (code < map[0] || code > map[mapsize - 1])
 		return false;
 
-	if (bsearch(&code, map, mapsize / 2, sizeof(pg_wchar) * 2,
+	if (bsearch(&code, map, mapsize / 2, sizeof(char32_t) * 2,
 				codepoint_range_cmp))
 		return true;
 	else
@@ -1016,34 +1005,21 @@ pg_utf8_string_len(const char *source)
 	const unsigned char *p = (const unsigned char *) source;
 	int			l;
 	int			num_chars = 0;
+	size_t		len = strlen(source);
 
-	while (*p)
+	while (len)
 	{
 		l = pg_utf_mblen(p);
 
-		if (!pg_utf8_islegal(p, l))
+		if (len < l || !pg_utf8_islegal(p, l))
 			return -1;
 
 		p += l;
+		len -= l;
 		num_chars++;
 	}
 
 	return num_chars;
-}
-
-/*
- * Returns true if the input string is pure ASCII.
- */
-static bool
-pg_is_ascii_string(const char *p)
-{
-	while (*p)
-	{
-		if (IS_HIGHBIT_SET(*p))
-			return false;
-		p++;
-	}
-	return true;
 }
 
 
@@ -1070,43 +1046,20 @@ pg_is_ascii_string(const char *p)
 pg_saslprep_rc
 pg_saslprep(const char *input, char **output)
 {
-	pg_wchar   *input_chars = NULL;
-	pg_wchar   *output_chars = NULL;
+	char32_t   *input_chars = NULL;
+	char32_t   *output_chars = NULL;
 	int			input_size;
 	char	   *result;
 	int			result_size;
 	int			count;
 	int			i;
 	bool		contains_RandALCat;
-	unsigned char *p;
-	pg_wchar   *wp;
+	const unsigned char *p;
+	unsigned char *outp;
+	char32_t   *wp;
 
 	/* Ensure we return *output as NULL on failure */
 	*output = NULL;
-
-	/* Check that the password isn't stupendously long */
-	if (strlen(input) > MAX_PASSWORD_LENGTH)
-	{
-#ifndef FRONTEND
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("password too long")));
-#else
-		return SASLPREP_OOM;
-#endif
-	}
-
-	/*
-	 * Quick check if the input is pure ASCII.  An ASCII string requires no
-	 * further processing.
-	 */
-	if (pg_is_ascii_string(input))
-	{
-		*output = STRDUP(input);
-		if (!(*output))
-			goto oom;
-		return SASLPREP_SUCCESS;
-	}
 
 	/*
 	 * Convert the input from UTF-8 to an array of Unicode codepoints.
@@ -1116,18 +1069,20 @@ pg_saslprep(const char *input, char **output)
 	input_size = pg_utf8_string_len(input);
 	if (input_size < 0)
 		return SASLPREP_INVALID_UTF8;
+	if (input_size >= MaxAllocSize / sizeof(char32_t))
+		goto oom;
 
-	input_chars = ALLOC((input_size + 1) * sizeof(pg_wchar));
+	input_chars = ALLOC((input_size + 1) * sizeof(char32_t));
 	if (!input_chars)
 		goto oom;
 
-	p = (unsigned char *) input;
+	p = (const unsigned char *) input;
 	for (i = 0; i < input_size; i++)
 	{
 		input_chars[i] = utf8_to_unicode(p);
 		p += pg_utf_mblen(p);
 	}
-	input_chars[i] = (pg_wchar) '\0';
+	input_chars[i] = (char32_t) '\0';
 
 	/*
 	 * The steps below correspond to the steps listed in [RFC3454], Section
@@ -1141,7 +1096,7 @@ pg_saslprep(const char *input, char **output)
 	count = 0;
 	for (i = 0; i < input_size; i++)
 	{
-		pg_wchar	code = input_chars[i];
+		char32_t	code = input_chars[i];
 
 		if (IS_CODE_IN_TABLE(code, non_ascii_space_ranges))
 			input_chars[count++] = 0x0020;
@@ -1152,7 +1107,7 @@ pg_saslprep(const char *input, char **output)
 		else
 			input_chars[count++] = code;
 	}
-	input_chars[count] = (pg_wchar) '\0';
+	input_chars[count] = (char32_t) '\0';
 	input_size = count;
 
 	if (input_size == 0)
@@ -1162,7 +1117,7 @@ pg_saslprep(const char *input, char **output)
 	 * 2) Normalize -- Normalize the result of step 1 using Unicode
 	 * normalization.
 	 */
-	output_chars = unicode_normalize_kc(input_chars);
+	output_chars = unicode_normalize(UNICODE_NFKC, input_chars);
 	if (!output_chars)
 		goto oom;
 
@@ -1172,7 +1127,7 @@ pg_saslprep(const char *input, char **output)
 	 */
 	for (i = 0; i < input_size; i++)
 	{
-		pg_wchar	code = input_chars[i];
+		char32_t	code = input_chars[i];
 
 		if (IS_CODE_IN_TABLE(code, prohibited_output_ranges))
 			goto prohibited;
@@ -1204,7 +1159,7 @@ pg_saslprep(const char *input, char **output)
 	contains_RandALCat = false;
 	for (i = 0; i < input_size; i++)
 	{
-		pg_wchar	code = input_chars[i];
+		char32_t	code = input_chars[i];
 
 		if (IS_CODE_IN_TABLE(code, RandALCat_codepoint_ranges))
 		{
@@ -1215,12 +1170,12 @@ pg_saslprep(const char *input, char **output)
 
 	if (contains_RandALCat)
 	{
-		pg_wchar	first = input_chars[0];
-		pg_wchar	last = input_chars[input_size - 1];
+		char32_t	first = input_chars[0];
+		char32_t	last = input_chars[input_size - 1];
 
 		for (i = 0; i < input_size; i++)
 		{
-			pg_wchar	code = input_chars[i];
+			char32_t	code = input_chars[i];
 
 			if (IS_CODE_IN_TABLE(code, LCat_codepoint_ranges))
 				goto prohibited;
@@ -1251,14 +1206,14 @@ pg_saslprep(const char *input, char **output)
 	 * There are no error exits below here, so the error exit paths don't need
 	 * to worry about possibly freeing "result".
 	 */
-	p = (unsigned char *) result;
+	outp = (unsigned char *) result;
 	for (wp = output_chars; *wp; wp++)
 	{
-		unicode_to_utf8(*wp, p);
-		p += pg_utf_mblen(p);
+		unicode_to_utf8(*wp, outp);
+		outp += pg_utf_mblen(outp);
 	}
-	Assert((char *) p == result + result_size);
-	*p = '\0';
+	Assert((char *) outp == result + result_size);
+	*outp = '\0';
 
 	FREE(input_chars);
 	FREE(output_chars);

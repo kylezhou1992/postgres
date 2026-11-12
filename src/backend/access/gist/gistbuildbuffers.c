@@ -4,7 +4,7 @@
  *	  node buffer management functions for GiST buffering build algorithm.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,31 +14,27 @@
  */
 #include "postgres.h"
 
-#include "access/genam.h"
 #include "access/gist_private.h"
-#include "catalog/index.h"
-#include "miscadmin.h"
 #include "storage/buffile.h"
 #include "storage/bufmgr.h"
-#include "utils/memutils.h"
 #include "utils/rel.h"
 
 static GISTNodeBufferPage *gistAllocateNewPageBuffer(GISTBuildBuffers *gfbb);
 static void gistAddLoadedBuffer(GISTBuildBuffers *gfbb,
-					GISTNodeBuffer *nodeBuffer);
+								GISTNodeBuffer *nodeBuffer);
 static void gistLoadNodeBuffer(GISTBuildBuffers *gfbb,
-				   GISTNodeBuffer *nodeBuffer);
+							   GISTNodeBuffer *nodeBuffer);
 static void gistUnloadNodeBuffer(GISTBuildBuffers *gfbb,
-					 GISTNodeBuffer *nodeBuffer);
+								 GISTNodeBuffer *nodeBuffer);
 static void gistPlaceItupToPage(GISTNodeBufferPage *pageBuffer,
-					IndexTuple item);
+								IndexTuple itup);
 static void gistGetItupFromPage(GISTNodeBufferPage *pageBuffer,
-					IndexTuple *item);
+								IndexTuple *itup);
 static long gistBuffersGetFreeBlock(GISTBuildBuffers *gfbb);
 static void gistBuffersReleaseBlock(GISTBuildBuffers *gfbb, long blocknum);
 
 static void ReadTempFileBlock(BufFile *file, long blknum, void *ptr);
-static void WriteTempFileBlock(BufFile *file, long blknum, void *ptr);
+static void WriteTempFileBlock(BufFile *file, long blknum, const void *ptr);
 
 
 /*
@@ -50,7 +46,7 @@ gistInitBuildBuffers(int pagesPerBuffer, int levelStep, int maxLevel)
 	GISTBuildBuffers *gfbb;
 	HASHCTL		hashCtl;
 
-	gfbb = palloc(sizeof(GISTBuildBuffers));
+	gfbb = palloc_object(GISTBuildBuffers);
 	gfbb->pagesPerBuffer = pagesPerBuffer;
 	gfbb->levelStep = levelStep;
 
@@ -64,7 +60,7 @@ gistInitBuildBuffers(int pagesPerBuffer, int levelStep, int maxLevel)
 	/* Initialize free page management. */
 	gfbb->nFreeBlocks = 0;
 	gfbb->freeBlocksLen = 32;
-	gfbb->freeBlocks = (long *) palloc(gfbb->freeBlocksLen * sizeof(long));
+	gfbb->freeBlocks = palloc_array(long, gfbb->freeBlocksLen);
 
 	/*
 	 * Current memory context will be used for all in-memory data structures
@@ -76,7 +72,6 @@ gistInitBuildBuffers(int pagesPerBuffer, int levelStep, int maxLevel)
 	 * nodeBuffersTab hash is association between index blocks and it's
 	 * buffers.
 	 */
-	memset(&hashCtl, 0, sizeof(hashCtl));
 	hashCtl.keysize = sizeof(BlockNumber);
 	hashCtl.entrysize = sizeof(GISTNodeBuffer);
 	hashCtl.hcxt = CurrentMemoryContext;
@@ -92,8 +87,7 @@ gistInitBuildBuffers(int pagesPerBuffer, int levelStep, int maxLevel)
 	 * buffers are inserted here when they are created.
 	 */
 	gfbb->buffersOnLevelsLen = 1;
-	gfbb->buffersOnLevels = (List **) palloc(sizeof(List *) *
-											 gfbb->buffersOnLevelsLen);
+	gfbb->buffersOnLevels = palloc_array(List *, gfbb->buffersOnLevelsLen);
 	gfbb->buffersOnLevels[0] = NIL;
 
 	/*
@@ -101,8 +95,7 @@ gistInitBuildBuffers(int pagesPerBuffer, int levelStep, int maxLevel)
 	 * into main memory.
 	 */
 	gfbb->loadedBuffersLen = 32;
-	gfbb->loadedBuffers = (GISTNodeBuffer **) palloc(gfbb->loadedBuffersLen *
-													 sizeof(GISTNodeBuffer *));
+	gfbb->loadedBuffers = palloc_array(GISTNodeBuffer *, gfbb->loadedBuffersLen);
 	gfbb->loadedBuffersCount = 0;
 
 	gfbb->rootlevel = maxLevel;
@@ -123,7 +116,7 @@ gistGetNodeBuffer(GISTBuildBuffers *gfbb, GISTSTATE *giststate,
 
 	/* Find node buffer in hash table */
 	nodeBuffer = (GISTNodeBuffer *) hash_search(gfbb->nodeBuffersTab,
-												(const void *) &nodeBlocknum,
+												&nodeBlocknum,
 												HASH_ENTER,
 												&found);
 	if (!found)
@@ -138,6 +131,7 @@ gistGetNodeBuffer(GISTBuildBuffers *gfbb, GISTSTATE *giststate,
 		nodeBuffer->pageBlocknum = InvalidBlockNumber;
 		nodeBuffer->pageBuffer = NULL;
 		nodeBuffer->queuedForEmptying = false;
+		nodeBuffer->isTemp = false;
 		nodeBuffer->level = level;
 
 		/*
@@ -148,9 +142,7 @@ gistGetNodeBuffer(GISTBuildBuffers *gfbb, GISTSTATE *giststate,
 		{
 			int			i;
 
-			gfbb->buffersOnLevels =
-				(List **) repalloc(gfbb->buffersOnLevels,
-								   (level + 1) * sizeof(List *));
+			gfbb->buffersOnLevels = repalloc_array(gfbb->buffersOnLevels, List *, level + 1);
 
 			/* initialize the enlarged portion */
 			for (i = gfbb->buffersOnLevelsLen; i <= level; i++)
@@ -163,7 +155,7 @@ gistGetNodeBuffer(GISTBuildBuffers *gfbb, GISTSTATE *giststate,
 		 * not arbitrary that the new buffer is put to the beginning of the
 		 * list: in the final emptying phase we loop through all buffers at
 		 * each level, and flush them. If a page is split during the emptying,
-		 * it's more efficient to flush the new splitted pages first, before
+		 * it's more efficient to flush the new split pages first, before
 		 * moving on to pre-existing pages on the level. The buffers just
 		 * created during the page split are likely still in cache, so
 		 * flushing them immediately is more efficient than putting them to
@@ -186,8 +178,8 @@ gistAllocateNewPageBuffer(GISTBuildBuffers *gfbb)
 {
 	GISTNodeBufferPage *pageBuffer;
 
-	pageBuffer = (GISTNodeBufferPage *) MemoryContextAlloc(gfbb->context,
-														   BLCKSZ);
+	pageBuffer = (GISTNodeBufferPage *) MemoryContextAllocZero(gfbb->context,
+															   BLCKSZ);
 	pageBuffer->prev = InvalidBlockNumber;
 
 	/* Set page free space */
@@ -209,9 +201,8 @@ gistAddLoadedBuffer(GISTBuildBuffers *gfbb, GISTNodeBuffer *nodeBuffer)
 	if (gfbb->loadedBuffersCount >= gfbb->loadedBuffersLen)
 	{
 		gfbb->loadedBuffersLen *= 2;
-		gfbb->loadedBuffers = (GISTNodeBuffer **)
-			repalloc(gfbb->loadedBuffers,
-					 gfbb->loadedBuffersLen * sizeof(GISTNodeBuffer *));
+		gfbb->loadedBuffers = repalloc_array(gfbb->loadedBuffers,
+											 GISTNodeBuffer *, gfbb->loadedBuffersLen);
 	}
 
 	gfbb->loadedBuffers[gfbb->loadedBuffersCount] = nodeBuffer;
@@ -494,9 +485,8 @@ gistBuffersReleaseBlock(GISTBuildBuffers *gfbb, long blocknum)
 	if (gfbb->nFreeBlocks >= gfbb->freeBlocksLen)
 	{
 		gfbb->freeBlocksLen *= 2;
-		gfbb->freeBlocks = (long *) repalloc(gfbb->freeBlocks,
-											 gfbb->freeBlocksLen *
-											 sizeof(long));
+		gfbb->freeBlocks = repalloc_array(gfbb->freeBlocks,
+										  long, gfbb->freeBlocksLen);
 	}
 
 	/* Add blocknum to array */
@@ -518,7 +508,7 @@ gistFreeBuildBuffers(GISTBuildBuffers *gfbb)
 
 /*
  * Data structure representing information about node buffer for index tuples
- * relocation from splitted node buffer.
+ * relocation from split node buffer.
  */
 typedef struct
 {
@@ -543,19 +533,18 @@ gistRelocateBuildBuffersOnSplit(GISTBuildBuffers *gfbb, GISTSTATE *giststate,
 	GISTNodeBuffer *nodeBuffer;
 	BlockNumber blocknum;
 	IndexTuple	itup;
-	int			splitPagesCount = 0,
-				i;
+	int			splitPagesCount = 0;
 	GISTENTRY	entry[INDEX_MAX_KEYS];
 	bool		isnull[INDEX_MAX_KEYS];
 	GISTNodeBuffer oldBuf;
 	ListCell   *lc;
 
-	/* If the splitted page doesn't have buffers, we have nothing to do. */
+	/* If the split page doesn't have buffers, we have nothing to do. */
 	if (!LEVEL_HAS_BUFFERS(level, gfbb))
 		return;
 
 	/*
-	 * Get the node buffer of the splitted page.
+	 * Get the node buffer of the split page.
 	 */
 	blocknum = BufferGetBlockNumber(buffer);
 	nodeBuffer = hash_search(gfbb->nodeBuffersTab, &blocknum,
@@ -587,19 +576,17 @@ gistRelocateBuildBuffersOnSplit(GISTBuildBuffers *gfbb, GISTSTATE *giststate,
 	 * Allocate memory for information about relocation buffers.
 	 */
 	splitPagesCount = list_length(splitinfo);
-	relocationBuffersInfos =
-		(RelocationBufferInfo *) palloc(sizeof(RelocationBufferInfo) *
-										splitPagesCount);
+	relocationBuffersInfos = palloc_array(RelocationBufferInfo, splitPagesCount);
 
 	/*
 	 * Fill relocation buffers information for node buffers of pages produced
 	 * by split.
 	 */
-	i = 0;
 	foreach(lc, splitinfo)
 	{
 		GISTPageSplitInfo *si = (GISTPageSplitInfo *) lfirst(lc);
 		GISTNodeBuffer *newNodeBuffer;
+		int			i = foreach_current_index(lc);
 
 		/* Decompress parent index tuple of node buffer page. */
 		gistDeCompressAtt(giststate, r,
@@ -618,8 +605,6 @@ gistRelocateBuildBuffersOnSplit(GISTBuildBuffers *gfbb, GISTSTATE *giststate,
 
 		relocationBuffersInfos[i].nodeBuffer = newNodeBuffer;
 		relocationBuffersInfos[i].splitinfo = si;
-
-		i++;
 	}
 
 	/*
@@ -665,7 +650,7 @@ gistRelocateBuildBuffersOnSplit(GISTBuildBuffers *gfbb, GISTSTATE *giststate,
 			zero_penalty = true;
 
 			/* Loop over index attributes. */
-			for (j = 0; j < r->rd_att->natts; j++)
+			for (j = 0; j < IndexRelationGetNumberOfKeyAttributes(r); j++)
 			{
 				float		usize;
 
@@ -691,7 +676,7 @@ gistRelocateBuildBuffersOnSplit(GISTBuildBuffers *gfbb, GISTSTATE *giststate,
 					which = i;
 					best_penalty[j] = usize;
 
-					if (j < r->rd_att->natts - 1)
+					if (j < IndexRelationGetNumberOfKeyAttributes(r) - 1)
 						best_penalty[j + 1] = -1;
 				}
 				else if (best_penalty[j] == usize)
@@ -757,25 +742,14 @@ static void
 ReadTempFileBlock(BufFile *file, long blknum, void *ptr)
 {
 	if (BufFileSeekBlock(file, blknum) != 0)
-		elog(ERROR, "could not seek temporary file: %m");
-	if (BufFileRead(file, ptr, BLCKSZ) != BLCKSZ)
-		elog(ERROR, "could not read temporary file: %m");
+		elog(ERROR, "could not seek to block %ld in temporary file", blknum);
+	BufFileReadExact(file, ptr, BLCKSZ);
 }
 
 static void
-WriteTempFileBlock(BufFile *file, long blknum, void *ptr)
+WriteTempFileBlock(BufFile *file, long blknum, const void *ptr)
 {
 	if (BufFileSeekBlock(file, blknum) != 0)
-		elog(ERROR, "could not seek temporary file: %m");
-	if (BufFileWrite(file, ptr, BLCKSZ) != BLCKSZ)
-	{
-		/*
-		 * the other errors in Read/WriteTempFileBlock shouldn't happen, but
-		 * an error at write can easily happen if you run out of disk space.
-		 */
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not write block %ld of temporary file: %m",
-						blknum)));
-	}
+		elog(ERROR, "could not seek to block %ld in temporary file", blknum);
+	BufFileWrite(file, ptr, BLCKSZ);
 }

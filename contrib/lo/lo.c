@@ -9,10 +9,13 @@
 
 #include "commands/trigger.h"
 #include "executor/spi.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/rel.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "lo",
+					.version = PG_VERSION
+);
 
 
 /*
@@ -33,8 +36,7 @@ lo_manage(PG_FUNCTION_ARGS)
 	HeapTuple	trigtuple;		/* The original value of tuple	*/
 
 	if (!CALLED_AS_TRIGGER(fcinfo)) /* internal error */
-		elog(ERROR, "%s: not fired by trigger manager",
-			 trigdata->tg_trigger->tgname);
+		elog(ERROR, "lo_manage: not fired by trigger manager");
 
 	if (!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event)) /* internal error */
 		elog(ERROR, "%s: must be fired for row",
@@ -74,7 +76,8 @@ lo_manage(PG_FUNCTION_ARGS)
 	 * Here, if the value of the monitored attribute changes, then the large
 	 * object associated with the original value is unlinked.
 	 */
-	if (newtuple != NULL)
+	if (newtuple != NULL &&
+		bms_is_member(attnum - FirstLowInvalidHeapAttributeNumber, trigdata->tg_updatedcols))
 	{
 		char	   *orig = SPI_getvalue(trigtuple, tupdesc, attnum);
 		char	   *newv = SPI_getvalue(newtuple, tupdesc, attnum);

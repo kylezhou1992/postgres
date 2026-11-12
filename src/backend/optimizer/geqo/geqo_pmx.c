@@ -11,12 +11,13 @@
 *-------------------------------------------------------------------------
 */
 
-/* contributed by:
-   =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
-   *  Martin Utesch				 * Institute of Automatic Control	   *
-   =							 = University of Mining and Technology =
-   *  utesch@aut.tu-freiberg.de  * Freiberg, Germany				   *
-   =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
+/*
+ * contributed by:
+ * =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
+ * *  Martin Utesch				 * Institute of Automatic Control	   *
+ * =							 = University of Mining and Technology =
+ * *  utesch@aut.tu-freiberg.de  * Freiberg, Germany				   *
+ * =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
  */
 
 /* the pmx algorithm is adopted from Genitor : */
@@ -34,22 +35,25 @@
 /*************************************************************/
 
 #include "postgres.h"
-#include "optimizer/geqo_random.h"
-#include "optimizer/geqo_recombination.h"
+#include "optimizer/geqo.h"
 
 #if defined(PMX)
 
-/* pmx
+#include "optimizer/geqo_random.h"
+#include "optimizer/geqo_recombination.h"
+
+/*
+ * pmx
  *
  *	 partially matched crossover
  */
 void
 pmx(PlannerInfo *root, Gene *tour1, Gene *tour2, Gene *offspring, int num_gene)
 {
-	int		   *failed = (int *) palloc((num_gene + 1) * sizeof(int));
-	int		   *from = (int *) palloc((num_gene + 1) * sizeof(int));
-	int		   *indx = (int *) palloc((num_gene + 1) * sizeof(int));
-	int		   *check_list = (int *) palloc((num_gene + 1) * sizeof(int));
+	int		   *failed = palloc_array(int, num_gene + 1);
+	int		   *from = palloc_array(int, num_gene + 1);
+	int		   *indx = palloc_array(int, num_gene + 1);
+	int		   *check_list = palloc_array(int, num_gene + 1);
 
 	int			left,
 				right,
@@ -131,7 +135,6 @@ pmx(PlannerInfo *root, Gene *tour1, Gene *tour2, Gene *offspring, int num_gene)
 
 				j++;
 			}
-
 		}
 
 		if (!(found))
@@ -140,7 +143,6 @@ pmx(PlannerInfo *root, Gene *tour1, Gene *tour2, Gene *offspring, int num_gene)
 			indx[mx_fail] = k;
 			mx_fail++;
 		}
-
 	}							/* ... for */
 
 
@@ -172,9 +174,7 @@ pmx(PlannerInfo *root, Gene *tour1, Gene *tour2, Gene *offspring, int num_gene)
 
 				j++;
 			}
-
 		}						/* ... for	 */
-
 	}							/* ... if	 */
 
 
@@ -206,12 +206,10 @@ pmx(PlannerInfo *root, Gene *tour1, Gene *tour2, Gene *offspring, int num_gene)
 
 						j++;
 					}
-
 				}				/* ... if	 */
 
 				i++;
 			}					/* end while */
-
 		}
 	}							/* ... for	 */
 

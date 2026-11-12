@@ -279,6 +279,11 @@ ALTER TABLE toasted_several ALTER COLUMN toasted_key SET STORAGE EXTERNAL;
 ALTER TABLE toasted_several ALTER COLUMN toasted_col1 SET STORAGE EXTERNAL;
 ALTER TABLE toasted_several ALTER COLUMN toasted_col2 SET STORAGE EXTERNAL;
 
+-- Change the storage of the index back to EXTENDED, separately from
+-- the table.  This is currently not doable via DDL, but it is
+-- supported internally.
+UPDATE pg_attribute SET attstorage = 'x' WHERE attrelid = 'toasted_several_pkey'::regclass AND attname = 'toasted_key';
+
 INSERT INTO toasted_several(toasted_key) VALUES(repeat('9876543210', 10000));
 SELECT pg_column_size(toasted_key) > 2^16 FROM toasted_several;
 
@@ -303,4 +308,46 @@ DROP TABLE toasted_several;
 
 SELECT regexp_replace(data, '^(.{100}).*(.{100})$', '\1..\2') FROM pg_logical_slot_get_changes('regression_slot', NULL, NULL, 'include-xids', '0', 'skip-empty-xacts', '1')
 WHERE data NOT LIKE '%INSERT: %';
+
+/*
+ * Test decoding relation rewrite with toast. The insert into tbl2 within the
+ * same transaction is there to check that there is no remaining toast_hash not
+ * being reset.
+ */
+CREATE TABLE tbl1 (a INT, b TEXT);
+CREATE TABLE tbl2 (a INT);
+ALTER TABLE tbl1 ALTER COLUMN b SET STORAGE EXTERNAL;
+BEGIN;
+INSERT INTO tbl1 VALUES(1, repeat('a', 4000)) ;
+ALTER TABLE tbl1 ADD COLUMN id serial primary key;
+INSERT INTO tbl2 VALUES(1);
+commit;
+SELECT substr(data, 1, 200) FROM pg_logical_slot_get_changes('regression_slot', NULL, NULL, 'include-xids', '0', 'skip-empty-xacts', '1');
+
+-- Test decoding of TOAST values with oid8
+-- Use pglz to ensure consistent results.
+SET default_toast_compression = 'pglz';
+CREATE TABLE toasted_oid8 (id serial primary key, data text)
+  WITH (toast_value_type = 'oid8');
+-- uncompressed external toast data
+ALTER TABLE toasted_oid8 ALTER COLUMN data SET STORAGE EXTERNAL;
+INSERT INTO toasted_oid8(data) SELECT repeat(string_agg(to_char(g.i, 'FM0000'), ''), 50) FROM generate_series(1, 500) g(i);
+-- compressed external toast data
+ALTER TABLE toasted_oid8 ALTER COLUMN data SET STORAGE EXTENDED;
+INSERT INTO toasted_oid8(data) SELECT repeat(string_agg(to_char(g.i, 'FM0000'), ''), 50) FROM generate_series(1, 500) g(i);
+SELECT id, pg_column_compression(data) AS compression,
+  pg_column_toast_chunk_id(data) IS NOT NULL AS has_chunk
+  FROM toasted_oid8 ORDER BY id;
+-- update without changing the toasted column, reported as unchanged
+UPDATE toasted_oid8 SET id = id + 10 WHERE id = 1;
+-- update changing the toasted column
+UPDATE toasted_oid8 SET data = repeat('abcdefghij', 20000) WHERE id = 2;
+DELETE FROM toasted_oid8;
+-- Check that the values are reassembled in full.
+SELECT regexp_replace(data, '^(.{60}).*(.{20})$', '\1..\2') AS shortened,
+       length(data) AS len
+  FROM pg_logical_slot_get_changes('regression_slot', NULL, NULL, 'include-xids', '0', 'skip-empty-xacts', '1');
+DROP TABLE toasted_oid8;
+RESET default_toast_compression;
+
 SELECT pg_drop_replication_slot('regression_slot');

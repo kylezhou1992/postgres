@@ -4,7 +4,7 @@
  *	  support for communication destinations
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -33,13 +33,13 @@
 #include "access/xact.h"
 #include "commands/copy.h"
 #include "commands/createas.h"
+#include "commands/explain_dr.h"
 #include "commands/matview.h"
 #include "executor/functions.h"
 #include "executor/tqueue.h"
 #include "executor/tstoreReceiver.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
-#include "utils/portal.h"
 
 
 /* ----------------
@@ -93,14 +93,14 @@ static const DestReceiver spi_printtupDR = {
  * It's ok to cast the constness away as any modification of the none receiver
  * would be a bug (which gets easier to catch this way).
  */
-DestReceiver *None_Receiver = (DestReceiver *) &donothingDR;
+DestReceiver *None_Receiver = unconstify_constexpr(DestReceiver *, &donothingDR);
 
 /* ----------------
  *		BeginCommand - initialize the destination at start of command
  * ----------------
  */
 void
-BeginCommand(const char *commandTag, CommandDest dest)
+BeginCommand(CommandTag commandTag, CommandDest dest)
 {
 	/* Nothing to do at present */
 }
@@ -113,8 +113,8 @@ DestReceiver *
 CreateDestReceiver(CommandDest dest)
 {
 	/*
-	 * It's ok to cast the constness away as any modification of the none receiver
-	 * would be a bug (which gets easier to catch this way).
+	 * It's ok to cast the constness away as any modification of the none
+	 * receiver would be a bug (which gets easier to catch this way).
 	 */
 
 	switch (dest)
@@ -152,6 +152,9 @@ CreateDestReceiver(CommandDest dest)
 
 		case DestTupleQueue:
 			return CreateTupleQueueDestReceiver(NULL);
+
+		case DestExplainSerialize:
+			return CreateExplainSerializeDestReceiver(NULL);
 	}
 
 	/* should never get here */
@@ -162,20 +165,26 @@ CreateDestReceiver(CommandDest dest)
  *		EndCommand - clean up the destination at end of command
  * ----------------
  */
+
 void
-EndCommand(const char *commandTag, CommandDest dest)
+EndCommandExtended(const QueryCompletion *qc, CommandDest dest,
+				   bool force_undecorated_output, bool noblock)
 {
+	char		completionTag[COMPLETION_TAG_BUFSIZE];
+	Size		len;
+
 	switch (dest)
 	{
 		case DestRemote:
 		case DestRemoteExecute:
 		case DestRemoteSimple:
 
-			/*
-			 * We assume the commandTag is plain ASCII and therefore requires
-			 * no encoding conversion.
-			 */
-			pq_putmessage('C', commandTag, strlen(commandTag) + 1);
+			len = BuildQueryCompletionString(completionTag, qc,
+											 force_undecorated_output);
+			if (noblock)
+				pq_putmessage_noblock(PqMsg_CommandComplete, completionTag, len + 1);
+			else
+				pq_putmessage(PqMsg_CommandComplete, completionTag, len + 1);
 			break;
 
 		case DestNone:
@@ -187,20 +196,34 @@ EndCommand(const char *commandTag, CommandDest dest)
 		case DestSQLFunction:
 		case DestTransientRel:
 		case DestTupleQueue:
+		case DestExplainSerialize:
 			break;
 	}
+}
+
+void
+EndCommand(const QueryCompletion *qc, CommandDest dest, bool force_undecorated_output)
+{
+	EndCommandExtended(qc, dest, force_undecorated_output, false);
+}
+
+/* ----------------
+ *		EndReplicationCommand - stripped down version of EndCommand
+ *
+ *		For use by replication commands.
+ * ----------------
+ */
+void
+EndReplicationCommand(const char *commandTag)
+{
+	pq_putmessage(PqMsg_CommandComplete, commandTag, strlen(commandTag) + 1);
 }
 
 /* ----------------
  *		NullCommand - tell dest that an empty query string was recognized
  *
- *		In FE/BE protocol version 1.0, this hack is necessary to support
- *		libpq's crufty way of determining whether a multiple-command
- *		query string is done.  In protocol 2.0 it's probably not really
- *		necessary to distinguish empty queries anymore, but we still do it
- *		for backwards compatibility with 1.0.  In protocol 3.0 it has some
- *		use again, since it ensures that there will be a recognizable end
- *		to the response to an Execute message.
+ *		This ensures that there will be a recognizable end to the response
+ *		to an Execute message in the extended query protocol.
  * ----------------
  */
 void
@@ -212,14 +235,8 @@ NullCommand(CommandDest dest)
 		case DestRemoteExecute:
 		case DestRemoteSimple:
 
-			/*
-			 * tell the fe that we saw an empty query string.  In protocols
-			 * before 3.0 this has a useless empty-string message body.
-			 */
-			if (PG_PROTOCOL_MAJOR(FrontendProtocol) >= 3)
-				pq_putemptymessage('I');
-			else
-				pq_putmessage('I', "", 1);
+			/* Tell the FE that we saw an empty query string */
+			pq_putemptymessage(PqMsg_EmptyQueryResponse);
 			break;
 
 		case DestNone:
@@ -231,6 +248,7 @@ NullCommand(CommandDest dest)
 		case DestSQLFunction:
 		case DestTransientRel:
 		case DestTupleQueue:
+		case DestExplainSerialize:
 			break;
 	}
 }
@@ -254,16 +272,13 @@ ReadyForQuery(CommandDest dest)
 		case DestRemote:
 		case DestRemoteExecute:
 		case DestRemoteSimple:
-			if (PG_PROTOCOL_MAJOR(FrontendProtocol) >= 3)
 			{
 				StringInfoData buf;
 
-				pq_beginmessage(&buf, 'Z');
+				pq_beginmessage(&buf, PqMsg_ReadyForQuery);
 				pq_sendbyte(&buf, TransactionBlockStatusCode());
 				pq_endmessage(&buf);
 			}
-			else
-				pq_putemptymessage('Z');
 			/* Flush output at end of cycle in any case. */
 			pq_flush();
 			break;
@@ -277,6 +292,7 @@ ReadyForQuery(CommandDest dest)
 		case DestSQLFunction:
 		case DestTransientRel:
 		case DestTupleQueue:
+		case DestExplainSerialize:
 			break;
 	}
 }

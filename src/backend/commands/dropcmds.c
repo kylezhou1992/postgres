@@ -3,7 +3,7 @@
  * dropcmds.c
  *	  handle various "DROP" operations
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,30 +14,28 @@
  */
 #include "postgres.h"
 
-#include "access/heapam.h"
-#include "access/htup_details.h"
+#include "access/table.h"
+#include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaddress.h"
-#include "catalog/pg_class.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "commands/defrem.h"
 #include "miscadmin.h"
-#include "nodes/makefuncs.h"
 #include "parser/parse_type.h"
-#include "utils/builtins.h"
+#include "utils/acl.h"
 #include "utils/lsyscache.h"
-#include "utils/syscache.h"
 
 
 static void does_not_exist_skipping(ObjectType objtype,
-						Node *object);
+									Node *object);
 static bool owningrel_does_not_exist_skipping(List *object,
-								  const char **msg, char **name);
+											  const char **msg, char **name);
 static bool schema_does_not_exist_skipping(List *object,
-							   const char **msg, char **name);
+										   const char **msg, char **name);
 static bool type_in_list_does_not_exist_skipping(List *typenames,
-									 const char **msg, char **name);
+												 const char **msg, char **name);
 
 
 /*
@@ -103,13 +101,20 @@ RemoveObjects(DropStmt *stmt)
 		/* Check permissions. */
 		namespaceId = get_object_namespace(&address);
 		if (!OidIsValid(namespaceId) ||
-			!pg_namespace_ownercheck(namespaceId, GetUserId()))
+			!object_ownercheck(NamespaceRelationId, namespaceId, GetUserId()))
 			check_object_ownership(GetUserId(), stmt->removeType, address,
 								   object, relation);
 
+		/*
+		 * Make note if a temporary namespace has been accessed in this
+		 * transaction.
+		 */
+		if (OidIsValid(namespaceId) && isTempNamespace(namespaceId))
+			MyXactFlags |= XACT_FLAGS_ACCESSEDTEMPNAMESPACE;
+
 		/* Release any relcache reference count, but keep lock until commit. */
 		if (relation)
-			heap_close(relation, NoLock);
+			table_close(relation, NoLock);
 
 		add_exact_object_address(&address, objects);
 	}
@@ -136,8 +141,7 @@ owningrel_does_not_exist_skipping(List *object, const char **msg, char **name)
 	List	   *parent_object;
 	RangeVar   *parent_rel;
 
-	parent_object = list_truncate(list_copy(object),
-								  list_length(object) - 1);
+	parent_object = list_copy_head(object, list_length(object) - 1);
 
 	if (schema_does_not_exist_skipping(parent_object, msg, name))
 		return true;
@@ -246,7 +250,7 @@ does_not_exist_skipping(ObjectType objtype, Node *object)
 	{
 		case OBJECT_ACCESS_METHOD:
 			msg = gettext_noop("access method \"%s\" does not exist, skipping");
-			name = strVal((Value *) object);
+			name = strVal(object);
 			break;
 		case OBJECT_TYPE:
 		case OBJECT_DOMAIN:
@@ -276,7 +280,7 @@ does_not_exist_skipping(ObjectType objtype, Node *object)
 			break;
 		case OBJECT_SCHEMA:
 			msg = gettext_noop("schema \"%s\" does not exist, skipping");
-			name = strVal((Value *) object);
+			name = strVal(object);
 			break;
 		case OBJECT_STATISTIC_EXT:
 			if (!schema_does_not_exist_skipping(castNode(List, object), &msg, &name))
@@ -315,7 +319,7 @@ does_not_exist_skipping(ObjectType objtype, Node *object)
 			break;
 		case OBJECT_EXTENSION:
 			msg = gettext_noop("extension \"%s\" does not exist, skipping");
-			name = strVal((Value *) object);
+			name = strVal(object);
 			break;
 		case OBJECT_FUNCTION:
 			{
@@ -383,7 +387,7 @@ does_not_exist_skipping(ObjectType objtype, Node *object)
 			}
 		case OBJECT_LANGUAGE:
 			msg = gettext_noop("language \"%s\" does not exist, skipping");
-			name = strVal((Value *) object);
+			name = strVal(object);
 			break;
 		case OBJECT_CAST:
 			{
@@ -410,8 +414,8 @@ does_not_exist_skipping(ObjectType objtype, Node *object)
 			{
 				msg = gettext_noop("trigger \"%s\" for relation \"%s\" does not exist, skipping");
 				name = strVal(llast(castNode(List, object)));
-				args = NameListToString(list_truncate(list_copy(castNode(List, object)),
-													  list_length(castNode(List, object)) - 1));
+				args = NameListToString(list_copy_head(castNode(List, object),
+													   list_length(castNode(List, object)) - 1));
 			}
 			break;
 		case OBJECT_POLICY:
@@ -419,30 +423,30 @@ does_not_exist_skipping(ObjectType objtype, Node *object)
 			{
 				msg = gettext_noop("policy \"%s\" for relation \"%s\" does not exist, skipping");
 				name = strVal(llast(castNode(List, object)));
-				args = NameListToString(list_truncate(list_copy(castNode(List, object)),
-													  list_length(castNode(List, object)) - 1));
+				args = NameListToString(list_copy_head(castNode(List, object),
+													   list_length(castNode(List, object)) - 1));
 			}
 			break;
 		case OBJECT_EVENT_TRIGGER:
 			msg = gettext_noop("event trigger \"%s\" does not exist, skipping");
-			name = strVal((Value *) object);
+			name = strVal(object);
 			break;
 		case OBJECT_RULE:
 			if (!owningrel_does_not_exist_skipping(castNode(List, object), &msg, &name))
 			{
 				msg = gettext_noop("rule \"%s\" for relation \"%s\" does not exist, skipping");
 				name = strVal(llast(castNode(List, object)));
-				args = NameListToString(list_truncate(list_copy(castNode(List, object)),
-													  list_length(castNode(List, object)) - 1));
+				args = NameListToString(list_copy_head(castNode(List, object),
+													   list_length(castNode(List, object)) - 1));
 			}
 			break;
 		case OBJECT_FDW:
 			msg = gettext_noop("foreign-data wrapper \"%s\" does not exist, skipping");
-			name = strVal((Value *) object);
+			name = strVal(object);
 			break;
 		case OBJECT_FOREIGN_SERVER:
 			msg = gettext_noop("server \"%s\" does not exist, skipping");
-			name = strVal((Value *) object);
+			name = strVal(object);
 			break;
 		case OBJECT_OPCLASS:
 			{
@@ -470,12 +474,49 @@ does_not_exist_skipping(ObjectType objtype, Node *object)
 			break;
 		case OBJECT_PUBLICATION:
 			msg = gettext_noop("publication \"%s\" does not exist, skipping");
-			name = strVal((Value *) object);
+			name = strVal(object);
 			break;
-		default:
-			elog(ERROR, "unrecognized object type: %d", (int) objtype);
+
+		case OBJECT_COLUMN:
+		case OBJECT_DATABASE:
+		case OBJECT_FOREIGN_TABLE:
+		case OBJECT_INDEX:
+		case OBJECT_MATVIEW:
+		case OBJECT_ROLE:
+		case OBJECT_SEQUENCE:
+		case OBJECT_SUBSCRIPTION:
+		case OBJECT_TABLE:
+		case OBJECT_TABLESPACE:
+		case OBJECT_VIEW:
+
+			/*
+			 * These are handled elsewhere, so if someone gets here the code
+			 * is probably wrong or should be revisited.
+			 */
+			elog(ERROR, "unsupported object type: %d", (int) objtype);
 			break;
+
+		case OBJECT_AMOP:
+		case OBJECT_AMPROC:
+		case OBJECT_ATTRIBUTE:
+		case OBJECT_DEFAULT:
+		case OBJECT_DEFACL:
+		case OBJECT_DOMCONSTRAINT:
+		case OBJECT_LARGEOBJECT:
+		case OBJECT_PARAMETER_ACL:
+		case OBJECT_PUBLICATION_EXCLUDED_REL:
+		case OBJECT_PUBLICATION_NAMESPACE:
+		case OBJECT_PUBLICATION_REL:
+		case OBJECT_TABCONSTRAINT:
+		case OBJECT_USER_MAPPING:
+			/* These are currently not used or needed. */
+			elog(ERROR, "unsupported object type: %d", (int) objtype);
+			break;
+
+			/* no default, to let compiler warn about missing case */
 	}
+	if (!msg)
+		elog(ERROR, "unrecognized object type: %d", (int) objtype);
 
 	if (!args)
 		ereport(NOTICE, (errmsg(msg, name)));

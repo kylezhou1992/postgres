@@ -21,7 +21,7 @@
  * The fields are separated by tabs. Lines beginning with # are comments, and
  * are ignored. Empty lines are also ignored.
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/timeline.c
@@ -37,9 +37,12 @@
 #include "access/timeline.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
+#include "access/xlogarchive.h"
 #include "access/xlogdefs.h"
+#include "common/pg_parse_lsn.h"
 #include "pgstat.h"
 #include "storage/fd.h"
+#include "utils/wait_event.h"
 
 /*
  * Copies all timeline history files with id's between 'begin' and 'end'
@@ -77,7 +80,6 @@ readTimeLineHistory(TimeLineID targetTLI)
 	List	   *result;
 	char		path[MAXPGPATH];
 	char		histfname[MAXFNAMELEN];
-	char		fline[MAXPGPATH];
 	FILE	   *fd;
 	TimeLineHistoryEntry *entry;
 	TimeLineID	lasttli = 0;
@@ -87,7 +89,7 @@ readTimeLineHistory(TimeLineID targetTLI)
 	/* Timeline 1 does not have a history file, so no need to check */
 	if (targetTLI == 1)
 	{
-		entry = (TimeLineHistoryEntry *) palloc(sizeof(TimeLineHistoryEntry));
+		entry = palloc_object(TimeLineHistoryEntry);
 		entry->tli = targetTLI;
 		entry->begin = entry->end = InvalidXLogRecPtr;
 		return list_make1(entry);
@@ -110,7 +112,7 @@ readTimeLineHistory(TimeLineID targetTLI)
 					(errcode_for_file_access(),
 					 errmsg("could not open file \"%s\": %m", path)));
 		/* Not there, so assume no parents */
-		entry = (TimeLineHistoryEntry *) palloc(sizeof(TimeLineHistoryEntry));
+		entry = palloc_object(TimeLineHistoryEntry);
 		entry->tli = targetTLI;
 		entry->begin = entry->end = InvalidXLogRecPtr;
 		return list_make1(entry);
@@ -122,15 +124,33 @@ readTimeLineHistory(TimeLineID targetTLI)
 	 * Parse the file...
 	 */
 	prevend = InvalidXLogRecPtr;
-	while (fgets(fline, sizeof(fline), fd) != NULL)
+	for (;;)
 	{
-		/* skip leading whitespace and check for # comment */
+		char		fline[MAXPGPATH];
+		char	   *res;
 		char	   *ptr;
+		char	   *token_end;
+		char		save;
 		TimeLineID	tli;
-		uint32		switchpoint_hi;
-		uint32		switchpoint_lo;
-		int			nfields;
+		XLogRecPtr	switchpoint;
+		bool		valid_switchpoint = false;
+		int			nchars;
+		size_t		nspaces;
 
+		pgstat_report_wait_start(WAIT_EVENT_TIMELINE_HISTORY_READ);
+		res = fgets(fline, sizeof(fline), fd);
+		pgstat_report_wait_end();
+		if (res == NULL)
+		{
+			if (ferror(fd))
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not read file \"%s\": %m", path)));
+
+			break;
+		}
+
+		/* skip leading whitespace and check for # comment */
 		for (ptr = fline; *ptr; ptr++)
 		{
 			if (!isspace((unsigned char) *ptr))
@@ -139,16 +159,33 @@ readTimeLineHistory(TimeLineID targetTLI)
 		if (*ptr == '\0' || *ptr == '#')
 			continue;
 
-		nfields = sscanf(fline, "%u\t%X/%X", &tli, &switchpoint_hi, &switchpoint_lo);
-
-		if (nfields < 1)
+		if (sscanf(fline, "%u%n", &tli, &nchars) != 1)
 		{
 			/* expect a numeric timeline ID as first field of line */
 			ereport(FATAL,
 					(errmsg("syntax error in history file: %s", fline),
 					 errhint("Expected a numeric timeline ID.")));
 		}
-		if (nfields != 3)
+
+		/* the switchpoint location follows, separated by whitespace */
+		ptr = fline + nchars;
+		nspaces = strspn(ptr, " \t\n\r\f\v");
+		if (nspaces > 0)
+		{
+			ptr += nspaces;
+
+			/*
+			 * isolate the location from the rest of the line before parsing
+			 * it
+			 */
+			token_end = ptr + strcspn(ptr, " \t\n\r\f\v");
+			save = *token_end;
+			*token_end = '\0';
+			valid_switchpoint = pg_parse_lsn(ptr, &switchpoint);
+			*token_end = save;
+		}
+
+		if (!valid_switchpoint)
 			ereport(FATAL,
 					(errmsg("syntax error in history file: %s", fline),
 					 errhint("Expected a write-ahead log switchpoint location.")));
@@ -160,10 +197,10 @@ readTimeLineHistory(TimeLineID targetTLI)
 
 		lasttli = tli;
 
-		entry = (TimeLineHistoryEntry *) palloc(sizeof(TimeLineHistoryEntry));
+		entry = palloc_object(TimeLineHistoryEntry);
 		entry->tli = tli;
 		entry->begin = prevend;
-		entry->end = ((uint64) (switchpoint_hi)) << 32 | (uint64) switchpoint_lo;
+		entry->end = switchpoint;
 		prevend = entry->end;
 
 		/* Build list with newest item first */
@@ -183,7 +220,7 @@ readTimeLineHistory(TimeLineID targetTLI)
 	 * Create one more entry for the "tip" of the timeline, which has no entry
 	 * in the history file.
 	 */
-	entry = (TimeLineHistoryEntry *) palloc(sizeof(TimeLineHistoryEntry));
+	entry = palloc_object(TimeLineHistoryEntry);
 	entry->tli = targetTLI;
 	entry->begin = prevend;
 	entry->end = InvalidXLogRecPtr;
@@ -287,7 +324,7 @@ findNewestTimeLine(TimeLineID startTLI)
  */
 void
 writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
-					 XLogRecPtr switchpoint, char *reason)
+					 XLogRecPtr switchpoint, const char *reason)
 {
 	char		path[MAXPGPATH];
 	char		tmppath[MAXPGPATH];
@@ -295,7 +332,7 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
 	char		buffer[BLCKSZ];
 	int			srcfd;
 	int			fd;
-	int			nbytes;
+	ssize_t		nbytes;
 
 	Assert(newTLI > parentTLI); /* else bad selection of newTLI */
 
@@ -339,7 +376,7 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
 		{
 			errno = 0;
 			pgstat_report_wait_start(WAIT_EVENT_TIMELINE_HISTORY_READ);
-			nbytes = (int) read(srcfd, buffer, sizeof(buffer));
+			nbytes = read(srcfd, buffer, sizeof(buffer));
 			pgstat_report_wait_end();
 			if (nbytes < 0 || errno != 0)
 				ereport(ERROR,
@@ -349,7 +386,7 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
 				break;
 			errno = 0;
 			pgstat_report_wait_start(WAIT_EVENT_TIMELINE_HISTORY_WRITE);
-			if ((int) write(fd, buffer, nbytes) != nbytes)
+			if (write(fd, buffer, nbytes) != nbytes)
 			{
 				int			save_errno = errno;
 
@@ -370,7 +407,11 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
 			}
 			pgstat_report_wait_end();
 		}
-		CloseTransientFile(srcfd);
+
+		if (CloseTransientFile(srcfd) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not close file \"%s\": %m", path)));
 	}
 
 	/*
@@ -380,15 +421,16 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
 	 * parent file failed to end with one.
 	 */
 	snprintf(buffer, sizeof(buffer),
-			 "%s%u\t%X/%X\t%s\n",
+			 "%s%u\t%X/%08X\t%s\n",
 			 (srcfd < 0) ? "" : "\n",
 			 parentTLI,
-			 (uint32) (switchpoint >> 32), (uint32) (switchpoint),
+			 LSN_FORMAT_ARGS(switchpoint),
 			 reason);
 
 	nbytes = strlen(buffer);
 	errno = 0;
-	if ((int) write(fd, buffer, nbytes) != nbytes)
+	pgstat_report_wait_start(WAIT_EVENT_TIMELINE_HISTORY_WRITE);
+	if (write(fd, buffer, nbytes) != nbytes)
 	{
 		int			save_errno = errno;
 
@@ -403,30 +445,26 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
 				(errcode_for_file_access(),
 				 errmsg("could not write to file \"%s\": %m", tmppath)));
 	}
+	pgstat_report_wait_end();
 
 	pgstat_report_wait_start(WAIT_EVENT_TIMELINE_HISTORY_SYNC);
 	if (pg_fsync(fd) != 0)
-		ereport(ERROR,
+		ereport(data_sync_elevel(ERROR),
 				(errcode_for_file_access(),
 				 errmsg("could not fsync file \"%s\": %m", tmppath)));
 	pgstat_report_wait_end();
 
-	if (CloseTransientFile(fd))
+	if (CloseTransientFile(fd) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not close file \"%s\": %m", tmppath)));
-
 
 	/*
 	 * Now move the completed history file into place with its final name.
 	 */
 	TLHistoryFilePath(path, newTLI);
-
-	/*
-	 * Perform the rename using link if available, paranoidly trying to avoid
-	 * overwriting an existing file (there shouldn't be one).
-	 */
-	durable_link_or_rename(tmppath, path, ERROR);
+	Assert(access(path, F_OK) != 0 && errno == ENOENT);
+	durable_rename(tmppath, path, ERROR);
 
 	/* The history file can be archived immediately. */
 	if (XLogArchivingActive())
@@ -444,7 +482,7 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
  * to avoid emplacing a bogus file.
  */
 void
-writeTimeLineHistoryFile(TimeLineID tli, char *content, int size)
+writeTimeLineHistoryFile(TimeLineID tli, const char *content, size_t size)
 {
 	char		path[MAXPGPATH];
 	char		tmppath[MAXPGPATH];
@@ -466,7 +504,7 @@ writeTimeLineHistoryFile(TimeLineID tli, char *content, int size)
 
 	errno = 0;
 	pgstat_report_wait_start(WAIT_EVENT_TIMELINE_HISTORY_FILE_WRITE);
-	if ((int) write(fd, content, size) != size)
+	if (write(fd, content, size) != size)
 	{
 		int			save_errno = errno;
 
@@ -485,27 +523,22 @@ writeTimeLineHistoryFile(TimeLineID tli, char *content, int size)
 
 	pgstat_report_wait_start(WAIT_EVENT_TIMELINE_HISTORY_FILE_SYNC);
 	if (pg_fsync(fd) != 0)
-		ereport(ERROR,
+		ereport(data_sync_elevel(ERROR),
 				(errcode_for_file_access(),
 				 errmsg("could not fsync file \"%s\": %m", tmppath)));
 	pgstat_report_wait_end();
 
-	if (CloseTransientFile(fd))
+	if (CloseTransientFile(fd) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not close file \"%s\": %m", tmppath)));
 
-
 	/*
-	 * Now move the completed history file into place with its final name.
+	 * Now move the completed history file into place with its final name,
+	 * replacing any existing file with the same name.
 	 */
 	TLHistoryFilePath(path, tli);
-
-	/*
-	 * Perform the rename using link if available, paranoidly trying to avoid
-	 * overwriting an existing file (there shouldn't be one).
-	 */
-	durable_link_or_rename(tmppath, path, ERROR);
+	durable_rename(tmppath, path, ERROR);
 }
 
 /*
@@ -538,8 +571,8 @@ tliOfPointInHistory(XLogRecPtr ptr, List *history)
 	{
 		TimeLineHistoryEntry *tle = (TimeLineHistoryEntry *) lfirst(cell);
 
-		if ((XLogRecPtrIsInvalid(tle->begin) || tle->begin <= ptr) &&
-			(XLogRecPtrIsInvalid(tle->end) || ptr < tle->end))
+		if ((!XLogRecPtrIsValid(tle->begin) || tle->begin <= ptr) &&
+			(!XLogRecPtrIsValid(tle->end) || ptr < tle->end))
 		{
 			/* found it */
 			return tle->tli;

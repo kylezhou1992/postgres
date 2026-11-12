@@ -4,7 +4,7 @@
  *	   Win32 open() replacement
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * src/port/open.c
  *
@@ -19,9 +19,11 @@
 #include "postgres_fe.h"
 #endif
 
+#include "port/win32ntdll.h"
+
 #include <fcntl.h>
 #include <assert.h>
-
+#include <sys/stat.h>
 
 static int
 openFlagsToCreateFileFlags(int openFlags)
@@ -55,21 +57,122 @@ openFlagsToCreateFileFlags(int openFlags)
 }
 
 /*
- *	 - file attribute setting, based on fileMode?
+ * Internal function used by pgwin32_open() and _pgstat64().  When
+ * backup_semantics is true, directories may be opened (for limited uses).  On
+ * failure, INVALID_HANDLE_VALUE is returned and errno is set.
  */
-int
-pgwin32_open(const char *fileName, int fileFlags,...)
+HANDLE
+pgwin32_open_handle(const char *fileName, int fileFlags, bool backup_semantics)
 {
-	int			fd;
-	HANDLE		h = INVALID_HANDLE_VALUE;
+	HANDLE		h;
 	SECURITY_ATTRIBUTES sa;
 	int			loops = 0;
+
+	if (initialize_ntdll() < 0)
+		return INVALID_HANDLE_VALUE;
 
 	/* Check that we can handle the request */
 	assert((fileFlags & ((O_RDONLY | O_WRONLY | O_RDWR) | O_APPEND |
 						 (O_RANDOM | O_SEQUENTIAL | O_TEMPORARY) |
-						 _O_SHORT_LIVED | O_DSYNC | O_DIRECT |
+						 _O_SHORT_LIVED | O_DSYNC | O_DIRECT | O_CLOEXEC |
 						 (O_CREAT | O_TRUNC | O_EXCL) | (O_TEXT | O_BINARY))) == fileFlags);
+
+	sa.nLength = sizeof(sa);
+	sa.lpSecurityDescriptor = NULL;
+
+	/*
+	 * If O_CLOEXEC is specified, create a non-inheritable handle.  Otherwise,
+	 * create an inheritable handle (the default Windows behavior).
+	 *
+	 * Note: We could instead use SetHandleInformation() after CreateFile() to
+	 * clear HANDLE_FLAG_INHERIT, but this way avoids rare leaks in
+	 * multi-threaded programs that create processes, just like POSIX
+	 * O_CLOEXEC.
+	 */
+	sa.bInheritHandle = !(fileFlags & O_CLOEXEC);
+
+	while ((h = CreateFile(fileName,
+	/* cannot use O_RDONLY, as it == 0 */
+						   (fileFlags & O_RDWR) ? (GENERIC_WRITE | GENERIC_READ) :
+						   ((fileFlags & O_WRONLY) ? GENERIC_WRITE : GENERIC_READ),
+	/* These flags allow concurrent rename/unlink */
+						   (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
+						   &sa,
+						   openFlagsToCreateFileFlags(fileFlags),
+						   FILE_ATTRIBUTE_NORMAL |
+						   (backup_semantics ? FILE_FLAG_BACKUP_SEMANTICS : 0) |
+						   ((fileFlags & O_RANDOM) ? FILE_FLAG_RANDOM_ACCESS : 0) |
+						   ((fileFlags & O_SEQUENTIAL) ? FILE_FLAG_SEQUENTIAL_SCAN : 0) |
+						   ((fileFlags & _O_SHORT_LIVED) ? FILE_ATTRIBUTE_TEMPORARY : 0) |
+						   ((fileFlags & O_TEMPORARY) ? FILE_FLAG_DELETE_ON_CLOSE : 0) |
+						   ((fileFlags & O_DIRECT) ? FILE_FLAG_NO_BUFFERING : 0) |
+						   ((fileFlags & O_DSYNC) ? FILE_FLAG_WRITE_THROUGH : 0),
+						   NULL)) == INVALID_HANDLE_VALUE)
+	{
+		/*
+		 * Sharing violation or locking error can indicate antivirus, backup
+		 * or similar software that's locking the file.  Wait a bit and try
+		 * again, giving up after 30 seconds.
+		 */
+		DWORD		err = GetLastError();
+
+		if (err == ERROR_SHARING_VIOLATION ||
+			err == ERROR_LOCK_VIOLATION)
+		{
+#ifndef FRONTEND
+			if (loops == 50)
+				ereport(LOG,
+						(errmsg("could not open file \"%s\": %s", fileName,
+								(err == ERROR_SHARING_VIOLATION) ? _("sharing violation") : _("lock violation")),
+						 errdetail("Continuing to retry for 30 seconds."),
+						 errhint("You might have antivirus, backup, or similar software interfering with the database system.")));
+#endif
+
+			if (loops < 300)
+			{
+				pg_usleep(100000);
+				loops++;
+				continue;
+			}
+		}
+
+		/*
+		 * ERROR_ACCESS_DENIED is returned if the file is deleted but not yet
+		 * gone (Windows NT status code is STATUS_DELETE_PENDING).  In that
+		 * case, we'd better ask for the NT status too so we can translate it
+		 * to a more Unix-like error.  We hope that nothing clobbers the NT
+		 * status in between the internal NtCreateFile() call and CreateFile()
+		 * returning.
+		 *
+		 * If there's no O_CREAT flag, then we'll pretend the file is
+		 * invisible.  With O_CREAT, we have no choice but to report that
+		 * there's a file in the way (which wouldn't happen on Unix).
+		 */
+		if (err == ERROR_ACCESS_DENIED &&
+			pg_RtlGetLastNtStatus() == STATUS_DELETE_PENDING)
+		{
+			if (fileFlags & O_CREAT)
+				err = ERROR_FILE_EXISTS;
+			else
+				err = ERROR_FILE_NOT_FOUND;
+		}
+
+		_dosmaperr(err);
+		return INVALID_HANDLE_VALUE;
+	}
+
+	return h;
+}
+
+int
+pgwin32_open(const char *fileName, int fileFlags, ...)
+{
+	HANDLE		h;
+	int			fd;
+
+	h = pgwin32_open_handle(fileName, fileFlags, false);
+	if (h == INVALID_HANDLE_VALUE)
+		return -1;
 
 #ifdef FRONTEND
 
@@ -84,57 +187,6 @@ pgwin32_open(const char *fileName, int fileFlags,...)
 	if ((fileFlags & O_BINARY) == 0)
 		fileFlags |= O_TEXT;
 #endif
-
-	sa.nLength = sizeof(sa);
-	sa.bInheritHandle = TRUE;
-	sa.lpSecurityDescriptor = NULL;
-
-	while ((h = CreateFile(fileName,
-	/* cannot use O_RDONLY, as it == 0 */
-						   (fileFlags & O_RDWR) ? (GENERIC_WRITE | GENERIC_READ) :
-						   ((fileFlags & O_WRONLY) ? GENERIC_WRITE : GENERIC_READ),
-	/* These flags allow concurrent rename/unlink */
-						   (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE),
-						   &sa,
-						   openFlagsToCreateFileFlags(fileFlags),
-						   FILE_ATTRIBUTE_NORMAL |
-						   ((fileFlags & O_RANDOM) ? FILE_FLAG_RANDOM_ACCESS : 0) |
-						   ((fileFlags & O_SEQUENTIAL) ? FILE_FLAG_SEQUENTIAL_SCAN : 0) |
-						   ((fileFlags & _O_SHORT_LIVED) ? FILE_ATTRIBUTE_TEMPORARY : 0) |
-						   ((fileFlags & O_TEMPORARY) ? FILE_FLAG_DELETE_ON_CLOSE : 0) |
-						   ((fileFlags & O_DIRECT) ? FILE_FLAG_NO_BUFFERING : 0) |
-						   ((fileFlags & O_DSYNC) ? FILE_FLAG_WRITE_THROUGH : 0),
-						   NULL)) == INVALID_HANDLE_VALUE)
-	{
-		/*
-		 * Sharing violation or locking error can indicate antivirus, backup
-		 * or similar software that's locking the file. Try again for 30
-		 * seconds before giving up.
-		 */
-		DWORD		err = GetLastError();
-
-		if (err == ERROR_SHARING_VIOLATION ||
-			err == ERROR_LOCK_VIOLATION)
-		{
-			pg_usleep(100000);
-			loops++;
-
-#ifndef FRONTEND
-			if (loops == 50)
-				ereport(LOG,
-						(errmsg("could not open file \"%s\": %s", fileName,
-								(err == ERROR_SHARING_VIOLATION) ? _("sharing violation") : _("lock violation")),
-						 errdetail("Continuing to retry for 30 seconds."),
-						 errhint("You might have antivirus, backup, or similar software interfering with the database system.")));
-#endif
-
-			if (loops < 300)
-				continue;
-		}
-
-		_dosmaperr(err);
-		return -1;
-	}
 
 	/* _open_osfhandle will, on error, set errno accordingly */
 	if ((fd = _open_osfhandle((intptr_t) h, fileFlags & O_APPEND)) < 0)

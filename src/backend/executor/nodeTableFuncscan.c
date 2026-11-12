@@ -3,7 +3,7 @@
  * nodeTableFuncscan.c
  *	  Support routines for scanning RangeTableFunc (XMLTABLE like functions).
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,24 +14,25 @@
  */
 /*
  * INTERFACE ROUTINES
- *		ExecTableFuncscan		scans a function.
+ *		ExecTableFuncScan		scans a function.
  *		ExecFunctionNext		retrieve next tuple in sequential order.
- *		ExecInitTableFuncscan	creates and initializes a TableFuncscan node.
- *		ExecEndTableFuncscan		releases any storage allocated.
- *		ExecReScanTableFuncscan rescans the function
+ *		ExecInitTableFuncScan	creates and initializes a TableFuncscan node.
+ *		ExecEndTableFuncScan		releases any storage allocated.
+ *		ExecReScanTableFuncScan rescans the function
  */
 #include "postgres.h"
 
-#include "nodes/execnodes.h"
 #include "executor/executor.h"
 #include "executor/nodeTableFuncscan.h"
 #include "executor/tablefunc.h"
 #include "miscadmin.h"
+#include "nodes/execnodes.h"
 #include "utils/builtins.h"
+#include "utils/jsonpath.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/tuplestore.h"
 #include "utils/xml.h"
-
 
 static TupleTableSlot *TableFuncNext(TableFuncScanState *node);
 static bool TableFuncRecheck(TableFuncScanState *node, TupleTableSlot *slot);
@@ -47,7 +48,7 @@ static void tfuncLoadRows(TableFuncScanState *tstate, ExprContext *econtext);
 /* ----------------------------------------------------------------
  *		TableFuncNext
  *
- *		This is a workhorse for ExecTableFuncscan
+ *		This is a workhorse for ExecTableFuncScan
  * ----------------------------------------------------------------
  */
 static TupleTableSlot *
@@ -58,11 +59,15 @@ TableFuncNext(TableFuncScanState *node)
 	scanslot = node->ss.ss_ScanTupleSlot;
 
 	/*
-	 * If first time through, read all tuples from function and put them in a
-	 * tuplestore. Subsequent calls just fetch tuples from tuplestore.
+	 * If first time through (or first since a parameter change), read all
+	 * tuples from function and put them in a tuplestore.  Subsequent calls
+	 * just fetch tuples from tuplestore.
 	 */
-	if (node->tupstore == NULL)
+	if (!node->tupstore_filled)
+	{
 		tfuncFetchRows(node, node->ss.ps.ps_ExprContext);
+		node->tupstore_filled = true;
+	}
 
 	/*
 	 * Get the next tuple from tuplestore.
@@ -85,7 +90,7 @@ TableFuncRecheck(TableFuncScanState *node, TupleTableSlot *slot)
 }
 
 /* ----------------------------------------------------------------
- *		ExecTableFuncscan(node)
+ *		ExecTableFuncScan(node)
  *
  *		Scans the function sequentially and returns the next qualifying
  *		tuple.
@@ -104,7 +109,7 @@ ExecTableFuncScan(PlanState *pstate)
 }
 
 /* ----------------------------------------------------------------
- *		ExecInitTableFuncscan
+ *		ExecInitTableFuncScan
  * ----------------------------------------------------------------
  */
 TableFuncScanState *
@@ -147,12 +152,13 @@ ExecInitTableFuncScan(TableFuncScan *node, EState *estate, int eflags)
 								 tf->coltypmods,
 								 tf->colcollations);
 	/* and the corresponding scan slot */
-	ExecInitScanTupleSlot(estate, &scanstate->ss, tupdesc);
+	ExecInitScanTupleSlot(estate, &scanstate->ss, tupdesc,
+						  &TTSOpsMinimalTuple, 0);
 
 	/*
-	 * Initialize result slot, type and projection.
+	 * Initialize result type and projection.
 	 */
-	ExecInitResultTupleSlotTL(estate, &scanstate->ss.ps);
+	ExecInitResultTypeTL(&scanstate->ss.ps);
 	ExecAssignScanProjectionInfo(&scanstate->ss);
 
 	/*
@@ -161,14 +167,16 @@ ExecInitTableFuncScan(TableFuncScan *node, EState *estate, int eflags)
 	scanstate->ss.ps.qual =
 		ExecInitQual(node->scan.plan.qual, &scanstate->ss.ps);
 
-	/* Only XMLTABLE is supported currently */
-	scanstate->routine = &XmlTableRoutine;
+	/* Only XMLTABLE and JSON_TABLE are supported currently */
+	scanstate->routine =
+		tf->functype == TFT_XMLTABLE ? &XmlTableRoutine : &JsonbTableRoutine;
 
 	scanstate->perTableCxt =
 		AllocSetContextCreate(CurrentMemoryContext,
 							  "TableFunc per value context",
 							  ALLOCSET_DEFAULT_SIZES);
 	scanstate->opaque = NULL;	/* initialized at runtime */
+	scanstate->tupstore_filled = false;
 
 	scanstate->ns_names = tf->ns_names;
 
@@ -182,12 +190,16 @@ ExecInitTableFuncScan(TableFuncScan *node, EState *estate, int eflags)
 		ExecInitExprList(tf->colexprs, (PlanState *) scanstate);
 	scanstate->coldefexprs =
 		ExecInitExprList(tf->coldefexprs, (PlanState *) scanstate);
+	scanstate->colvalexprs =
+		ExecInitExprList(tf->colvalexprs, (PlanState *) scanstate);
+	scanstate->passingvalexprs =
+		ExecInitExprList(tf->passingvalexprs, (PlanState *) scanstate);
 
 	scanstate->notnulls = tf->notnulls;
 
 	/* these are allocated now and initialized later */
-	scanstate->in_functions = palloc(sizeof(FmgrInfo) * tupdesc->natts);
-	scanstate->typioparams = palloc(sizeof(Oid) * tupdesc->natts);
+	scanstate->in_functions = palloc_array(FmgrInfo, tupdesc->natts);
+	scanstate->typioparams = palloc_array(Oid, tupdesc->natts);
 
 	/*
 	 * Fill in the necessary fmgr infos.
@@ -205,7 +217,7 @@ ExecInitTableFuncScan(TableFuncScan *node, EState *estate, int eflags)
 }
 
 /* ----------------------------------------------------------------
- *		ExecEndTableFuncscan
+ *		ExecEndTableFuncScan
  *
  *		frees any storage allocated through C routines.
  * ----------------------------------------------------------------
@@ -213,17 +225,6 @@ ExecInitTableFuncScan(TableFuncScan *node, EState *estate, int eflags)
 void
 ExecEndTableFuncScan(TableFuncScanState *node)
 {
-	/*
-	 * Free the exprcontext
-	 */
-	ExecFreeExprContext(&node->ss.ps);
-
-	/*
-	 * clean out the tuple table
-	 */
-	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
-
 	/*
 	 * Release tuplestore resources
 	 */
@@ -233,7 +234,7 @@ ExecEndTableFuncScan(TableFuncScanState *node)
 }
 
 /* ----------------------------------------------------------------
- *		ExecReScanTableFuncscan
+ *		ExecReScanTableFuncScan
  *
  *		Rescans the relation.
  * ----------------------------------------------------------------
@@ -243,22 +244,22 @@ ExecReScanTableFuncScan(TableFuncScanState *node)
 {
 	Bitmapset  *chgparam = node->ss.ps.chgParam;
 
-	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+	if (node->ss.ps.ps_ResultTupleSlot)
+		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
 	ExecScanReScan(&node->ss);
 
 	/*
-	 * Recompute when parameters are changed.
+	 * Recompute when parameters are changed.  It's important to use
+	 * tuplestore_clear() rather than tuplestore_end() here so that we keep
+	 * track of the maximum storage used by all rescans.
 	 */
 	if (chgparam)
 	{
 		if (node->tupstore != NULL)
-		{
-			tuplestore_end(node->tupstore);
-			node->tupstore = NULL;
-		}
+			tuplestore_clear(node->tupstore);
+		node->tupstore_filled = false;
 	}
-
-	if (node->tupstore != NULL)
+	else if (node->tupstore != NULL)
 		tuplestore_rescan(node->tupstore);
 }
 
@@ -278,17 +279,19 @@ tfuncFetchRows(TableFuncScanState *tstate, ExprContext *econtext)
 
 	Assert(tstate->opaque == NULL);
 
-	/* build tuplestore for the result */
+	/* build tuplestore for the result, unless we have one from a prior scan */
 	oldcxt = MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
-	tstate->tupstore = tuplestore_begin_heap(false, false, work_mem);
+	if (tstate->tupstore == NULL)
+		tstate->tupstore = tuplestore_begin_heap(false, false, work_mem);
 
 	/*
 	 * Each call to fetch a new set of rows - of which there may be very many
-	 * if XMLTABLE is being used in a lateral join - will allocate a possibly
-	 * substantial amount of memory, so we cannot use the per-query context
-	 * here. perTableCxt now serves the same function as "argcontext" does in
-	 * FunctionScan - a place to store per-one-call (i.e. one result table)
-	 * lifetime data (as opposed to per-query or per-result-tuple).
+	 * if XMLTABLE or JSON_TABLE is being used in a lateral join - will
+	 * allocate a possibly substantial amount of memory, so we cannot use the
+	 * per-query context here. perTableCxt now serves the same function as
+	 * "argcontext" does in FunctionScan - a place to store per-one-call (i.e.
+	 * one result table) lifetime data (as opposed to per-query or
+	 * per-result-tuple).
 	 */
 	MemoryContextSwitchTo(tstate->perTableCxt);
 
@@ -333,8 +336,6 @@ tfuncFetchRows(TableFuncScanState *tstate, ExprContext *econtext)
 
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextReset(tstate->perTableCxt);
-
-	return;
 }
 
 /*
@@ -352,7 +353,7 @@ tfuncInitialize(TableFuncScanState *tstate, ExprContext *econtext, Datum doc)
 	int			colno;
 	Datum		value;
 	int			ordinalitycol =
-	((TableFuncScan *) (tstate->ss.ps.plan))->tablefunc->ordinalitycol;
+		((TableFuncScan *) (tstate->ss.ps.plan))->tablefunc->ordinalitycol;
 
 	/*
 	 * Install the document as a possibly-toasted Datum into the tablefunc
@@ -364,11 +365,11 @@ tfuncInitialize(TableFuncScanState *tstate, ExprContext *econtext, Datum doc)
 	forboth(lc1, tstate->ns_uris, lc2, tstate->ns_names)
 	{
 		ExprState  *expr = (ExprState *) lfirst(lc1);
-		Value	   *ns_node = (Value *) lfirst(lc2);
+		String	   *ns_node = lfirst_node(String, lc2);
 		char	   *ns_uri;
 		char	   *ns_name;
 
-		value = ExecEvalExpr((ExprState *) expr, econtext, &isnull);
+		value = ExecEvalExpr(expr, econtext, &isnull);
 		if (isnull)
 			ereport(ERROR,
 					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
@@ -381,14 +382,20 @@ tfuncInitialize(TableFuncScanState *tstate, ExprContext *econtext, Datum doc)
 		routine->SetNamespace(tstate, ns_name, ns_uri);
 	}
 
-	/* Install the row filter expression into the table builder context */
-	value = ExecEvalExpr(tstate->rowexpr, econtext, &isnull);
-	if (isnull)
-		ereport(ERROR,
-				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-				 errmsg("row filter expression must not be null")));
+	/*
+	 * Install the row filter expression, if any, into the table builder
+	 * context.
+	 */
+	if (routine->SetRowFilter)
+	{
+		value = ExecEvalExpr(tstate->rowexpr, econtext, &isnull);
+		if (isnull)
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("row filter expression must not be null")));
 
-	routine->SetRowFilter(tstate, TextDatumGetCString(value));
+		routine->SetRowFilter(tstate, TextDatumGetCString(value));
+	}
 
 	/*
 	 * Install the column filter expressions into the table builder context.
@@ -511,7 +518,7 @@ tfuncLoadRows(TableFuncScanState *tstate, ExprContext *econtext)
 
 			/* advance list of default expressions */
 			if (cell != NULL)
-				cell = lnext(cell);
+				cell = lnext(tstate->coldefexprs, cell);
 		}
 
 		tuplestore_putvalues(tstate->tupstore, tupdesc, values, nulls);

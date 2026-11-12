@@ -3,7 +3,7 @@
  * base64.c
  *	  Encoding and decoding routines for base64 without whitespace.
  *
- * Copyright (c) 2001-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2026, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -41,14 +41,15 @@ static const int8 b64lookup[128] = {
 /*
  * pg_b64_encode
  *
- * Encode into base64 the given string.  Returns the length of the encoded
- * string.
+ * Encode the 'src' byte array into base64.  Returns the length of the encoded
+ * string, and -1 in the event of an error with the result buffer zeroed for
+ * safety.
  */
 int
-pg_b64_encode(const char *src, int len, char *dst)
+pg_b64_encode(const uint8 *src, int len, char *dst, int dstlen)
 {
 	char	   *p;
-	const char *s,
+	const uint8 *s,
 			   *end = src + len;
 	int			pos = 2;
 	uint32		buf = 0;
@@ -58,13 +59,20 @@ pg_b64_encode(const char *src, int len, char *dst)
 
 	while (s < end)
 	{
-		buf |= (unsigned char) *s << (pos << 3);
+		buf |= *s << (pos << 3);
 		pos--;
 		s++;
 
 		/* write it out */
 		if (pos < 0)
 		{
+			/*
+			 * Leave if there is an overflow in the area allocated for the
+			 * encoded string.
+			 */
+			if ((p - dst + 4) > dstlen)
+				goto error;
+
 			*p++ = _base64[(buf >> 18) & 0x3f];
 			*p++ = _base64[(buf >> 12) & 0x3f];
 			*p++ = _base64[(buf >> 6) & 0x3f];
@@ -76,27 +84,40 @@ pg_b64_encode(const char *src, int len, char *dst)
 	}
 	if (pos != 2)
 	{
+		/*
+		 * Leave if there is an overflow in the area allocated for the encoded
+		 * string.
+		 */
+		if ((p - dst + 4) > dstlen)
+			goto error;
+
 		*p++ = _base64[(buf >> 18) & 0x3f];
 		*p++ = _base64[(buf >> 12) & 0x3f];
 		*p++ = (pos == 0) ? _base64[(buf >> 6) & 0x3f] : '=';
 		*p++ = '=';
 	}
 
+	Assert((p - dst) <= dstlen);
 	return p - dst;
+
+error:
+	memset(dst, 0, dstlen);
+	return -1;
 }
 
 /*
  * pg_b64_decode
  *
  * Decode the given base64 string.  Returns the length of the decoded
- * string on success, and -1 in the event of an error.
+ * string on success, and -1 in the event of an error with the result
+ * buffer zeroed for safety.
  */
 int
-pg_b64_decode(const char *src, int len, char *dst)
+pg_b64_decode(const char *src, int len, uint8 *dst, int dstlen)
 {
 	const char *srcend = src + len,
 			   *s = src;
-	char	   *p = dst;
+	uint8	   *p = dst;
 	char		c;
 	int			b = 0;
 	uint32		buf = 0;
@@ -109,7 +130,7 @@ pg_b64_decode(const char *src, int len, char *dst)
 
 		/* Leave if a whitespace is found */
 		if (c == ' ' || c == '\t' || c == '\n' || c == '\r')
-			return -1;
+			goto error;
 
 		if (c == '=')
 		{
@@ -126,7 +147,7 @@ pg_b64_decode(const char *src, int len, char *dst)
 					 * Unexpected "=" character found while decoding base64
 					 * sequence.
 					 */
-					return -1;
+					goto error;
 				}
 			}
 			b = 0;
@@ -139,7 +160,7 @@ pg_b64_decode(const char *src, int len, char *dst)
 			if (b < 0)
 			{
 				/* invalid symbol found */
-				return -1;
+				goto error;
 			}
 		}
 		/* add it to buffer */
@@ -147,11 +168,28 @@ pg_b64_decode(const char *src, int len, char *dst)
 		pos++;
 		if (pos == 4)
 		{
+			/*
+			 * Leave if there is an overflow in the area allocated for the
+			 * decoded string.
+			 */
+			if ((p - dst + 1) > dstlen)
+				goto error;
 			*p++ = (buf >> 16) & 255;
+
 			if (end == 0 || end > 1)
+			{
+				/* overflow check */
+				if ((p - dst + 1) > dstlen)
+					goto error;
 				*p++ = (buf >> 8) & 255;
+			}
 			if (end == 0 || end > 2)
+			{
+				/* overflow check */
+				if ((p - dst + 1) > dstlen)
+					goto error;
 				*p++ = buf & 255;
+			}
 			buf = 0;
 			pos = 0;
 		}
@@ -163,10 +201,15 @@ pg_b64_decode(const char *src, int len, char *dst)
 		 * base64 end sequence is invalid.  Input data is missing padding, is
 		 * truncated or is otherwise corrupted.
 		 */
-		return -1;
+		goto error;
 	}
 
+	Assert((p - dst) <= dstlen);
 	return p - dst;
+
+error:
+	memset(dst, 0, dstlen);
+	return -1;
 }
 
 /*
@@ -181,7 +224,7 @@ int
 pg_b64_enc_len(int srclen)
 {
 	/* 3 bytes will be converted to 4 */
-	return (srclen + 2) * 4 / 3;
+	return (srclen + 2) / 3 * 4;
 }
 
 /*

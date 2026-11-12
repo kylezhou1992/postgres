@@ -3,7 +3,7 @@
  * test_rbtree.c
  *		Test correctness of red-black tree operations.
  *
- * Copyright (c) 2009-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2009-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/test/modules/test_rbtree/test_rbtree.c
@@ -13,6 +13,7 @@
 
 #include "postgres.h"
 
+#include "common/pg_prng.h"
 #include "fmgr.h"
 #include "lib/rbtree.h"
 #include "utils/memutils.h"
@@ -25,7 +26,7 @@ PG_MODULE_MAGIC;
  */
 typedef struct IntRBTreeNode
 {
-	RBNode		rbnode;
+	RBTNode		rbtnode;
 	int			key;
 } IntRBTreeNode;
 
@@ -35,7 +36,7 @@ typedef struct IntRBTreeNode
  * since none of our test keys are negative.
  */
 static int
-irb_cmp(const RBNode *a, const RBNode *b, void *arg)
+irbt_cmp(const RBTNode *a, const RBTNode *b, void *arg)
 {
 	const IntRBTreeNode *ea = (const IntRBTreeNode *) a;
 	const IntRBTreeNode *eb = (const IntRBTreeNode *) b;
@@ -48,7 +49,7 @@ irb_cmp(const RBNode *a, const RBNode *b, void *arg)
  * try to combine unequal keys.
  */
 static void
-irb_combine(RBNode *existing, const RBNode *newdata, void *arg)
+irbt_combine(RBTNode *existing, const RBTNode *newdata, void *arg)
 {
 	const IntRBTreeNode *eexist = (const IntRBTreeNode *) existing;
 	const IntRBTreeNode *enew = (const IntRBTreeNode *) newdata;
@@ -59,15 +60,15 @@ irb_combine(RBNode *existing, const RBNode *newdata, void *arg)
 }
 
 /* Node allocator */
-static RBNode *
-irb_alloc(void *arg)
+static RBTNode *
+irbt_alloc(void *arg)
 {
-	return (RBNode *) palloc(sizeof(IntRBTreeNode));
+	return (RBTNode *) palloc_object(IntRBTreeNode);
 }
 
 /* Node freer */
 static void
-irb_free(RBNode *node, void *arg)
+irbt_free(RBTNode *node, void *arg)
 {
 	pfree(node);
 }
@@ -78,12 +79,12 @@ irb_free(RBNode *node, void *arg)
 static RBTree *
 create_int_rbtree(void)
 {
-	return rb_create(sizeof(IntRBTreeNode),
-					 irb_cmp,
-					 irb_combine,
-					 irb_alloc,
-					 irb_free,
-					 NULL);
+	return rbt_create(sizeof(IntRBTreeNode),
+					  irbt_cmp,
+					  irbt_combine,
+					  irbt_alloc,
+					  irbt_free,
+					  NULL);
 }
 
 /*
@@ -95,7 +96,7 @@ GetPermutation(int size)
 	int		   *permutation;
 	int			i;
 
-	permutation = (int *) palloc(size * sizeof(int));
+	permutation = palloc_array(int, size);
 
 	permutation[0] = 0;
 
@@ -108,7 +109,7 @@ GetPermutation(int size)
 	 */
 	for (i = 1; i < size; i++)
 	{
-		int			j = random() % (i + 1);
+		int			j = pg_prng_uint64_range(&pg_global_prng_state, 0, i);
 
 		if (j < i)				/* avoid fetching undefined data if j=i */
 			permutation[i] = permutation[j];
@@ -123,7 +124,7 @@ GetPermutation(int size)
  * 0, step, 2*step, 3*step, ..., inserting them in random order
  */
 static void
-rb_populate(RBTree *tree, int size, int step)
+rbt_populate(RBTree *tree, int size, int step)
 {
 	int		   *permutation = GetPermutation(size);
 	IntRBTreeNode node;
@@ -134,9 +135,9 @@ rb_populate(RBTree *tree, int size, int step)
 	for (i = 0; i < size; i++)
 	{
 		node.key = step * permutation[i];
-		rb_insert(tree, (RBNode *) &node, &isNew);
+		rbt_insert(tree, (RBTNode *) &node, &isNew);
 		if (!isNew)
-			elog(ERROR, "unexpected !isNew result from rb_insert");
+			elog(ERROR, "unexpected !isNew result from rbt_insert");
 	}
 
 	/*
@@ -146,9 +147,9 @@ rb_populate(RBTree *tree, int size, int step)
 	if (size > 0)
 	{
 		node.key = step * permutation[0];
-		rb_insert(tree, (RBNode *) &node, &isNew);
+		rbt_insert(tree, (RBTNode *) &node, &isNew);
 		if (isNew)
-			elog(ERROR, "unexpected isNew result from rb_insert");
+			elog(ERROR, "unexpected isNew result from rbt_insert");
 	}
 
 	pfree(permutation);
@@ -169,17 +170,17 @@ testleftright(int size)
 	int			count = 0;
 
 	/* check iteration over empty tree */
-	rb_begin_iterate(tree, LeftRightWalk, &iter);
-	if (rb_iterate(&iter) != NULL)
+	rbt_begin_iterate(tree, LeftRightWalk, &iter);
+	if (rbt_iterate(&iter) != NULL)
 		elog(ERROR, "left-right walk over empty tree produced an element");
 
 	/* fill tree with consecutive natural numbers */
-	rb_populate(tree, size, 1);
+	rbt_populate(tree, size, 1);
 
 	/* iterate over the tree */
-	rb_begin_iterate(tree, LeftRightWalk, &iter);
+	rbt_begin_iterate(tree, LeftRightWalk, &iter);
 
-	while ((node = (IntRBTreeNode *) rb_iterate(&iter)) != NULL)
+	while ((node = (IntRBTreeNode *) rbt_iterate(&iter)) != NULL)
 	{
 		/* check that order is increasing */
 		if (node->key <= lastKey)
@@ -209,17 +210,17 @@ testrightleft(int size)
 	int			count = 0;
 
 	/* check iteration over empty tree */
-	rb_begin_iterate(tree, RightLeftWalk, &iter);
-	if (rb_iterate(&iter) != NULL)
+	rbt_begin_iterate(tree, RightLeftWalk, &iter);
+	if (rbt_iterate(&iter) != NULL)
 		elog(ERROR, "right-left walk over empty tree produced an element");
 
 	/* fill tree with consecutive natural numbers */
-	rb_populate(tree, size, 1);
+	rbt_populate(tree, size, 1);
 
 	/* iterate over the tree */
-	rb_begin_iterate(tree, RightLeftWalk, &iter);
+	rbt_begin_iterate(tree, RightLeftWalk, &iter);
 
-	while ((node = (IntRBTreeNode *) rb_iterate(&iter)) != NULL)
+	while ((node = (IntRBTreeNode *) rbt_iterate(&iter)) != NULL)
 	{
 		/* check that order is decreasing */
 		if (node->key >= lastKey)
@@ -235,7 +236,7 @@ testrightleft(int size)
 }
 
 /*
- * Check the correctness of the rb_find operation by searching for
+ * Check the correctness of the rbt_find operation by searching for
  * both elements we inserted and elements we didn't.
  */
 static void
@@ -245,7 +246,7 @@ testfind(int size)
 	int			i;
 
 	/* Insert even integers from 0 to 2 * (size-1) */
-	rb_populate(tree, size, 2);
+	rbt_populate(tree, size, 2);
 
 	/* Check that all inserted elements can be found */
 	for (i = 0; i < size; i++)
@@ -254,7 +255,7 @@ testfind(int size)
 		IntRBTreeNode *resultNode;
 
 		node.key = 2 * i;
-		resultNode = (IntRBTreeNode *) rb_find(tree, (RBNode *) &node);
+		resultNode = (IntRBTreeNode *) rbt_find(tree, (RBTNode *) &node);
 		if (resultNode == NULL)
 			elog(ERROR, "inserted element was not found");
 		if (node.key != resultNode->key)
@@ -271,14 +272,115 @@ testfind(int size)
 		IntRBTreeNode *resultNode;
 
 		node.key = i;
-		resultNode = (IntRBTreeNode *) rb_find(tree, (RBNode *) &node);
+		resultNode = (IntRBTreeNode *) rbt_find(tree, (RBTNode *) &node);
 		if (resultNode != NULL)
 			elog(ERROR, "not-inserted element was found");
 	}
 }
 
 /*
- * Check the correctness of the rb_leftmost operation.
+ * Check the correctness of the rbt_find_less() and rbt_find_great() functions
+ * by searching for an equal key and iterating the lesser keys then the greater
+ * keys.
+ */
+static void
+testfindltgt(int size)
+{
+	RBTree	   *tree = create_int_rbtree();
+
+	/*
+	 * Using the size as the random key to search wouldn't allow us to get at
+	 * least one greater match, so we do size - 1
+	 */
+	int			randomKey = pg_prng_uint64_range(&pg_global_prng_state, 0, size - 1);
+	bool		keyDeleted;
+	IntRBTreeNode searchNode = {.key = randomKey};
+	IntRBTreeNode *lteNode;
+	IntRBTreeNode *gteNode;
+	IntRBTreeNode *node;
+
+	/* Insert natural numbers */
+	rbt_populate(tree, size, 1);
+
+	/*
+	 * Since the search key is included in the naturals of the tree, we're
+	 * sure to find an equal match
+	 */
+	lteNode = (IntRBTreeNode *) rbt_find_less(tree, (RBTNode *) &searchNode, true);
+	gteNode = (IntRBTreeNode *) rbt_find_great(tree, (RBTNode *) &searchNode, true);
+
+	if (lteNode == NULL || lteNode->key != searchNode.key)
+		elog(ERROR, "rbt_find_less() didn't find the equal key");
+
+	if (gteNode == NULL || gteNode->key != searchNode.key)
+		elog(ERROR, "rbt_find_great() didn't find the equal key");
+
+	if (lteNode != gteNode)
+		elog(ERROR, "rbt_find_less() and rbt_find_great() found different equal keys");
+
+	/* Find the rest of the naturals lesser than the search key */
+	keyDeleted = false;
+	for (; searchNode.key > 0; searchNode.key--)
+	{
+		/*
+		 * Find the next key.  If the current key is deleted, we can pass
+		 * equal_match == true and still find the next one.
+		 */
+		node = (IntRBTreeNode *) rbt_find_less(tree, (RBTNode *) &searchNode,
+											   keyDeleted);
+
+		/* ensure we find a lesser match */
+		if (!node || !(node->key < searchNode.key))
+			elog(ERROR, "rbt_find_less() didn't find a lesser key");
+
+		/* randomly delete the found key or leave it */
+		keyDeleted = (pg_prng_uint64_range(&pg_global_prng_state, 0, 1) == 1);
+		if (keyDeleted)
+			rbt_delete(tree, (RBTNode *) node);
+	}
+
+	/* Find the rest of the naturals greater than the search key */
+	keyDeleted = false;
+	for (searchNode.key = randomKey; searchNode.key < size - 1; searchNode.key++)
+	{
+		/*
+		 * Find the next key.  If the current key is deleted, we can pass
+		 * equal_match == true and still find the next one.
+		 */
+		node = (IntRBTreeNode *) rbt_find_great(tree, (RBTNode *) &searchNode,
+												keyDeleted);
+
+		/* ensure we find a greater match */
+		if (!node || !(node->key > searchNode.key))
+			elog(ERROR, "rbt_find_great() didn't find a greater key");
+
+		/* randomly delete the found key or leave it */
+		keyDeleted = (pg_prng_uint64_range(&pg_global_prng_state, 0, 1) == 1);
+		if (keyDeleted)
+			rbt_delete(tree, (RBTNode *) node);
+	}
+
+	/* Check out of bounds searches find nothing */
+	searchNode.key = -1;
+	node = (IntRBTreeNode *) rbt_find_less(tree, (RBTNode *) &searchNode, true);
+	if (node != NULL)
+		elog(ERROR, "rbt_find_less() found non-inserted element");
+	searchNode.key = 0;
+	node = (IntRBTreeNode *) rbt_find_less(tree, (RBTNode *) &searchNode, false);
+	if (node != NULL)
+		elog(ERROR, "rbt_find_less() found non-inserted element");
+	searchNode.key = size;
+	node = (IntRBTreeNode *) rbt_find_great(tree, (RBTNode *) &searchNode, true);
+	if (node != NULL)
+		elog(ERROR, "rbt_find_great() found non-inserted element");
+	searchNode.key = size - 1;
+	node = (IntRBTreeNode *) rbt_find_great(tree, (RBTNode *) &searchNode, false);
+	if (node != NULL)
+		elog(ERROR, "rbt_find_great() found non-inserted element");
+}
+
+/*
+ * Check the correctness of the rbt_leftmost operation.
  * This operation should always return the smallest element of the tree.
  */
 static void
@@ -288,20 +390,20 @@ testleftmost(int size)
 	IntRBTreeNode *result;
 
 	/* Check that empty tree has no leftmost element */
-	if (rb_leftmost(tree) != NULL)
+	if (rbt_leftmost(tree) != NULL)
 		elog(ERROR, "leftmost node of empty tree is not NULL");
 
 	/* fill tree with consecutive natural numbers */
-	rb_populate(tree, size, 1);
+	rbt_populate(tree, size, 1);
 
 	/* Check that leftmost element is the smallest one */
-	result = (IntRBTreeNode *) rb_leftmost(tree);
+	result = (IntRBTreeNode *) rbt_leftmost(tree);
 	if (result == NULL || result->key != 0)
-		elog(ERROR, "rb_leftmost gave wrong result");
+		elog(ERROR, "rbt_leftmost gave wrong result");
 }
 
 /*
- * Check the correctness of the rb_delete operation.
+ * Check the correctness of the rbt_delete operation.
  */
 static void
 testdelete(int size, int delsize)
@@ -312,15 +414,15 @@ testdelete(int size, int delsize)
 	int			i;
 
 	/* fill tree with consecutive natural numbers */
-	rb_populate(tree, size, 1);
+	rbt_populate(tree, size, 1);
 
 	/* Choose unique ids to delete */
-	deleteIds = (int *) palloc(delsize * sizeof(int));
-	chosen = (bool *) palloc0(size * sizeof(bool));
+	deleteIds = palloc_array(int, delsize);
+	chosen = palloc0_array(bool, size);
 
 	for (i = 0; i < delsize; i++)
 	{
-		int			k = random() % size;
+		int			k = pg_prng_uint64_range(&pg_global_prng_state, 0, size - 1);
 
 		while (chosen[k])
 			k = (k + 1) % size;
@@ -336,11 +438,11 @@ testdelete(int size, int delsize)
 
 		find.key = deleteIds[i];
 		/* Locate the node to be deleted */
-		node = (IntRBTreeNode *) rb_find(tree, (RBNode *) &find);
+		node = (IntRBTreeNode *) rbt_find(tree, (RBTNode *) &find);
 		if (node == NULL || node->key != deleteIds[i])
 			elog(ERROR, "expected element was not found during deleting");
 		/* Delete it */
-		rb_delete(tree, (RBNode *) node);
+		rbt_delete(tree, (RBTNode *) node);
 	}
 
 	/* Check that deleted elements are deleted */
@@ -350,7 +452,7 @@ testdelete(int size, int delsize)
 		IntRBTreeNode *result;
 
 		node.key = i;
-		result = (IntRBTreeNode *) rb_find(tree, (RBNode *) &node);
+		result = (IntRBTreeNode *) rbt_find(tree, (RBTNode *) &node);
 		if (chosen[i])
 		{
 			/* Deleted element should be absent */
@@ -375,15 +477,15 @@ testdelete(int size, int delsize)
 			continue;
 		find.key = i;
 		/* Locate the node to be deleted */
-		node = (IntRBTreeNode *) rb_find(tree, (RBNode *) &find);
+		node = (IntRBTreeNode *) rbt_find(tree, (RBTNode *) &find);
 		if (node == NULL || node->key != i)
 			elog(ERROR, "expected element was not found during deleting");
 		/* Delete it */
-		rb_delete(tree, (RBNode *) node);
+		rbt_delete(tree, (RBTNode *) node);
 	}
 
 	/* Tree should now be empty */
-	if (rb_leftmost(tree) != NULL)
+	if (rbt_leftmost(tree) != NULL)
 		elog(ERROR, "deleting all elements failed");
 
 	pfree(deleteIds);
@@ -407,6 +509,7 @@ test_rb_tree(PG_FUNCTION_ARGS)
 	testleftright(size);
 	testrightleft(size);
 	testfind(size);
+	testfindltgt(size);
 	testleftmost(size);
 	testdelete(size, Max(size / 10, 1));
 	PG_RETURN_VOID();

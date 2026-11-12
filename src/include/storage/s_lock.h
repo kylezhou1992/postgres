@@ -1,10 +1,10 @@
 /*-------------------------------------------------------------------------
  *
  * s_lock.h
- *	   Hardware-dependent implementation of spinlocks.
+ *	   Implementation of spinlocks.
  *
  *	NOTE: none of the macros in this file are intended to be called directly.
- *	Call them through the hardware-independent macros in spin.h.
+ *	Call them through the macros in spin.h.
  *
  *	The following hardware-dependent macros must be provided for each
  *	supported platform:
@@ -20,10 +20,6 @@
  *
  *	void S_UNLOCK(slock_t *lock)
  *		Unlock a previously acquired lock.
- *
- *	bool S_LOCK_FREE(slock_t *lock)
- *		Tests if the lock is free. Returns true if free, false if locked.
- *		This does *not* change the state of the lock.
  *
  *	void SPIN_DELAY(void)
  *		Delay operation to occur inside spinlock wait loop.
@@ -48,23 +44,14 @@
  *		atomic test-and-set only when it appears free.
  *
  *	TAS() and TAS_SPIN() are NOT part of the API, and should never be called
- *	directly.
- *
- *	CAUTION: on some platforms TAS() and/or TAS_SPIN() may sometimes report
- *	failure to acquire a lock even when the lock is not locked.  For example,
- *	on Alpha TAS() will "fail" if interrupted.  Therefore a retry loop must
- *	always be used, even if you are certain the lock is free.
+ *	directly.  A platform must provide either S_LOCK() or a TAS() for the
+ *	default S_LOCK() to be built on.  Currently, all supported platforms do
+ *	the latter, so that is probably the best place to start if adding a new
+ *	one.
  *
  *	It is the responsibility of these macros to make sure that the compiler
  *	does not re-order accesses to shared memory to precede the actual lock
- *	acquisition, or follow the lock release.  Prior to PostgreSQL 9.5, this
- *	was the caller's responsibility, which meant that callers had to use
- *	volatile-qualified pointers to refer to both the spinlock itself and the
- *	shared data being accessed within the spinlocked critical section.  This
- *	was notationally awkward, easy to forget (and thus error-prone), and
- *	prevented some useful compiler optimizations.  For these reasons, we
- *	now require that the macros themselves prevent compiler re-ordering,
- *	so that the caller doesn't need to take special precautions.
+ *	acquisition, or follow the lock release.
  *
  *	On platforms with weak memory ordering, the TAS(), TAS_SPIN(), and
  *	S_UNLOCK() macros must further include hardware-level memory fence
@@ -76,17 +63,10 @@
  *
  *	On most supported platforms, TAS() uses a tas() function written
  *	in assembly language to execute a hardware atomic-test-and-set
- *	instruction.  Equivalent OS-supplied mutex routines could be used too.
- *
- *	If no system-specific TAS() is available (ie, HAVE_SPINLOCKS is not
- *	defined), then we fall back on an emulation that uses SysV semaphores
- *	(see spin.c).  This emulation will be MUCH MUCH slower than a proper TAS()
- *	implementation, because of the cost of a kernel call per lock or unlock.
- *	An old report is that Postgres spends around 40% of its time in semop(2)
- *	when using the SysV semaphore code.
+ *	instruction.  Equivalent compiler intrinsics are another popular option.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *	  src/include/storage/s_lock.h
@@ -99,8 +79,6 @@
 #ifdef FRONTEND
 #error "s_lock.h may not be included from frontend code"
 #endif
-
-#ifdef HAVE_SPINLOCKS	/* skip spinlocks if requested */
 
 #if defined(__GNUC__) || defined(__INTEL_COMPILER)
 /*************************************************************************
@@ -128,21 +106,24 @@
  * gcc from thinking it can cache the values of shared-memory fields
  * across the asm code.  Add "cc" if your asm code changes the condition
  * code register, and also list any temp registers the code uses.
+ *
+ * If you need branch target labels within the asm block, include "%="
+ * in the label names to make them distinct across multiple asm blocks
+ * within a source file.
  *----------
  */
 
 
 #ifdef __i386__		/* 32-bit i386 */
-#define HAS_TEST_AND_SET
 
 typedef unsigned char slock_t;
 
 #define TAS(lock) tas(lock)
 
-static __inline__ int
+static inline int
 tas(volatile slock_t *lock)
 {
-	register slock_t _res = 1;
+	slock_t		_res = 1;
 
 	/*
 	 * Use a non-locking test before asserting the bus lock.  Note that the
@@ -156,11 +137,11 @@ tas(volatile slock_t *lock)
 	 * leave it alone.
 	 */
 	__asm__ __volatile__(
-		"	cmpb	$0,%1	\n"
-		"	jne		1f		\n"
-		"	lock			\n"
-		"	xchgb	%0,%1	\n"
-		"1: \n"
+		"	cmpb	$0,%1		\n"
+		"	jne		TAS%=_out	\n"
+		"	lock				\n"
+		"	xchgb	%0,%1		\n"
+		"TAS%=_out: \n"
 :		"+q"(_res), "+m"(*lock)
 :		/* no inputs */
 :		"memory", "cc");
@@ -169,7 +150,7 @@ tas(volatile slock_t *lock)
 
 #define SPIN_DELAY() spin_delay()
 
-static __inline__ void
+static inline void
 spin_delay(void)
 {
 	/*
@@ -203,7 +184,6 @@ spin_delay(void)
 
 
 #ifdef __x86_64__		/* AMD Opteron, Intel EM64T */
-#define HAS_TEST_AND_SET
 
 typedef unsigned char slock_t;
 
@@ -220,10 +200,10 @@ typedef unsigned char slock_t;
  */
 #define TAS_SPIN(lock)    (*(lock) ? 1 : TAS(lock))
 
-static __inline__ int
+static inline int
 tas(volatile slock_t *lock)
 {
-	register slock_t _res = 1;
+	slock_t		_res = 1;
 
 	__asm__ __volatile__(
 		"	lock			\n"
@@ -236,7 +216,7 @@ tas(volatile slock_t *lock)
 
 #define SPIN_DELAY() spin_delay()
 
-static __inline__ void
+static inline void
 spin_delay(void)
 {
 	/*
@@ -250,85 +230,20 @@ spin_delay(void)
 #endif	 /* __x86_64__ */
 
 
-#if defined(__ia64__) || defined(__ia64)
-/*
- * Intel Itanium, gcc or Intel's compiler.
- *
- * Itanium has weak memory ordering, but we rely on the compiler to enforce
- * strict ordering of accesses to volatile data.  In particular, while the
- * xchg instruction implicitly acts as a memory barrier with 'acquire'
- * semantics, we do not have an explicit memory fence instruction in the
- * S_UNLOCK macro.  We use a regular assignment to clear the spinlock, and
- * trust that the compiler marks the generated store instruction with the
- * ".rel" opcode.
- *
- * Testing shows that assumption to hold on gcc, although I could not find
- * any explicit statement on that in the gcc manual.  In Intel's compiler,
- * the -m[no-]serialize-volatile option controls that, and testing shows that
- * it is enabled by default.
- *
- * While icc accepts gcc asm blocks on x86[_64], this is not true on ia64
- * (at least not in icc versions before 12.x).  So we have to carry a separate
- * compiler-intrinsic-based implementation for it.
- */
-#define HAS_TEST_AND_SET
-
-typedef unsigned int slock_t;
-
-#define TAS(lock) tas(lock)
-
-/* On IA64, it's a win to use a non-locking test before the xchg proper */
-#define TAS_SPIN(lock)	(*(lock) ? 1 : TAS(lock))
-
-#ifndef __INTEL_COMPILER
-
-static __inline__ int
-tas(volatile slock_t *lock)
-{
-	long int	ret;
-
-	__asm__ __volatile__(
-		"	xchg4 	%0=%1,%2	\n"
-:		"=r"(ret), "+m"(*lock)
-:		"r"(1)
-:		"memory");
-	return (int) ret;
-}
-
-#else /* __INTEL_COMPILER */
-
-static __inline__ int
-tas(volatile slock_t *lock)
-{
-	int		ret;
-
-	ret = _InterlockedExchange(lock,1);	/* this is a xchg asm macro */
-
-	return ret;
-}
-
-/* icc can't use the regular gcc S_UNLOCK() macro either in this case */
-#define S_UNLOCK(lock)	\
-	do { __memory_barrier(); *(lock) = 0; } while (0)
-
-#endif /* __INTEL_COMPILER */
-#endif	 /* __ia64__ || __ia64 */
-
 /*
  * On ARM and ARM64, we use __sync_lock_test_and_set(int *, int) if available.
  *
  * We use the int-width variant of the builtin because it works on more chips
  * than other widths.
  */
-#if defined(__arm__) || defined(__arm) || defined(__aarch64__) || defined(__aarch64)
+#if defined(__arm__) || defined(__aarch64__)
 #ifdef HAVE_GCC__SYNC_INT32_TAS
-#define HAS_TEST_AND_SET
 
 #define TAS(lock) tas(lock)
 
 typedef int slock_t;
 
-static __inline__ int
+static inline int
 tas(volatile slock_t *lock)
 {
 	return __sync_lock_test_and_set(lock, 1);
@@ -336,19 +251,41 @@ tas(volatile slock_t *lock)
 
 #define S_UNLOCK(lock) __sync_lock_release(lock)
 
+#if defined(__aarch64__)
+
+/*
+ * On ARM64, it's a win to use a non-locking test before the TAS proper.  It
+ * may be a win on 32-bit ARM, too, but nobody's tested it yet.
+ */
+#define TAS_SPIN(lock)	(*(lock) ? 1 : TAS(lock))
+
+#define SPIN_DELAY() spin_delay()
+
+static inline void
+spin_delay(void)
+{
+	/*
+	 * Using an ISB instruction to delay in spinlock loops appears beneficial
+	 * on high-core-count ARM64 processors.  It seems mostly a wash for smaller
+	 * gear, and ISB doesn't exist at all on pre-v7 ARM chips.
+	 */
+	__asm__ __volatile__(
+		" isb;				\n");
+}
+
+#endif	 /* __aarch64__ */
 #endif	 /* HAVE_GCC__SYNC_INT32_TAS */
-#endif	 /* __arm__ || __arm || __aarch64__ || __aarch64 */
+#endif	 /* __arm__ || __aarch64__ */
 
 
 /* S/390 and S/390x Linux (32- and 64-bit zSeries) */
 #if defined(__s390__) || defined(__s390x__)
-#define HAS_TEST_AND_SET
 
 typedef unsigned int slock_t;
 
 #define TAS(lock)	   tas(lock)
 
-static __inline__ int
+static inline int
 tas(volatile slock_t *lock)
 {
 	int			_res = 0;
@@ -368,24 +305,23 @@ tas(volatile slock_t *lock)
 /*
  * Solaris has always run sparc processors in TSO (total store) mode, but
  * linux didn't use to and the *BSDs still don't. So, be careful about
- * acquire/release semantics. The CPU will treat superfluous membars as
+ * acquire/release semantics. The CPU will treat superfluous members as
  * NOPs, so it's just code space.
  */
-#define HAS_TEST_AND_SET
 
 typedef unsigned char slock_t;
 
 #define TAS(lock) tas(lock)
 
-static __inline__ int
+static inline int
 tas(volatile slock_t *lock)
 {
-	register slock_t _res;
+	slock_t		_res;
 
 	/*
-	 *	See comment in /pg/backend/port/tas/solaris_sparc.s for why this
-	 *	uses "ldstub", and that file uses "cas".  gcc currently generates
-	 *	sparcv7-targeted binaries, so "cas" use isn't possible.
+	 * "cas" would be better than "ldstub", but it is only present on
+	 * sparcv8plus and later, while some platforms still support sparcv7 or
+	 * sparcv8.  Also, "cas" requires that the system be running in TSO mode.
 	 */
 	__asm__ __volatile__(
 		"	ldstub	[%2], %0	\n"
@@ -441,8 +377,7 @@ do \
 
 
 /* PowerPC */
-#if defined(__ppc__) || defined(__powerpc__) || defined(__ppc64__) || defined(__powerpc64__)
-#define HAS_TEST_AND_SET
+#if defined(__powerpc__) || defined(__powerpc64__)
 
 typedef unsigned int slock_t;
 
@@ -452,43 +387,37 @@ typedef unsigned int slock_t;
 #define TAS_SPIN(lock)	(*(lock) ? 1 : TAS(lock))
 
 /*
+ * The second operand of addi can hold a constant zero or a register number,
+ * hence constraint "=&b" to avoid allocating r0.  "b" stands for "address
+ * base register"; most operands having this register-or-zero property are
+ * address bases, e.g. the second operand of lwax.
+ *
  * NOTE: per the Enhanced PowerPC Architecture manual, v1.0 dated 7-May-2002,
  * an isync is a sufficient synchronization barrier after a lwarx/stwcx loop.
- * On newer machines, we can use lwsync instead for better performance.
- *
- * Ordinarily, we'd code the branches here using GNU-style local symbols, that
- * is "1f" referencing "1:" and so on.  But some people run gcc on AIX with
- * IBM's assembler as backend, and IBM's assembler doesn't do local symbols.
- * So hand-code the branch offsets; fortunately, all PPC instructions are
- * exactly 4 bytes each, so it's not too hard to count.
+ * But if the spinlock is in ordinary memory, we can use lwsync instead for
+ * better performance.
  */
-static __inline__ int
+static inline int
 tas(volatile slock_t *lock)
 {
 	slock_t _t;
 	int _res;
 
 	__asm__ __volatile__(
-#ifdef USE_PPC_LWARX_MUTEX_HINT
 "	lwarx   %0,0,%3,1	\n"
-#else
-"	lwarx   %0,0,%3		\n"
-#endif
 "	cmpwi   %0,0		\n"
-"	bne     $+16		\n"		/* branch to li %1,1 */
+"	bne     TAS%=_fail	\n"
 "	addi    %0,%0,1		\n"
 "	stwcx.  %0,0,%3		\n"
-"	beq     $+12		\n"		/* branch to lwsync/isync */
+"	beq     TAS%=_ok	\n"
+"TAS%=_fail: \n"
 "	li      %1,1		\n"
-"	b       $+12		\n"		/* branch to end of asm sequence */
-#ifdef USE_PPC_LWSYNC
+"	b       TAS%=_out	\n"
+"TAS%=_ok: \n"
 "	lwsync				\n"
-#else
-"	isync				\n"
-#endif
 "	li      %1,0		\n"
-
-:	"=&r"(_t), "=r"(_res), "+m"(*lock)
+"TAS%=_out: \n"
+:	"=&b"(_t), "=r"(_res), "+m"(*lock)
 :	"r"(lock)
 :	"memory", "cc");
 	return _res;
@@ -496,126 +425,53 @@ tas(volatile slock_t *lock)
 
 /*
  * PowerPC S_UNLOCK is almost standard but requires a "sync" instruction.
- * On newer machines, we can use lwsync instead for better performance.
+ * But we can use lwsync instead for better performance.
  */
-#ifdef USE_PPC_LWSYNC
 #define S_UNLOCK(lock)	\
 do \
 { \
 	__asm__ __volatile__ ("	lwsync \n" ::: "memory"); \
 	*((volatile slock_t *) (lock)) = 0; \
 } while (0)
-#else
-#define S_UNLOCK(lock)	\
-do \
-{ \
-	__asm__ __volatile__ ("	sync \n" ::: "memory"); \
-	*((volatile slock_t *) (lock)) = 0; \
-} while (0)
-#endif /* USE_PPC_LWSYNC */
 
 #endif /* powerpc */
 
 
-/* Linux Motorola 68k */
-#if (defined(__mc68000__) || defined(__m68k__)) && defined(__linux__)
-#define HAS_TEST_AND_SET
-
-typedef unsigned char slock_t;
-
-#define TAS(lock) tas(lock)
-
-static __inline__ int
-tas(volatile slock_t *lock)
-{
-	register int rv;
-
-	__asm__	__volatile__(
-		"	clrl	%0		\n"
-		"	tas		%1		\n"
-		"	sne		%0		\n"
-:		"=d"(rv), "+m"(*lock)
-:		/* no inputs */
-:		"memory", "cc");
-	return rv;
-}
-
-#endif	 /* (__mc68000__ || __m68k__) && __linux__ */
-
-
-/* Motorola 88k */
-#if defined(__m88k__)
-#define HAS_TEST_AND_SET
+#if defined(__mips__) && !defined(__sgi)	/* non-SGI MIPS */
 
 typedef unsigned int slock_t;
 
 #define TAS(lock) tas(lock)
-
-static __inline__ int
-tas(volatile slock_t *lock)
-{
-	register slock_t _res = 1;
-
-	__asm__ __volatile__(
-		"	xmem	%0, %2, %%r0	\n"
-:		"+r"(_res), "+m"(*lock)
-:		"r"(lock)
-:		"memory");
-	return (int) _res;
-}
-
-#endif	 /* __m88k__ */
-
 
 /*
- * VAXen -- even multiprocessor ones
- * (thanks to Tom Ivar Helbekkmo)
+ * Original MIPS-I processors lacked the LL/SC instructions, but if we are
+ * so unfortunate as to be running on one of those, we expect that the kernel
+ * will handle the illegal-instruction traps and emulate them for us.  On
+ * anything newer (and really, MIPS-I is extinct) LL/SC is the only sane
+ * choice because any other synchronization method must involve a kernel
+ * call.  Unfortunately, many toolchains still default to MIPS-I as the
+ * codegen target; if the symbol __mips shows that that's the case, we
+ * have to force the assembler to accept LL/SC.
+ *
+ * R10000 and up processors require a separate SYNC, which has the same
+ * issues as LL/SC.
  */
-#if defined(__vax__)
-#define HAS_TEST_AND_SET
+#if __mips < 2
+#define MIPS_SET_MIPS2	"       .set mips2          \n"
+#else
+#define MIPS_SET_MIPS2
+#endif
 
-typedef unsigned char slock_t;
-
-#define TAS(lock) tas(lock)
-
-static __inline__ int
+static inline int
 tas(volatile slock_t *lock)
 {
-	register int	_res;
-
-	__asm__ __volatile__(
-		"	movl 	$1, %0			\n"
-		"	bbssi	$0, (%2), 1f	\n"
-		"	clrl	%0				\n"
-		"1: \n"
-:		"=&r"(_res), "+m"(*lock)
-:		"r"(lock)
-:		"memory");
-	return _res;
-}
-
-#endif	 /* __vax__ */
-
-
-#if defined(__mips__) && !defined(__sgi)	/* non-SGI MIPS */
-/* Note: on SGI we use the OS' mutex ABI, see below */
-/* Note: R10000 processors require a separate SYNC */
-#define HAS_TEST_AND_SET
-
-typedef unsigned int slock_t;
-
-#define TAS(lock) tas(lock)
-
-static __inline__ int
-tas(volatile slock_t *lock)
-{
-	register volatile slock_t *_l = lock;
-	register int _res;
-	register int _tmp;
+	volatile slock_t *_l = lock;
+	int			_res;
+	int			_tmp;
 
 	__asm__ __volatile__(
 		"       .set push           \n"
-		"       .set mips2          \n"
+		MIPS_SET_MIPS2
 		"       .set noreorder      \n"
 		"       .set nomacro        \n"
 		"       ll      %0, %2      \n"
@@ -637,7 +493,7 @@ do \
 { \
 	__asm__ __volatile__( \
 		"       .set push           \n" \
-		"       .set mips2          \n" \
+		MIPS_SET_MIPS2 \
 		"       .set noreorder      \n" \
 		"       .set nomacro        \n" \
 		"       sync                \n" \
@@ -651,56 +507,48 @@ do \
 #endif /* __mips__ && !__sgi */
 
 
-#if defined(__m32r__) && defined(HAVE_SYS_TAS_H)	/* Renesas' M32R */
-#define HAS_TEST_AND_SET
 
-#include <sys/tas.h>
+/*
+ * If we have no platform-specific knowledge, but we found that the compiler
+ * provides __sync_lock_test_and_set(), use that.  Prefer the int-width
+ * version over the char-width version if we have both, on the rather dubious
+ * grounds that that's known to be more likely to work in the ARM ecosystem.
+ * (But we dealt with ARM above.)
+ */
+#if !defined(TAS)
+
+#if defined(HAVE_GCC__SYNC_INT32_TAS)
+
+#define TAS(lock) tas(lock)
 
 typedef int slock_t;
 
-#define TAS(lock) tas(lock)
-
-#endif /* __m32r__ */
-
-
-#if defined(__sh__)				/* Renesas' SuperH */
-#define HAS_TEST_AND_SET
-
-typedef unsigned char slock_t;
-
-#define TAS(lock) tas(lock)
-
-static __inline__ int
+static inline int
 tas(volatile slock_t *lock)
 {
-	register int _res;
-
-	/*
-	 * This asm is coded as if %0 could be any register, but actually SuperH
-	 * restricts the target of xor-immediate to be R0.  That's handled by
-	 * the "z" constraint on _res.
-	 */
-	__asm__ __volatile__(
-		"	tas.b @%2    \n"
-		"	movt  %0     \n"
-		"	xor   #1,%0  \n"
-:		"=z"(_res), "+m"(*lock)
-:		"r"(lock)
-:		"memory", "t");
-	return _res;
+	return __sync_lock_test_and_set(lock, 1);
 }
 
-#endif	 /* __sh__ */
+#define S_UNLOCK(lock) __sync_lock_release(lock)
 
+#elif defined(HAVE_GCC__SYNC_CHAR_TAS)
 
-/* These live in s_lock.c, but only for gcc */
+#define TAS(lock) tas(lock)
 
+typedef char slock_t;
 
-#if defined(__m68k__) && !defined(__linux__)	/* non-Linux Motorola 68k */
-#define HAS_TEST_AND_SET
+static inline int
+tas(volatile slock_t *lock)
+{
+	return __sync_lock_test_and_set(lock, 1);
+}
 
-typedef unsigned char slock_t;
-#endif
+#define S_UNLOCK(lock) __sync_lock_release(lock)
+
+#endif	 /* HAVE_GCC__SYNC_INT32_TAS */
+
+#endif	/* !defined(TAS) */
+
 
 /*
  * Default implementation of S_UNLOCK() for gcc/icc.
@@ -720,158 +568,39 @@ typedef unsigned char slock_t;
 #endif	/* defined(__GNUC__) || defined(__INTEL_COMPILER) */
 
 
-
 /*
  * ---------------------------------------------------------------------
  * Platforms that use non-gcc inline assembly:
  * ---------------------------------------------------------------------
  */
 
-#if !defined(HAS_TEST_AND_SET)	/* We didn't trigger above, let's try here */
-
-
-#if defined(__hppa) || defined(__hppa__)	/* HP PA-RISC, GCC and HP compilers */
-/*
- * HP's PA-RISC
- *
- * See src/backend/port/hpux/tas.c.template for details about LDCWX.  Because
- * LDCWX requires a 16-byte-aligned address, we declare slock_t as a 16-byte
- * struct.  The active word in the struct is whichever has the aligned address;
- * the other three words just sit at -1.
- *
- * When using gcc, we can inline the required assembly code.
- */
-#define HAS_TEST_AND_SET
-
-typedef struct
-{
-	int			sema[4];
-} slock_t;
-
-#define TAS_ACTIVE_WORD(lock)	((volatile int *) (((uintptr_t) (lock) + 15) & ~15))
-
-#if defined(__GNUC__)
-
-static __inline__ int
-tas(volatile slock_t *lock)
-{
-	volatile int *lockword = TAS_ACTIVE_WORD(lock);
-	register int lockval;
-
-	__asm__ __volatile__(
-		"	ldcwx	0(0,%2),%0	\n"
-:		"=r"(lockval), "+m"(*lockword)
-:		"r"(lockword)
-:		"memory");
-	return (lockval == 0);
-}
-
-/*
- * The hppa implementation doesn't follow the rules of this files and provides
- * a gcc specific implementation outside of the above defined(__GNUC__). It
- * does so to avoid duplication between the HP compiler and gcc. So undefine
- * the generic fallback S_UNLOCK from above.
- */
-#ifdef S_UNLOCK
-#undef S_UNLOCK
-#endif
-#define S_UNLOCK(lock)	\
-	do { \
-		__asm__ __volatile__("" : : : "memory"); \
-		*TAS_ACTIVE_WORD(lock) = -1; \
-	} while (0)
-
-#endif /* __GNUC__ */
-
-#define S_INIT_LOCK(lock) \
-	do { \
-		volatile slock_t *lock_ = (lock); \
-		lock_->sema[0] = -1; \
-		lock_->sema[1] = -1; \
-		lock_->sema[2] = -1; \
-		lock_->sema[3] = -1; \
-	} while (0)
-
-#define S_LOCK_FREE(lock)	(*TAS_ACTIVE_WORD(lock) != 0)
-
-#endif	 /* __hppa || __hppa__ */
-
-
-#if defined(__hpux) && defined(__ia64) && !defined(__GNUC__)
-/*
- * HP-UX on Itanium, non-gcc/icc compiler
- *
- * We assume that the compiler enforces strict ordering of loads/stores on
- * volatile data (see comments on the gcc-version earlier in this file).
- * Note that this assumption does *not* hold if you use the
- * +Ovolatile=__unordered option on the HP-UX compiler, so don't do that.
- *
- * See also Implementing Spinlocks on the Intel Itanium Architecture and
- * PA-RISC, by Tor Ekqvist and David Graves, for more information.  As of
- * this writing, version 1.0 of the manual is available at:
- * http://h21007.www2.hp.com/portal/download/files/unprot/itanium/spinlocks.pdf
- */
-#define HAS_TEST_AND_SET
-
-typedef unsigned int slock_t;
-
-#include <ia64/sys/inline.h>
-#define TAS(lock) _Asm_xchg(_SZ_W, lock, 1, _LDHINT_NONE)
-/* On IA64, it's a win to use a non-locking test before the xchg proper */
-#define TAS_SPIN(lock)	(*(lock) ? 1 : TAS(lock))
-#define S_UNLOCK(lock)	\
-	do { _Asm_mf(); (*(lock)) = 0; } while (0)
-
-#endif	/* HPUX on IA64, non gcc/icc */
-
-#if defined(_AIX)	/* AIX */
-/*
- * AIX (POWER)
- */
-#define HAS_TEST_AND_SET
-
-#include <sys/atomic_op.h>
-
-typedef int slock_t;
-
-#define TAS(lock)			_check_lock((slock_t *) (lock), 0, 1)
-#define S_UNLOCK(lock)		_clear_lock((slock_t *) (lock), 0)
-#endif	 /* _AIX */
-
-
-/* These are in sunstudio_(sparc|x86).s */
-
-#if defined(__SUNPRO_C) && (defined(__i386) || defined(__x86_64__) || defined(__sparc__) || defined(__sparc))
-#define HAS_TEST_AND_SET
-
-#if defined(__i386) || defined(__x86_64__) || defined(__sparcv9) || defined(__sparcv8plus)
-typedef unsigned int slock_t;
-#else
-typedef unsigned char slock_t;
-#endif
-
-extern slock_t pg_atomic_cas(volatile slock_t *lock, slock_t with,
-									  slock_t cmp);
-
-#define TAS(a) (pg_atomic_cas((a), 1, 0) != 0)
-#endif
-
+#if !defined(TAS)				/* We didn't trigger above, let's try here */
 
 #ifdef _MSC_VER
 typedef LONG slock_t;
 
-#define HAS_TEST_AND_SET
 #define TAS(lock) (InterlockedCompareExchange(lock, 1, 0))
 
 #define SPIN_DELAY() spin_delay()
 
-/* If using Visual C++ on Win64, inline assembly is unavailable.
- * Use a _mm_pause intrinsic instead of rep nop.
- */
-#if defined(_WIN64)
+#ifdef __aarch64__
 static __forceinline void
 spin_delay(void)
 {
+	/*
+	 * Research indicates ISB is better than __yield() on AArch64.  See
+	 * https://postgr.es/m/1c2a29b8-5b1e-44f7-a871-71ec5fefc120%40app.fastmail.com.
+	 */
+	__isb(_ARM64_BARRIER_SY);
+}
+#elif defined(_WIN64)
+static __forceinline void
+spin_delay(void)
+{
+	/*
+	 * If using Visual C++ on Win64, inline assembly is unavailable.
+	 * Use a _mm_pause intrinsic instead of rep nop.
+	 */
 	_mm_pause();
 }
 #else
@@ -884,59 +613,44 @@ spin_delay(void)
 #endif
 
 #include <intrin.h>
-#pragma intrinsic(_ReadWriteBarrier)
 
+#ifdef __aarch64__
+
+/* _ReadWriteBarrier() is insufficient on non-TSO architectures. */
+#pragma intrinsic(_InterlockedExchange)
+#define S_UNLOCK(lock) _InterlockedExchange(lock, 0)
+
+#else
+
+#pragma intrinsic(_ReadWriteBarrier)
 #define S_UNLOCK(lock)	\
 	do { _ReadWriteBarrier(); (*(lock)) = 0; } while (0)
 
 #endif
-
-
-#endif	/* !defined(HAS_TEST_AND_SET) */
-
-
-/* Blow up if we didn't have any way to do spinlocks */
-#ifndef HAS_TEST_AND_SET
-#error PostgreSQL does not have native spinlock support on this platform.  To continue the compilation, rerun configure using --disable-spinlocks.  However, performance will be poor.  Please report this to pgsql-bugs@postgresql.org.
 #endif
 
 
-#else	/* !HAVE_SPINLOCKS */
-
-
-/*
- * Fake spinlock implementation using semaphores --- slow and prone
- * to fall foul of kernel limits on number of semaphores, so don't use this
- * unless you must!  The subroutines appear in spin.c.
- */
-typedef int slock_t;
-
-extern bool s_lock_free_sema(volatile slock_t *lock);
-extern void s_unlock_sema(volatile slock_t *lock);
-extern void s_init_lock_sema(volatile slock_t *lock, bool nested);
-extern int	tas_sema(volatile slock_t *lock);
-
-#define S_LOCK_FREE(lock)	s_lock_free_sema(lock)
-#define S_UNLOCK(lock)	 s_unlock_sema(lock)
-#define S_INIT_LOCK(lock)	s_init_lock_sema(lock, false)
-#define TAS(lock)	tas_sema(lock)
-
-
-#endif	/* HAVE_SPINLOCKS */
+#endif	/* !defined(TAS) */
 
 
 /*
  * Default Definitions - override these above as needed.
  */
 
+/*
+ * Make sure S_LOCK is defined, either explicitly for the platform or via a TAS
+ * macro for the platform.
+ */
 #if !defined(S_LOCK)
+#ifdef TAS
+#define USE_DEFAULT_S_LOCK
+extern int s_lock(volatile slock_t *lock, const char *file, int line, const char *func);
 #define S_LOCK(lock) \
-	(TAS(lock) ? s_lock((lock), __FILE__, __LINE__, PG_FUNCNAME_MACRO) : 0)
+	(TAS(lock) ? s_lock((lock), __FILE__, __LINE__, __func__) : 0)
+#else
+#error PostgreSQL does not have spinlock support on this platform.  Please report this to pgsql-bugs@lists.postgresql.org.
+#endif	 /* TAS */
 #endif	 /* S_LOCK */
-
-#if !defined(S_LOCK_FREE)
-#define S_LOCK_FREE(lock)	(*(lock) == 0)
-#endif	 /* S_LOCK_FREE */
 
 #if !defined(S_UNLOCK)
 /*
@@ -968,23 +682,18 @@ extern void s_unlock(volatile slock_t *lock);
 #define SPIN_DELAY()	((void) 0)
 #endif	 /* SPIN_DELAY */
 
-#if !defined(TAS)
-extern int	tas(volatile slock_t *lock);		/* in port/.../tas.s, or
-												 * s_lock.c */
-
-#define TAS(lock)		tas(lock)
-#endif	 /* TAS */
-
-#if !defined(TAS_SPIN)
+/*
+ * TAS_SPIN is only needed by the default S_LOCK's helper function (s_lock()),
+ * so we only provide a default when there is a TAS to base it on.
+ */
+#if !defined(TAS_SPIN) && defined(TAS)
 #define TAS_SPIN(lock)	TAS(lock)
-#endif	 /* TAS_SPIN */
+#endif	 /* ! TAS_SPIN && TAS */
 
-extern slock_t dummy_spinlock;
 
 /*
  * Platform-independent out-of-line support routines
  */
-extern int s_lock(volatile slock_t *lock, const char *file, int line, const char *func);
 
 /* Support for dynamic adjustment of spins_per_delay */
 #define DEFAULT_SPINS_PER_DELAY  100
@@ -1018,8 +727,8 @@ init_spin_delay(SpinDelayStatus *status,
 	status->func = func;
 }
 
-#define init_local_spin_delay(status) init_spin_delay(status, __FILE__, __LINE__, PG_FUNCNAME_MACRO)
-void perform_spin_delay(SpinDelayStatus *status);
-void finish_spin_delay(SpinDelayStatus *status);
+#define init_local_spin_delay(status) init_spin_delay(status, __FILE__, __LINE__, __func__)
+extern void perform_spin_delay(SpinDelayStatus *status);
+extern void finish_spin_delay(SpinDelayStatus *status);
 
 #endif	 /* S_LOCK_H */

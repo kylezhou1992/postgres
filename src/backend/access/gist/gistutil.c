@@ -4,7 +4,7 @@
  *	  utilities routines for the postgres GiST index access method.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -18,13 +18,14 @@
 #include "access/gist_private.h"
 #include "access/htup_details.h"
 #include "access/reloptions.h"
-#include "catalog/pg_opclass.h"
+#include "common/pg_prng.h"
 #include "storage/indexfsm.h"
-#include "storage/lmgr.h"
 #include "utils/float.h"
-#include "utils/syscache.h"
+#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
-
+#include "utils/rel.h"
+#include "utils/snapmgr.h"
+#include "utils/syscache.h"
 
 /*
  * Write itup vector to page, has no control of free space.
@@ -32,7 +33,6 @@
 void
 gistfillbuffer(Page page, IndexTuple *itup, int len, OffsetNumber off)
 {
-	OffsetNumber l = InvalidOffsetNumber;
 	int			i;
 
 	if (off == InvalidOffsetNumber)
@@ -42,11 +42,12 @@ gistfillbuffer(Page page, IndexTuple *itup, int len, OffsetNumber off)
 	for (i = 0; i < len; i++)
 	{
 		Size		sz = IndexTupleSize(itup[i]);
+		OffsetNumber l;
 
-		l = PageAddItem(page, (Item) itup[i], sz, off, false, false);
+		l = PageAddItem(page, itup[i], sz, off, false, false);
 		if (l == InvalidOffsetNumber)
-			elog(ERROR, "failed to add item to GiST index page, item %d out of %d, size %d bytes",
-				 i, len, (int) sz);
+			elog(ERROR, "failed to add item to GiST index page, item %d out of %d, size %zu bytes",
+				 i, len, sz);
 		off++;
 	}
 }
@@ -99,7 +100,7 @@ gistextractpage(Page page, int *len /* out */ )
 
 	maxoff = PageGetMaxOffsetNumber(page);
 	*len = maxoff;
-	itvec = palloc(sizeof(IndexTuple) * maxoff);
+	itvec = palloc_array(IndexTuple, maxoff);
 	for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i))
 		itvec[i - FirstOffsetNumber] = (IndexTuple) PageGetItem(page, PageGetItemId(page, i));
 
@@ -112,14 +113,14 @@ gistextractpage(Page page, int *len /* out */ )
 IndexTuple *
 gistjoinvector(IndexTuple *itvec, int *len, IndexTuple *additvec, int addlen)
 {
-	itvec = (IndexTuple *) repalloc((void *) itvec, sizeof(IndexTuple) * ((*len) + addlen));
+	itvec = repalloc_array(itvec, IndexTuple, (*len) + addlen);
 	memmove(&itvec[*len], additvec, sizeof(IndexTuple) * addlen);
 	*len += addlen;
 	return itvec;
 }
 
 /*
- * make plain IndexTupleVector
+ * make plain IndexTuple vector
  */
 
 IndexTupleData *
@@ -156,11 +157,11 @@ gistMakeUnionItVec(GISTSTATE *giststate, IndexTuple *itvec, int len,
 {
 	int			i;
 	GistEntryVector *evec;
-	int			attrsize;
+	int			attrsize = 0;	/* silence compiler warning */
 
 	evec = (GistEntryVector *) palloc((len + 2) * sizeof(GISTENTRY) + GEVHDRSZ);
 
-	for (i = 0; i < giststate->tupdesc->natts; i++)
+	for (i = 0; i < giststate->nonLeafTupdesc->natts; i++)
 	{
 		int			j;
 
@@ -171,7 +172,8 @@ gistMakeUnionItVec(GISTSTATE *giststate, IndexTuple *itvec, int len,
 			Datum		datum;
 			bool		IsNull;
 
-			datum = index_getattr(itvec[j], i + 1, giststate->tupdesc, &IsNull);
+			datum = index_getattr(itvec[j], i + 1, giststate->leafTupdesc,
+								  &IsNull);
 			if (IsNull)
 				continue;
 
@@ -240,7 +242,7 @@ gistMakeUnionKey(GISTSTATE *giststate, int attno,
 		char		padding[2 * sizeof(GISTENTRY) + GEVHDRSZ];
 	}			storage;
 	GistEntryVector *evec = &storage.gev;
-	int			dstsize;
+	int			dstsize = 0;	/* silence compiler warning */
 
 	evec->n = 2;
 
@@ -278,7 +280,7 @@ gistMakeUnionKey(GISTSTATE *giststate, int attno,
 bool
 gistKeyIsEQ(GISTSTATE *giststate, int attno, Datum a, Datum b)
 {
-	bool		result;
+	bool		result = false; /* silence compiler warning */
 
 	FunctionCall3Coll(&giststate->equalFn[attno],
 					  giststate->supportCollation[attno],
@@ -296,11 +298,11 @@ gistDeCompressAtt(GISTSTATE *giststate, Relation r, IndexTuple tuple, Page p,
 {
 	int			i;
 
-	for (i = 0; i < r->rd_att->natts; i++)
+	for (i = 0; i < IndexRelationGetNumberOfKeyAttributes(r); i++)
 	{
 		Datum		datum;
 
-		datum = index_getattr(tuple, i + 1, giststate->tupdesc, &isnull[i]);
+		datum = index_getattr(tuple, i + 1, giststate->leafTupdesc, &isnull[i]);
 		gistdentryinit(giststate, i, &attdata[i],
 					   datum, r, p, o,
 					   false, isnull[i]);
@@ -329,7 +331,7 @@ gistgetadjusted(Relation r, IndexTuple oldtup, IndexTuple addtup, GISTSTATE *gis
 	gistDeCompressAtt(giststate, r, addtup, NULL,
 					  (OffsetNumber) 0, addentries, addisnull);
 
-	for (i = 0; i < r->rd_att->natts; i++)
+	for (i = 0; i < IndexRelationGetNumberOfKeyAttributes(r); i++)
 	{
 		gistMakeUnionKey(giststate, i,
 						 oldentries + i, oldisnull[i],
@@ -442,14 +444,15 @@ gistchoose(Relation r, Page p, IndexTuple it,	/* it has compressed entry */
 		zero_penalty = true;
 
 		/* Loop over index attributes. */
-		for (j = 0; j < r->rd_att->natts; j++)
+		for (j = 0; j < IndexRelationGetNumberOfKeyAttributes(r); j++)
 		{
 			Datum		datum;
 			float		usize;
 			bool		IsNull;
 
 			/* Compute penalty for this column. */
-			datum = index_getattr(itup, j + 1, giststate->tupdesc, &IsNull);
+			datum = index_getattr(itup, j + 1, giststate->leafTupdesc,
+								  &IsNull);
 			gistdentryinit(giststate, j, &entry, datum, r, p, i,
 						   false, IsNull);
 			usize = gistpenalty(giststate, j, &entry, IsNull,
@@ -470,7 +473,7 @@ gistchoose(Relation r, Page p, IndexTuple it,	/* it has compressed entry */
 				result = i;
 				best_penalty[j] = usize;
 
-				if (j < r->rd_att->natts - 1)
+				if (j < IndexRelationGetNumberOfKeyAttributes(r) - 1)
 					best_penalty[j + 1] = -1;
 
 				/* we have new best, so reset keep-it decision */
@@ -500,12 +503,12 @@ gistchoose(Relation r, Page p, IndexTuple it,	/* it has compressed entry */
 		 * If we looped past the last column, and did not update "result",
 		 * then this tuple is exactly as good as the prior best tuple.
 		 */
-		if (j == r->rd_att->natts && result != i)
+		if (j == IndexRelationGetNumberOfKeyAttributes(r) && result != i)
 		{
 			if (keep_current_best == -1)
 			{
 				/* we didn't make the random choice yet for this old best */
-				keep_current_best = (random() <= (MAX_RANDOM_VALUE / 2)) ? 1 : 0;
+				keep_current_best = pg_prng_bool(&pg_global_prng_state) ? 1 : 0;
 			}
 			if (keep_current_best == 0)
 			{
@@ -527,7 +530,7 @@ gistchoose(Relation r, Page p, IndexTuple it,	/* it has compressed entry */
 			if (keep_current_best == -1)
 			{
 				/* we didn't make the random choice yet for this old best */
-				keep_current_best = (random() <= (MAX_RANDOM_VALUE / 2)) ? 1 : 0;
+				keep_current_best = pg_prng_bool(&pg_global_prng_state) ? 1 : 0;
 			}
 			if (keep_current_best == 1)
 				break;
@@ -570,16 +573,35 @@ gistdentryinit(GISTSTATE *giststate, int nkey, GISTENTRY *e,
 
 IndexTuple
 gistFormTuple(GISTSTATE *giststate, Relation r,
-			  Datum attdata[], bool isnull[], bool isleaf)
+			  const Datum *attdata, const bool *isnull, bool isleaf)
 {
 	Datum		compatt[INDEX_MAX_KEYS];
-	int			i;
 	IndexTuple	res;
+
+	gistCompressValues(giststate, r, attdata, isnull, isleaf, compatt);
+
+	res = index_form_tuple(isleaf ? giststate->leafTupdesc :
+						   giststate->nonLeafTupdesc,
+						   compatt, isnull);
+
+	/*
+	 * The offset number on tuples on internal pages is unused. For historical
+	 * reasons, it is set to 0xffff.
+	 */
+	ItemPointerSetOffsetNumber(&(res->t_tid), 0xffff);
+	return res;
+}
+
+void
+gistCompressValues(GISTSTATE *giststate, Relation r,
+				   const Datum *attdata, const bool *isnull, bool isleaf, Datum *compatt)
+{
+	int			i;
 
 	/*
 	 * Call the compress method on each attribute.
 	 */
-	for (i = 0; i < r->rd_att->natts; i++)
+	for (i = 0; i < IndexRelationGetNumberOfKeyAttributes(r); i++)
 	{
 		if (isnull[i])
 			compatt[i] = (Datum) 0;
@@ -602,14 +624,19 @@ gistFormTuple(GISTSTATE *giststate, Relation r,
 		}
 	}
 
-	res = index_form_tuple(giststate->tupdesc, compatt, isnull);
-
-	/*
-	 * The offset number on tuples on internal pages is unused. For historical
-	 * reasons, it is set to 0xffff.
-	 */
-	ItemPointerSetOffsetNumber(&(res->t_tid), 0xffff);
-	return res;
+	if (isleaf)
+	{
+		/*
+		 * Emplace each included attribute if any.
+		 */
+		for (; i < r->rd_att->natts; i++)
+		{
+			if (isnull[i])
+				compatt[i] = (Datum) 0;
+			else
+				compatt[i] = attdata[i];
+		}
+	}
 }
 
 /*
@@ -644,11 +671,11 @@ gistFetchTuple(GISTSTATE *giststate, Relation r, IndexTuple tuple)
 	bool		isnull[INDEX_MAX_KEYS];
 	int			i;
 
-	for (i = 0; i < r->rd_att->natts; i++)
+	for (i = 0; i < IndexRelationGetNumberOfKeyAttributes(r); i++)
 	{
 		Datum		datum;
 
-		datum = index_getattr(tuple, i + 1, giststate->tupdesc, &isnull[i]);
+		datum = index_getattr(tuple, i + 1, giststate->leafTupdesc, &isnull[i]);
 
 		if (giststate->fetchFn[i].fn_oid != InvalidOid)
 		{
@@ -678,6 +705,15 @@ gistFetchTuple(GISTSTATE *giststate, Relation r, IndexTuple tuple)
 			isnull[i] = true;
 			fetchatt[i] = (Datum) 0;
 		}
+	}
+
+	/*
+	 * Get each included attribute.
+	 */
+	for (; i < r->rd_att->natts; i++)
+	{
+		fetchatt[i] = index_getattr(tuple, i + 1, giststate->leafTupdesc,
+									&isnull[i]);
 	}
 	MemoryContextSwitchTo(oldcxt);
 
@@ -718,22 +754,28 @@ gistpenalty(GISTSTATE *giststate, int attno,
  * Initialize a new index page
  */
 void
-GISTInitBuffer(Buffer b, uint32 f)
+gistinitpage(Page page, uint32 f)
 {
 	GISTPageOpaque opaque;
-	Page		page;
-	Size		pageSize;
 
-	pageSize = BufferGetPageSize(b);
-	page = BufferGetPage(b);
-	PageInit(page, pageSize, sizeof(GISTPageOpaqueData));
+	PageInit(page, BLCKSZ, sizeof(GISTPageOpaqueData));
 
 	opaque = GistPageGetOpaque(page);
-	/* page was already zeroed by PageInit, so this is not needed: */
-	/* memset(&(opaque->nsn), 0, sizeof(GistNSN)); */
 	opaque->rightlink = InvalidBlockNumber;
 	opaque->flags = f;
 	opaque->gist_page_id = GIST_PAGE_ID;
+}
+
+/*
+ * Initialize a new index buffer
+ */
+void
+GISTInitBuffer(Buffer b, uint32 f)
+{
+	Page		page;
+
+	page = BufferGetPage(b);
+	gistinitpage(page, f);
 }
 
 /*
@@ -779,10 +821,9 @@ gistcheckpage(Relation rel, Buffer buf)
  * Caller is responsible for initializing the page by calling GISTInitBuffer
  */
 Buffer
-gistNewBuffer(Relation r)
+gistNewBuffer(Relation r, Relation heaprel)
 {
 	Buffer		buffer;
-	bool		needLock;
 
 	/* First, try to get a page from FSM */
 	for (;;)
@@ -802,13 +843,31 @@ gistNewBuffer(Relation r)
 		{
 			Page		page = BufferGetPage(buffer);
 
+			/*
+			 * If the page was never initialized, it's OK to use.
+			 */
 			if (PageIsNew(page))
-				return buffer;	/* OK to use, if never initialized */
+				return buffer;
 
 			gistcheckpage(r, buffer);
 
-			if (GistPageIsDeleted(page))
-				return buffer;	/* OK to use */
+			/*
+			 * Otherwise, recycle it if deleted, and too old to have any
+			 * processes interested in it.
+			 */
+			if (gistPageRecyclable(page))
+			{
+				/*
+				 * If we are generating WAL for Hot Standby then create a WAL
+				 * record that will allow us to conflict with queries running
+				 * on standby, in case they have snapshots older than the
+				 * page's deleteXid.
+				 */
+				if (XLogStandbyInfoActive() && RelationNeedsWAL(r))
+					gistXLogPageReuse(r, heaprel, blkno, GistPageGetDeleteXid(page));
+
+				return buffer;
+			}
 
 			LockBuffer(buffer, GIST_UNLOCK);
 		}
@@ -818,46 +877,49 @@ gistNewBuffer(Relation r)
 	}
 
 	/* Must extend the file */
-	needLock = !RELATION_IS_LOCAL(r);
-
-	if (needLock)
-		LockRelationForExtension(r, ExclusiveLock);
-
-	buffer = ReadBuffer(r, P_NEW);
-	LockBuffer(buffer, GIST_EXCLUSIVE);
-
-	if (needLock)
-		UnlockRelationForExtension(r, ExclusiveLock);
+	buffer = ExtendBufferedRel(BMR_REL(r), MAIN_FORKNUM, NULL,
+							   EB_LOCK_FIRST);
 
 	return buffer;
+}
+
+/* Can this page be recycled yet? */
+bool
+gistPageRecyclable(Page page)
+{
+	if (PageIsNew(page))
+		return true;
+	if (GistPageIsDeleted(page))
+	{
+		/*
+		 * The page was deleted, but when? If it was just deleted, a scan
+		 * might have seen the downlink to it, and will read the page later.
+		 * As long as that can happen, we must keep the deleted page around as
+		 * a tombstone.
+		 *
+		 * For that check if the deletion XID could still be visible to
+		 * anyone. If not, then no scan that's still in progress could have
+		 * seen its downlink, and we can recycle it.
+		 */
+		FullTransactionId deletexid_full = GistPageGetDeleteXid(page);
+
+		return GlobalVisCheckRemovableFullXid(NULL, deletexid_full);
+	}
+	return false;
 }
 
 bytea *
 gistoptions(Datum reloptions, bool validate)
 {
-	relopt_value *options;
-	GiSTOptions *rdopts;
-	int			numoptions;
 	static const relopt_parse_elt tab[] = {
 		{"fillfactor", RELOPT_TYPE_INT, offsetof(GiSTOptions, fillfactor)},
-		{"buffering", RELOPT_TYPE_STRING, offsetof(GiSTOptions, bufferingModeOffset)}
+		{"buffering", RELOPT_TYPE_ENUM, offsetof(GiSTOptions, buffering_mode)}
 	};
 
-	options = parseRelOptions(reloptions, validate, RELOPT_KIND_GIST,
-							  &numoptions);
-
-	/* if none set, we're done */
-	if (numoptions == 0)
-		return NULL;
-
-	rdopts = allocateReloptStruct(sizeof(GiSTOptions), options, numoptions);
-
-	fillRelOptions((void *) rdopts, sizeof(GiSTOptions), options, numoptions,
-				   validate, tab, lengthof(tab));
-
-	pfree(options);
-
-	return (bytea *) rdopts;
+	return (bytea *) build_reloptions(reloptions, validate,
+									  RELOPT_KIND_GIST,
+									  sizeof(GiSTOptions),
+									  tab, lengthof(tab));
 }
 
 /*
@@ -946,30 +1008,54 @@ gistproperty(Oid index_oid, int attno,
 }
 
 /*
- * Temporary and unlogged GiST indexes are not WAL-logged, but we need LSNs
- * to detect concurrent page splits anyway. This function provides a fake
- * sequence of LSNs for that purpose.
+ * This is a stratnum translation support function for GiST opclasses that use
+ * the RT*StrategyNumber constants.
  */
-XLogRecPtr
-gistGetFakeLSN(Relation rel)
+Datum
+gist_translate_cmptype_common(PG_FUNCTION_ARGS)
 {
-	static XLogRecPtr counter = 1;
+	CompareType cmptype = PG_GETARG_INT32(0);
 
-	if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+	switch (cmptype)
 	{
-		/*
-		 * Temporary relations are only accessible in our session, so a simple
-		 * backend-local counter will do.
-		 */
-		return counter++;
+		case COMPARE_EQ:
+			PG_RETURN_UINT16(RTEqualStrategyNumber);
+		case COMPARE_LT:
+			PG_RETURN_UINT16(RTLessStrategyNumber);
+		case COMPARE_LE:
+			PG_RETURN_UINT16(RTLessEqualStrategyNumber);
+		case COMPARE_GT:
+			PG_RETURN_UINT16(RTGreaterStrategyNumber);
+		case COMPARE_GE:
+			PG_RETURN_UINT16(RTGreaterEqualStrategyNumber);
+		case COMPARE_OVERLAP:
+			PG_RETURN_UINT16(RTOverlapStrategyNumber);
+		case COMPARE_CONTAINED_BY:
+			PG_RETURN_UINT16(RTContainedByStrategyNumber);
+		default:
+			PG_RETURN_UINT16(InvalidStrategy);
 	}
-	else
-	{
-		/*
-		 * Unlogged relations are accessible from other backends, and survive
-		 * (clean) restarts. GetFakeLSNForUnloggedRel() handles that for us.
-		 */
-		Assert(rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED);
-		return GetFakeLSNForUnloggedRel();
-	}
+}
+
+/*
+ * Returns the opclass's private stratnum used for the given compare type.
+ *
+ * Calls the opclass's GIST_TRANSLATE_CMPTYPE_PROC support function, if any,
+ * and returns the result.  Returns InvalidStrategy if the function is not
+ * defined.
+ */
+StrategyNumber
+gisttranslatecmptype(CompareType cmptype, Oid opfamily)
+{
+	Oid			funcid;
+	Datum		result;
+
+	/* Check whether the function is provided. */
+	funcid = get_opfamily_proc(opfamily, ANYOID, ANYOID, GIST_TRANSLATE_CMPTYPE_PROC);
+	if (!OidIsValid(funcid))
+		return InvalidStrategy;
+
+	/* Ask the translation function */
+	result = OidFunctionCall1Coll(funcid, InvalidOid, Int32GetDatum(cmptype));
+	return DatumGetUInt16(result);
 }

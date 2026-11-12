@@ -2,7 +2,7 @@
  *
  *	  GB18030 <--> UTF8
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -17,7 +17,10 @@
 #include "../../Unicode/gb18030_to_utf8.map"
 #include "../../Unicode/utf8_to_gb18030.map"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "utf8_and_gb18030",
+					.version = PG_VERSION
+);
 
 PG_FUNCTION_INFO_V1(gb18030_to_utf8);
 PG_FUNCTION_INFO_V1(utf8_to_gb18030);
@@ -121,7 +124,12 @@ utf8word_to_unicode(uint32 c)
 /*
  * Perform mapping of GB18030 ranges to UTF8
  *
- * The ranges we need to convert are specified in gb-18030-2000.xml.
+ * General description, and the range we need to convert for U+10000 and up:
+ * https://htmlpreview.github.io/?https://github.com/unicode-org/icu-data/blob/main/charset/source/gb18030/gb18030.html
+ *
+ * Ranges up to U+FFFF:
+ * https://github.com/unicode-org/icu-data/blob/main/charset/source/gb18030/ranges.txt
+ *
  * All are ranges of 4-byte GB18030 codes.
  */
 static uint32
@@ -183,8 +191,11 @@ conv_utf8_to_18030(uint32 code)
  *		INTEGER,	-- destination encoding id
  *		CSTRING,	-- source string (null terminated C string)
  *		CSTRING,	-- destination string (null terminated C string)
- *		INTEGER		-- source string length
- * ) returns VOID;
+ *		INTEGER,	-- source string length
+ *		BOOL		-- if true, don't throw an error if conversion fails
+ * ) returns INTEGER;
+ *
+ * Returns the number of bytes successfully converted.
  * ----------
  */
 Datum
@@ -193,16 +204,19 @@ gb18030_to_utf8(PG_FUNCTION_ARGS)
 	unsigned char *src = (unsigned char *) PG_GETARG_CSTRING(2);
 	unsigned char *dest = (unsigned char *) PG_GETARG_CSTRING(3);
 	int			len = PG_GETARG_INT32(4);
+	bool		noError = PG_GETARG_BOOL(5);
+	int			converted;
 
 	CHECK_ENCODING_CONVERSION_ARGS(PG_GB18030, PG_UTF8);
 
-	LocalToUtf(src, len, dest,
-			   &gb18030_to_unicode_tree,
-			   NULL, 0,
-			   conv_18030_to_utf8,
-			   PG_GB18030);
+	converted = LocalToUtf(src, len, dest,
+						   &gb18030_to_unicode_tree,
+						   NULL, 0,
+						   conv_18030_to_utf8,
+						   PG_GB18030,
+						   noError);
 
-	PG_RETURN_VOID();
+	PG_RETURN_INT32(converted);
 }
 
 Datum
@@ -211,14 +225,17 @@ utf8_to_gb18030(PG_FUNCTION_ARGS)
 	unsigned char *src = (unsigned char *) PG_GETARG_CSTRING(2);
 	unsigned char *dest = (unsigned char *) PG_GETARG_CSTRING(3);
 	int			len = PG_GETARG_INT32(4);
+	bool		noError = PG_GETARG_BOOL(5);
+	int			converted;
 
 	CHECK_ENCODING_CONVERSION_ARGS(PG_UTF8, PG_GB18030);
 
-	UtfToLocal(src, len, dest,
-			   &gb18030_from_unicode_tree,
-			   NULL, 0,
-			   conv_utf8_to_18030,
-			   PG_GB18030);
+	converted = UtfToLocal(src, len, dest,
+						   &gb18030_from_unicode_tree,
+						   NULL, 0,
+						   conv_utf8_to_18030,
+						   PG_GB18030,
+						   noError);
 
-	PG_RETURN_VOID();
+	PG_RETURN_INT32(converted);
 }

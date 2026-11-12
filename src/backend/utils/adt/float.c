@@ -3,7 +3,7 @@
  * float.c
  *	  Functions for the built-in floating-point types.
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,6 +21,7 @@
 
 #include "catalog/pg_type.h"
 #include "common/int.h"
+#include "common/shortest_dec.h"
 #include "libpq/pqformat.h"
 #include "utils/array.h"
 #include "utils/float.h"
@@ -28,8 +29,32 @@
 #include "utils/sortsupport.h"
 
 
-/* Configurable GUC parameter */
-int			extra_float_digits = 0; /* Added to DBL_DIG or FLT_DIG */
+/*
+ * Reject building with gcc's -ffast-math switch.  It breaks our handling of
+ * float Infinity and NaN values (via -ffinite-math-only), causes results to
+ * be less accurate than expected (via -funsafe-math-optimizations and
+ * -fexcess-precision=fast), and causes some math error reports to be missed
+ * (via -fno-math-errno).  Unfortunately we can't easily detect cases where
+ * those options were given individually, but this at least catches the most
+ * obvious case.
+ *
+ * We test this only here, not in any header file, to allow extensions to use
+ * -ffast-math if they need to.  But the inline functions in float.h will
+ * misbehave in such an extension, so its authors had better be careful.
+ */
+#ifdef __FAST_MATH__
+#error -ffast-math is known to break this code
+#endif
+
+/*
+ * Configurable GUC parameter
+ *
+ * If >0, use shortest-decimal format for output; this is both the default and
+ * allows for compatibility with clients that explicitly set a value here to
+ * get round-trip-accurate results. If 0 or less, then use the old, slow,
+ * decimal rounding method.
+ */
+int			extra_float_digits = 1;
 
 /* Cached constants for degree-based trig functions */
 static bool degree_consts_set = false;
@@ -46,7 +71,15 @@ static float8 cot_45 = 0;
  * be referenced by other files, much less changed; but we don't want the
  * compiler to know that, else it might try to precompute expressions
  * involving them.  See comments for init_degree_constants().
+ *
+ * The additional extern declarations are to silence
+ * -Wmissing-variable-declarations.
  */
+extern float8 degree_c_thirty;
+extern float8 degree_c_forty_five;
+extern float8 degree_c_sixty;
+extern float8 degree_c_one_half;
+extern float8 degree_c_one;
 float8		degree_c_thirty = 30.0;
 float8		degree_c_forty_five = 45.0;
 float8		degree_c_sixty = 60.0;
@@ -58,18 +91,61 @@ static double sind_q1(double x);
 static double cosd_q1(double x);
 static void init_degree_constants(void);
 
-#ifndef HAVE_CBRT
+
 /*
- * Some machines (in particular, some versions of AIX) have an extern
- * declaration for cbrt() in <math.h> but fail to provide the actual
- * function, which causes configure to not set HAVE_CBRT.  Furthermore,
- * their compilers spit up at the mismatch between extern declaration
- * and static definition.  We work around that here by the expedient
- * of a #define to make the actual name of the static function different.
+ * We use these out-of-line ereport() calls to report float overflow,
+ * underflow, and zero-divide, because following our usual practice of
+ * repeating them at each call site would lead to a lot of code bloat.
+ *
+ * This does mean that you don't get a useful error location indicator.
  */
-#define cbrt my_cbrt
-static double cbrt(double x);
-#endif							/* HAVE_CBRT */
+pg_noinline void
+float_overflow_error(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+			 errmsg("value out of range: overflow")));
+}
+
+pg_noinline void
+float_underflow_error(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+			 errmsg("value out of range: underflow")));
+}
+
+pg_noinline void
+float_zero_divide_error(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_DIVISION_BY_ZERO),
+			 errmsg("division by zero")));
+}
+
+float8
+float_overflow_error_ext(struct Node *escontext)
+{
+	ereturn(escontext, 0.0,
+			errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+			errmsg("value out of range: overflow"));
+}
+
+float8
+float_underflow_error_ext(struct Node *escontext)
+{
+	ereturn(escontext, 0.0,
+			errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+			errmsg("value out of range: underflow"));
+}
+
+float8
+float_zero_divide_error_ext(struct Node *escontext)
+{
+	ereturn(escontext, 0.0,
+			(errcode(ERRCODE_DIVISION_BY_ZERO),
+			 errmsg("division by zero")));
+}
 
 
 /*
@@ -98,21 +174,65 @@ is_infinite(double val)
 
 /*
  *		float4in		- converts "num" to float4
+ *
+ * Note that this code now uses strtof(), where it used to use strtod().
+ *
+ * The motivation for using strtof() is to avoid a double-rounding problem:
+ * for certain decimal inputs, if you round the input correctly to a double,
+ * and then round the double to a float, the result is incorrect in that it
+ * does not match the result of rounding the decimal value to float directly.
+ *
+ * One of the best examples is 7.038531e-26:
+ *
+ * 0xAE43FDp-107 = 7.03853069185120912085...e-26
+ *      midpoint   7.03853100000000022281...e-26
+ * 0xAE43FEp-107 = 7.03853130814879132477...e-26
+ *
+ * making 0xAE43FDp-107 the correct float result, but if you do the conversion
+ * via a double, you get
+ *
+ * 0xAE43FD.7FFFFFF8p-107 = 7.03853099999999907487...e-26
+ *               midpoint   7.03853099999999964884...e-26
+ * 0xAE43FD.80000000p-107 = 7.03853100000000022281...e-26
+ * 0xAE43FD.80000008p-107 = 7.03853100000000137076...e-26
+ *
+ * so the value rounds to the double exactly on the midpoint between the two
+ * nearest floats, and then rounding again to a float gives the incorrect
+ * result of 0xAE43FEp-107.
+ *
  */
 Datum
 float4in(PG_FUNCTION_ARGS)
 {
 	char	   *num = PG_GETARG_CSTRING(0);
-	char	   *orig_num;
-	double		val;
-	char	   *endptr;
+
+	PG_RETURN_FLOAT4(float4in_internal(num, NULL, "real", num,
+									   fcinfo->context));
+}
+
+/*
+ * float4in_internal - guts of float4in()
+ *
+ * This is exposed for use by functions that want a reasonably
+ * platform-independent way of inputting floats. The behavior is
+ * essentially like strtof + ereturn on error.
+ *
+ * Uses the same API as float8in_internal below, so most of its
+ * comments also apply here, except regarding use in geometric types.
+ */
+float4
+float4in_internal(const char *num, char **endptr_p,
+				  const char *type_name, const char *orig_string,
+				  struct Node *escontext)
+{
+	float		val;
+	const char *endptr;
 
 	/*
 	 * endptr points to the first character _after_ the sequence we recognized
-	 * as a valid floating point number. orig_num points to the original input
-	 * string.
+	 * as a valid floating point number. orig_string points to the original
+	 * input string.
 	 */
-	orig_num = num;
 
 	/* skip leading whitespace */
 	while (*num != '\0' && isspace((unsigned char) *num))
@@ -123,13 +243,13 @@ float4in(PG_FUNCTION_ARGS)
 	 * strtod() on different platforms.
 	 */
 	if (*num == '\0')
-		ereport(ERROR,
+		ereturn(escontext, 0,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("invalid input syntax for type %s: \"%s\"",
-						"real", orig_num)));
+						type_name, orig_string)));
 
 	errno = 0;
-	val = strtod(num, &endptr);
+	val = strtof(num, unconstify(char **, &endptr));
 
 	/* did we not see anything that looks like a double? */
 	if (endptr == num || errno != 0)
@@ -137,14 +257,14 @@ float4in(PG_FUNCTION_ARGS)
 		int			save_errno = errno;
 
 		/*
-		 * C99 requires that strtod() accept NaN, [+-]Infinity, and [+-]Inf,
+		 * C99 requires that strtof() accept NaN, [+-]Infinity, and [+-]Inf,
 		 * but not all platforms support all of these (and some accept them
 		 * but set ERANGE anyway...)  Therefore, we check for these inputs
-		 * ourselves if strtod() fails.
+		 * ourselves if strtof() fails.
 		 *
 		 * Note: C99 also requires hexadecimal input as well as some extended
 		 * forms of NaN, but we consider these forms unportable and don't try
-		 * to support them.  You can use 'em if your strtod() takes 'em.
+		 * to support them.  You can use 'em if your strtof() takes 'em.
 		 */
 		if (pg_strncasecmp(num, "NaN", 3) == 0)
 		{
@@ -190,49 +310,46 @@ float4in(PG_FUNCTION_ARGS)
 			 * detect whether it's a "real" out-of-range condition by checking
 			 * to see if the result is zero or huge.
 			 */
-			if (val == 0.0 || val >= HUGE_VAL || val <= -HUGE_VAL)
-				ereport(ERROR,
+			if (val == 0.0 ||
+#if !defined(HUGE_VALF)
+				isinf(val)
+#else
+				(val >= HUGE_VALF || val <= -HUGE_VALF)
+#endif
+				)
+			{
+				/* see comments in float8in_internal for rationale */
+				char	   *errnumber = pstrdup(num);
+
+				errnumber[endptr - num] = '\0';
+
+				ereturn(escontext, 0,
 						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 						 errmsg("\"%s\" is out of range for type real",
-								orig_num)));
+								errnumber)));
+			}
 		}
 		else
-			ereport(ERROR,
+			ereturn(escontext, 0,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("invalid input syntax for type %s: \"%s\"",
-							"real", orig_num)));
+							type_name, orig_string)));
 	}
-#ifdef HAVE_BUGGY_SOLARIS_STRTOD
-	else
-	{
-		/*
-		 * Many versions of Solaris have a bug wherein strtod sets endptr to
-		 * point one byte beyond the end of the string when given "inf" or
-		 * "infinity".
-		 */
-		if (endptr != num && endptr[-1] == '\0')
-			endptr--;
-	}
-#endif							/* HAVE_BUGGY_SOLARIS_STRTOD */
 
 	/* skip trailing whitespace */
 	while (*endptr != '\0' && isspace((unsigned char) *endptr))
 		endptr++;
 
-	/* if there is any junk left at the end of the string, bail out */
-	if (*endptr != '\0')
-		ereport(ERROR,
+	/* report stopping point if wanted, else complain if not end of string */
+	if (endptr_p)
+		*endptr_p = unconstify(char *, endptr);
+	else if (*endptr != '\0')
+		ereturn(escontext, 0,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("invalid input syntax for type %s: \"%s\"",
-						"real", orig_num)));
+						type_name, orig_string)));
 
-	/*
-	 * if we get here, we have a legal double, still need to check to see if
-	 * it's a legal float4
-	 */
-	check_float4_val((float4) val, isinf(val), val == 0);
-
-	PG_RETURN_FLOAT4((float4) val);
+	return val;
 }
 
 /*
@@ -245,6 +362,12 @@ float4out(PG_FUNCTION_ARGS)
 	float4		num = PG_GETARG_FLOAT4(0);
 	char	   *ascii = (char *) palloc(32);
 	int			ndig = FLT_DIG + extra_float_digits;
+
+	if (extra_float_digits > 0)
+	{
+		float_to_shortest_decimal_buf(num, ascii);
+		PG_RETURN_CSTRING(ascii);
+	}
 
 	(void) pg_strfromd(ascii, 32, ndig, num);
 	PG_RETURN_CSTRING(ascii);
@@ -283,7 +406,8 @@ float8in(PG_FUNCTION_ARGS)
 {
 	char	   *num = PG_GETARG_CSTRING(0);
 
-	PG_RETURN_FLOAT8(float8in_internal(num, NULL, "double precision", num));
+	PG_RETURN_FLOAT8(float8in_internal(num, NULL, "double precision", num,
+									   fcinfo->context));
 }
 
 /*
@@ -291,25 +415,27 @@ float8in(PG_FUNCTION_ARGS)
  *
  * This is exposed for use by functions that want a reasonably
  * platform-independent way of inputting doubles.  The behavior is
- * essentially like strtod + ereport on error, but note the following
+ * essentially like strtod + ereturn on error, but note the following
  * differences:
  * 1. Both leading and trailing whitespace are skipped.
- * 2. If endptr_p is NULL, we throw error if there's trailing junk.
+ * 2. If endptr_p is NULL, we report error if there's trailing junk.
  * Otherwise, it's up to the caller to complain about trailing junk.
  * 3. In event of a syntax error, the report mentions the given type_name
  * and prints orig_string as the input; this is meant to support use of
  * this function with types such as "box" and "point", where what we are
  * parsing here is just a substring of orig_string.
  *
- * "num" could validly be declared "const char *", but that results in an
- * unreasonable amount of extra casting both here and in callers, so we don't.
+ * If escontext points to an ErrorSaveContext node, that is filled instead
+ * of throwing an error; the caller must check SOFT_ERROR_OCCURRED()
+ * to detect errors.
  */
-double
-float8in_internal(char *num, char **endptr_p,
-				  const char *type_name, const char *orig_string)
+float8
+float8in_internal(const char *num, char **endptr_p,
+				  const char *type_name, const char *orig_string,
+				  struct Node *escontext)
 {
 	double		val;
-	char	   *endptr;
+	const char *endptr;
 
 	/* skip leading whitespace */
 	while (*num != '\0' && isspace((unsigned char) *num))
@@ -320,13 +446,13 @@ float8in_internal(char *num, char **endptr_p,
 	 * strtod() on different platforms.
 	 */
 	if (*num == '\0')
-		ereport(ERROR,
+		ereturn(escontext, 0,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("invalid input syntax for type %s: \"%s\"",
 						type_name, orig_string)));
 
 	errno = 0;
-	val = strtod(num, &endptr);
+	val = strtod(num, unconstify(char **, &endptr));
 
 	/* did we not see anything that looks like a double? */
 	if (endptr == num || errno != 0)
@@ -396,30 +522,18 @@ float8in_internal(char *num, char **endptr_p,
 				char	   *errnumber = pstrdup(num);
 
 				errnumber[endptr - num] = '\0';
-				ereport(ERROR,
+				ereturn(escontext, 0,
 						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 						 errmsg("\"%s\" is out of range for type double precision",
 								errnumber)));
 			}
 		}
 		else
-			ereport(ERROR,
+			ereturn(escontext, 0,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("invalid input syntax for type %s: \"%s\"",
 							type_name, orig_string)));
 	}
-#ifdef HAVE_BUGGY_SOLARIS_STRTOD
-	else
-	{
-		/*
-		 * Many versions of Solaris have a bug wherein strtod sets endptr to
-		 * point one byte beyond the end of the string when given "inf" or
-		 * "infinity".
-		 */
-		if (endptr != num && endptr[-1] == '\0')
-			endptr--;
-	}
-#endif							/* HAVE_BUGGY_SOLARIS_STRTOD */
 
 	/* skip trailing whitespace */
 	while (*endptr != '\0' && isspace((unsigned char) *endptr))
@@ -427,15 +541,16 @@ float8in_internal(char *num, char **endptr_p,
 
 	/* report stopping point if wanted, else complain if not end of string */
 	if (endptr_p)
-		*endptr_p = endptr;
+		*endptr_p = unconstify(char *, endptr);
 	else if (*endptr != '\0')
-		ereport(ERROR,
+		ereturn(escontext, 0,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("invalid input syntax for type %s: \"%s\"",
 						type_name, orig_string)));
 
 	return val;
 }
+
 
 /*
  *		float8out		- converts float8 number to a string
@@ -461,6 +576,12 @@ float8out_internal(double num)
 {
 	char	   *ascii = (char *) palloc(32);
 	int			ndig = DBL_DIG + extra_float_digits;
+
+	if (extra_float_digits > 0)
+	{
+		double_to_shortest_decimal_buf(num, ascii);
+		return ascii;
+	}
 
 	(void) pg_strfromd(ascii, 32, ndig, num);
 	return ascii;
@@ -509,7 +630,7 @@ float4abs(PG_FUNCTION_ARGS)
 {
 	float4		arg1 = PG_GETARG_FLOAT4(0);
 
-	PG_RETURN_FLOAT4((float4) fabs(arg1));
+	PG_RETURN_FLOAT4(fabsf(arg1));
 }
 
 /*
@@ -977,18 +1098,25 @@ in_range_float8_float8(PG_FUNCTION_ARGS)
 	}
 
 	/*
-	 * Deal with infinite offset (necessarily +inf, at this point).  We must
-	 * special-case this because if base happens to be -inf, their sum would
-	 * be NaN, which is an overflow-ish condition we should avoid.
+	 * Deal with cases where both base and offset are infinite, and computing
+	 * base +/- offset would produce NaN.  This corresponds to a window frame
+	 * whose boundary infinitely precedes +inf or infinitely follows -inf,
+	 * which is not well-defined.  For consistency with other cases involving
+	 * infinities, such as the fact that +inf infinitely follows +inf, we
+	 * choose to assume that +inf infinitely precedes +inf and -inf infinitely
+	 * follows -inf, and therefore that all finite and infinite values are in
+	 * such a window frame.
+	 *
+	 * offset is known positive, so we need only check the sign of base in
+	 * this test.
 	 */
-	if (isinf(offset))
-	{
-		PG_RETURN_BOOL(sub ? !less : less);
-	}
+	if (isinf(offset) && isinf(base) &&
+		(sub ? base > 0 : base < 0))
+		PG_RETURN_BOOL(true);
 
 	/*
 	 * Otherwise it should be safe to compute base +/- offset.  We trust the
-	 * FPU to cope if base is +/-inf or the true sum would overflow, and
+	 * FPU to cope if an input is +/-inf or the true sum would overflow, and
 	 * produce a suitably signed infinity, which will compare properly against
 	 * val whether or not that's infinity.
 	 */
@@ -1046,18 +1174,25 @@ in_range_float4_float8(PG_FUNCTION_ARGS)
 	}
 
 	/*
-	 * Deal with infinite offset (necessarily +inf, at this point).  We must
-	 * special-case this because if base happens to be -inf, their sum would
-	 * be NaN, which is an overflow-ish condition we should avoid.
+	 * Deal with cases where both base and offset are infinite, and computing
+	 * base +/- offset would produce NaN.  This corresponds to a window frame
+	 * whose boundary infinitely precedes +inf or infinitely follows -inf,
+	 * which is not well-defined.  For consistency with other cases involving
+	 * infinities, such as the fact that +inf infinitely follows +inf, we
+	 * choose to assume that +inf infinitely precedes +inf and -inf infinitely
+	 * follows -inf, and therefore that all finite and infinite values are in
+	 * such a window frame.
+	 *
+	 * offset is known positive, so we need only check the sign of base in
+	 * this test.
 	 */
-	if (isinf(offset))
-	{
-		PG_RETURN_BOOL(sub ? !less : less);
-	}
+	if (isinf(offset) && isinf(base) &&
+		(sub ? base > 0 : base < 0))
+		PG_RETURN_BOOL(true);
 
 	/*
 	 * Otherwise it should be safe to compute base +/- offset.  We trust the
-	 * FPU to cope if base is +/-inf or the true sum would overflow, and
+	 * FPU to cope if an input is +/-inf or the true sum would overflow, and
 	 * produce a suitably signed infinity, which will compare properly against
 	 * val whether or not that's infinity.
 	 */
@@ -1098,10 +1233,15 @@ Datum
 dtof(PG_FUNCTION_ARGS)
 {
 	float8		num = PG_GETARG_FLOAT8(0);
+	float4		result;
 
-	check_float4_val((float4) num, isinf(num), num == 0);
+	result = (float4) num;
+	if (unlikely(isinf(result)) && !isinf(num))
+		float_overflow_error_ext(fcinfo->context);
+	if (unlikely(result == 0.0f) && num != 0.0)
+		float_underflow_error_ext(fcinfo->context);
 
-	PG_RETURN_FLOAT4((float4) num);
+	PG_RETURN_FLOAT4(result);
 }
 
 
@@ -1112,16 +1252,21 @@ Datum
 dtoi4(PG_FUNCTION_ARGS)
 {
 	float8		num = PG_GETARG_FLOAT8(0);
-	int32		result;
 
-	/* 'Inf' is handled by INT_MAX */
-	if (num < INT_MIN || num > INT_MAX || isnan(num))
-		ereport(ERROR,
+	/*
+	 * Get rid of any fractional part in the input.  This is so we don't fail
+	 * on just-out-of-range values that would round into range.  Note
+	 * assumption that rint() will pass through a NaN or Inf unchanged.
+	 */
+	num = rint(num);
+
+	/* Range check */
+	if (unlikely(isnan(num) || !FLOAT8_FITS_IN_INT32(num)))
+		ereturn(fcinfo->context, (Datum) 0,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("integer out of range")));
 
-	result = (int32) rint(num);
-	PG_RETURN_INT32(result);
+	PG_RETURN_INT32((int32) num);
 }
 
 
@@ -1133,12 +1278,20 @@ dtoi2(PG_FUNCTION_ARGS)
 {
 	float8		num = PG_GETARG_FLOAT8(0);
 
-	if (num < SHRT_MIN || num > SHRT_MAX || isnan(num))
-		ereport(ERROR,
+	/*
+	 * Get rid of any fractional part in the input.  This is so we don't fail
+	 * on just-out-of-range values that would round into range.  Note
+	 * assumption that rint() will pass through a NaN or Inf unchanged.
+	 */
+	num = rint(num);
+
+	/* Range check */
+	if (unlikely(isnan(num) || !FLOAT8_FITS_IN_INT16(num)))
+		ereturn(fcinfo->context, (Datum) 0,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("smallint out of range")));
 
-	PG_RETURN_INT16((int16) rint(num));
+	PG_RETURN_INT16((int16) num);
 }
 
 
@@ -1174,12 +1327,20 @@ ftoi4(PG_FUNCTION_ARGS)
 {
 	float4		num = PG_GETARG_FLOAT4(0);
 
-	if (num < INT_MIN || num > INT_MAX || isnan(num))
-		ereport(ERROR,
+	/*
+	 * Get rid of any fractional part in the input.  This is so we don't fail
+	 * on just-out-of-range values that would round into range.  Note
+	 * assumption that rint() will pass through a NaN or Inf unchanged.
+	 */
+	num = rint(num);
+
+	/* Range check */
+	if (unlikely(isnan(num) || !FLOAT4_FITS_IN_INT32(num)))
+		ereturn(fcinfo->context, (Datum) 0,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("integer out of range")));
 
-	PG_RETURN_INT32((int32) rint(num));
+	PG_RETURN_INT32((int32) num);
 }
 
 
@@ -1191,12 +1352,20 @@ ftoi2(PG_FUNCTION_ARGS)
 {
 	float4		num = PG_GETARG_FLOAT4(0);
 
-	if (num < SHRT_MIN || num > SHRT_MAX || isnan(num))
-		ereport(ERROR,
+	/*
+	 * Get rid of any fractional part in the input.  This is so we don't fail
+	 * on just-out-of-range values that would round into range.  Note
+	 * assumption that rint() will pass through a NaN or Inf unchanged.
+	 */
+	num = rint(num);
+
+	/* Range check */
+	if (unlikely(isnan(num) || !FLOAT4_FITS_IN_INT16(num)))
+		ereturn(fcinfo->context, (Datum) 0,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("smallint out of range")));
 
-	PG_RETURN_INT16((int16) rint(num));
+	PG_RETURN_INT16((int16) num);
 }
 
 
@@ -1323,8 +1492,11 @@ dsqrt(PG_FUNCTION_ARGS)
 				 errmsg("cannot take square root of a negative number")));
 
 	result = sqrt(arg1);
+	if (unlikely(isinf(result)) && !isinf(arg1))
+		float_overflow_error();
+	if (unlikely(result == 0.0) && arg1 != 0.0)
+		float_underflow_error();
 
-	check_float8_val(result, isinf(arg1), arg1 == 0);
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -1339,7 +1511,11 @@ dcbrt(PG_FUNCTION_ARGS)
 	float8		result;
 
 	result = cbrt(arg1);
-	check_float8_val(result, isinf(arg1), arg1 == 0);
+	if (unlikely(isinf(result)) && !isinf(arg1))
+		float_overflow_error();
+	if (unlikely(result == 0.0) && arg1 != 0.0)
+		float_underflow_error();
+
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -1388,30 +1564,113 @@ dpow(PG_FUNCTION_ARGS)
 				 errmsg("a negative number raised to a non-integer power yields a complex result")));
 
 	/*
-	 * pow() sets errno only on some platforms, depending on whether it
-	 * follows _IEEE_, _POSIX_, _XOPEN_, or _SVID_, so we try to avoid using
-	 * errno.  However, some platform/CPU combinations return errno == EDOM
-	 * and result == NaN for negative arg1 and very large arg2 (they must be
-	 * using something different from our floor() test to decide it's
-	 * invalid).  Other platforms (HPPA) return errno == ERANGE and a large
-	 * (HUGE_VAL) but finite result to signal overflow.
+	 * We don't trust the platform's pow() to handle infinity cases per POSIX
+	 * spec either, so deal with those explicitly too.  It's easier to handle
+	 * infinite y first, so that it doesn't matter if x is also infinite.
 	 */
-	errno = 0;
-	result = pow(arg1, arg2);
-	if (errno == EDOM && isnan(result))
+	if (isinf(arg2))
 	{
-		if ((fabs(arg1) > 1 && arg2 >= 0) || (fabs(arg1) < 1 && arg2 < 0))
-			/* The sign of Inf is not significant in this case. */
-			result = get_float8_infinity();
-		else if (fabs(arg1) != 1)
-			result = 0;
-		else
-			result = 1;
-	}
-	else if (errno == ERANGE && result != 0 && !isinf(result))
-		result = get_float8_infinity();
+		float8		absx = fabs(arg1);
 
-	check_float8_val(result, isinf(arg1) || isinf(arg2), arg1 == 0);
+		if (absx == 1.0)
+			result = 1.0;
+		else if (arg2 > 0.0)	/* y = +Inf */
+		{
+			if (absx > 1.0)
+				result = arg2;
+			else
+				result = 0.0;
+		}
+		else					/* y = -Inf */
+		{
+			if (absx > 1.0)
+				result = 0.0;
+			else
+				result = -arg2;
+		}
+	}
+	else if (isinf(arg1))
+	{
+		if (arg2 == 0.0)
+			result = 1.0;
+		else if (arg1 > 0.0)	/* x = +Inf */
+		{
+			if (arg2 > 0.0)
+				result = arg1;
+			else
+				result = 0.0;
+		}
+		else					/* x = -Inf */
+		{
+			/*
+			 * Per POSIX, the sign of the result depends on whether y is an
+			 * odd integer.  Since x < 0, we already know from the previous
+			 * domain check that y is an integer.  It is odd if y/2 is not
+			 * also an integer.
+			 */
+			float8		halfy = arg2 / 2;	/* should be computed exactly */
+			bool		yisoddinteger = (floor(halfy) != halfy);
+
+			if (arg2 > 0.0)
+				result = yisoddinteger ? arg1 : -arg1;
+			else
+				result = yisoddinteger ? -0.0 : 0.0;
+		}
+	}
+	else
+	{
+		/*
+		 * pow() sets errno on only some platforms, depending on whether it
+		 * follows _IEEE_, _POSIX_, _XOPEN_, or _SVID_, so we must check both
+		 * errno and invalid output values.  (We can't rely on just the
+		 * latter, either; some old platforms return a large-but-finite
+		 * HUGE_VAL when reporting overflow.)
+		 */
+		errno = 0;
+		result = pow(arg1, arg2);
+		if (errno == EDOM || isnan(result))
+		{
+			/*
+			 * We handled all possible domain errors above, so this should be
+			 * impossible.  However, old glibc versions on x86 have a bug that
+			 * causes them to fail this way for abs(y) greater than 2^63:
+			 *
+			 * https://sourceware.org/bugzilla/show_bug.cgi?id=3866
+			 *
+			 * Hence, if we get here, assume y is finite but large (large
+			 * enough to be certainly even). The result should be 0 if x == 0,
+			 * 1.0 if abs(x) == 1.0, otherwise an overflow or underflow error.
+			 */
+			if (arg1 == 0.0)
+				result = 0.0;	/* we already verified y is positive */
+			else
+			{
+				float8		absx = fabs(arg1);
+
+				if (absx == 1.0)
+					result = 1.0;
+				else if (arg2 >= 0.0 ? (absx > 1.0) : (absx < 1.0))
+					float_overflow_error();
+				else
+					float_underflow_error();
+			}
+		}
+		else if (errno == ERANGE)
+		{
+			if (result != 0.0)
+				float_overflow_error();
+			else
+				float_underflow_error();
+		}
+		else
+		{
+			if (unlikely(isinf(result)))
+				float_overflow_error();
+			if (unlikely(result == 0.0) && arg1 != 0.0)
+				float_underflow_error();
+		}
+	}
+
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -1425,12 +1684,39 @@ dexp(PG_FUNCTION_ARGS)
 	float8		arg1 = PG_GETARG_FLOAT8(0);
 	float8		result;
 
-	errno = 0;
-	result = exp(arg1);
-	if (errno == ERANGE && result != 0 && !isinf(result))
-		result = get_float8_infinity();
+	/*
+	 * Handle NaN and Inf cases explicitly.  This avoids needing to assume
+	 * that the platform's exp() conforms to POSIX for these cases, and it
+	 * removes some edge cases for the overflow checks below.
+	 */
+	if (isnan(arg1))
+		result = arg1;
+	else if (isinf(arg1))
+	{
+		/* Per POSIX, exp(-Inf) is 0 */
+		result = (arg1 > 0.0) ? arg1 : 0;
+	}
+	else
+	{
+		/*
+		 * On some platforms, exp() will not set errno but just return Inf or
+		 * zero to report overflow/underflow; therefore, test both cases.
+		 */
+		errno = 0;
+		result = exp(arg1);
+		if (unlikely(errno == ERANGE))
+		{
+			if (result != 0.0)
+				float_overflow_error();
+			else
+				float_underflow_error();
+		}
+		else if (unlikely(isinf(result)))
+			float_overflow_error();
+		else if (unlikely(result == 0.0))
+			float_underflow_error();
+	}
 
-	check_float8_val(result, isinf(arg1), false);
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -1458,8 +1744,11 @@ dlog1(PG_FUNCTION_ARGS)
 				 errmsg("cannot take logarithm of a negative number")));
 
 	result = log(arg1);
+	if (unlikely(isinf(result)) && !isinf(arg1))
+		float_overflow_error();
+	if (unlikely(result == 0.0) && arg1 != 1.0)
+		float_underflow_error();
 
-	check_float8_val(result, isinf(arg1), arg1 == 1);
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -1488,8 +1777,11 @@ dlog10(PG_FUNCTION_ARGS)
 				 errmsg("cannot take logarithm of a negative number")));
 
 	result = log10(arg1);
+	if (unlikely(isinf(result)) && !isinf(arg1))
+		float_overflow_error();
+	if (unlikely(result == 0.0) && arg1 != 1.0)
+		float_underflow_error();
 
-	check_float8_val(result, isinf(arg1), arg1 == 1);
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -1518,8 +1810,9 @@ dacos(PG_FUNCTION_ARGS)
 				 errmsg("input is out of range")));
 
 	result = acos(arg1);
+	if (unlikely(isinf(result)))
+		float_overflow_error();
 
-	check_float8_val(result, false, true);
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -1548,8 +1841,9 @@ dasin(PG_FUNCTION_ARGS)
 				 errmsg("input is out of range")));
 
 	result = asin(arg1);
+	if (unlikely(isinf(result)))
+		float_overflow_error();
 
-	check_float8_val(result, false, true);
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -1573,8 +1867,9 @@ datan(PG_FUNCTION_ARGS)
 	 * finite, even if the input is infinite.
 	 */
 	result = atan(arg1);
+	if (unlikely(isinf(result)))
+		float_overflow_error();
 
-	check_float8_val(result, false, true);
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -1598,8 +1893,9 @@ datan2(PG_FUNCTION_ARGS)
 	 * should always be finite, even if the inputs are infinite.
 	 */
 	result = atan2(arg1, arg2);
+	if (unlikely(isinf(result)))
+		float_overflow_error();
 
-	check_float8_val(result, false, true);
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -1638,8 +1934,9 @@ dcos(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("input is out of range")));
+	if (unlikely(isinf(result)))
+		float_overflow_error();
 
-	check_float8_val(result, false, true);
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -1666,7 +1963,8 @@ dcot(PG_FUNCTION_ARGS)
 				 errmsg("input is out of range")));
 
 	result = 1.0 / result;
-	check_float8_val(result, true /* cot(0) == Inf */ , true);
+	/* Not checking for overflow because cot(0) == Inf */
+
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -1691,8 +1989,9 @@ dsin(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("input is out of range")));
+	if (unlikely(isinf(result)))
+		float_overflow_error();
 
-	check_float8_val(result, false, true);
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -1717,8 +2016,8 @@ dtan(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 				 errmsg("input is out of range")));
+	/* Not checking for overflow because tan(pi/2) == Inf */
 
-	check_float8_val(result, true /* tan(pi/2) == Inf */ , true);
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -1870,7 +2169,9 @@ dacosd(PG_FUNCTION_ARGS)
 	else
 		result = 90.0 + asind_q1(-arg1);
 
-	check_float8_val(result, false, true);
+	if (unlikely(isinf(result)))
+		float_overflow_error();
+
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -1905,7 +2206,9 @@ dasind(PG_FUNCTION_ARGS)
 	else
 		result = -asind_q1(-arg1);
 
-	check_float8_val(result, false, true);
+	if (unlikely(isinf(result)))
+		float_overflow_error();
+
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -1935,7 +2238,9 @@ datand(PG_FUNCTION_ARGS)
 	atan_arg1 = atan(arg1);
 	result = (atan_arg1 / atan_1_0) * 45.0;
 
-	check_float8_val(result, false, true);
+	if (unlikely(isinf(result)))
+		float_overflow_error();
+
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -1969,7 +2274,9 @@ datan2d(PG_FUNCTION_ARGS)
 	atan2_arg1_arg2 = atan2(arg1, arg2);
 	result = (atan2_arg1_arg2 / atan_1_0) * 45.0;
 
-	check_float8_val(result, false, true);
+	if (unlikely(isinf(result)))
+		float_overflow_error();
+
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -2090,7 +2397,9 @@ dcosd(PG_FUNCTION_ARGS)
 
 	result = sign * cosd_q1(arg1);
 
-	check_float8_val(result, false, true);
+	if (unlikely(isinf(result)))
+		float_overflow_error();
+
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -2155,7 +2464,8 @@ dcotd(PG_FUNCTION_ARGS)
 	if (result == 0.0)
 		result = 0.0;
 
-	check_float8_val(result, true /* cotd(0) == Inf */ , true);
+	/* Not checking for overflow because cotd(0) == Inf */
+
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -2209,7 +2519,9 @@ dsind(PG_FUNCTION_ARGS)
 
 	result = sign * sind_q1(arg1);
 
-	check_float8_val(result, false, true);
+	if (unlikely(isinf(result)))
+		float_overflow_error();
+
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -2274,7 +2586,8 @@ dtand(PG_FUNCTION_ARGS)
 	if (result == 0.0)
 		result = 0.0;
 
-	check_float8_val(result, true /* tand(90) == Inf */ , true);
+	/* Not checking for overflow because tand(90) == Inf */
+
 	PG_RETURN_FLOAT8(result);
 }
 
@@ -2313,37 +2626,295 @@ radians(PG_FUNCTION_ARGS)
 }
 
 
+/* ========== HYPERBOLIC FUNCTIONS ========== */
+
+
 /*
- *		drandom		- returns a random number
+ *		dsinh			- returns the hyperbolic sine of arg1
  */
 Datum
-drandom(PG_FUNCTION_ARGS)
+dsinh(PG_FUNCTION_ARGS)
 {
+	float8		arg1 = PG_GETARG_FLOAT8(0);
 	float8		result;
 
-	/* result [0.0 - 1.0) */
-	result = (double) random() / ((double) MAX_RANDOM_VALUE + 1);
+	errno = 0;
+	result = sinh(arg1);
+
+	/*
+	 * if an ERANGE error occurs, it means there is an overflow.  For sinh,
+	 * the result should be either -infinity or infinity, depending on the
+	 * sign of arg1.
+	 */
+	if (errno == ERANGE)
+	{
+		if (arg1 < 0)
+			result = -get_float8_infinity();
+		else
+			result = get_float8_infinity();
+	}
 
 	PG_RETURN_FLOAT8(result);
 }
 
 
 /*
- *		setseed		- set seed for the random number generator
+ *		dcosh			- returns the hyperbolic cosine of arg1
  */
 Datum
-setseed(PG_FUNCTION_ARGS)
+dcosh(PG_FUNCTION_ARGS)
 {
-	float8		seed = PG_GETARG_FLOAT8(0);
-	int			iseed;
+	float8		arg1 = PG_GETARG_FLOAT8(0);
+	float8		result;
 
-	if (seed < -1 || seed > 1)
-		elog(ERROR, "setseed parameter %f out of range [-1,1]", seed);
+	errno = 0;
+	result = cosh(arg1);
 
-	iseed = (int) (seed * MAX_RANDOM_VALUE);
-	srandom((unsigned int) iseed);
+	/*
+	 * if an ERANGE error occurs, it means there is an overflow.  As cosh is
+	 * always positive, it always means the result is positive infinity.
+	 */
+	if (errno == ERANGE)
+		result = get_float8_infinity();
 
-	PG_RETURN_VOID();
+	if (unlikely(result == 0.0))
+		float_underflow_error();
+
+	PG_RETURN_FLOAT8(result);
+}
+
+/*
+ *		dtanh			- returns the hyperbolic tangent of arg1
+ */
+Datum
+dtanh(PG_FUNCTION_ARGS)
+{
+	float8		arg1 = PG_GETARG_FLOAT8(0);
+	float8		result;
+
+	/*
+	 * For tanh, we don't need an errno check because it never overflows.
+	 */
+	result = tanh(arg1);
+
+	if (unlikely(isinf(result)))
+		float_overflow_error();
+
+	PG_RETURN_FLOAT8(result);
+}
+
+/*
+ *		dasinh			- returns the inverse hyperbolic sine of arg1
+ */
+Datum
+dasinh(PG_FUNCTION_ARGS)
+{
+	float8		arg1 = PG_GETARG_FLOAT8(0);
+	float8		result;
+
+	/*
+	 * For asinh, we don't need an errno check because it never overflows.
+	 */
+	result = asinh(arg1);
+
+	PG_RETURN_FLOAT8(result);
+}
+
+/*
+ *		dacosh			- returns the inverse hyperbolic cosine of arg1
+ */
+Datum
+dacosh(PG_FUNCTION_ARGS)
+{
+	float8		arg1 = PG_GETARG_FLOAT8(0);
+	float8		result;
+
+	/*
+	 * acosh is only defined for inputs >= 1.0.  By checking this ourselves,
+	 * we need not worry about checking for an EDOM error, which is a good
+	 * thing because some implementations will report that for NaN. Otherwise,
+	 * no error is possible.
+	 */
+	if (arg1 < 1.0)
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("input is out of range")));
+
+	result = acosh(arg1);
+
+	PG_RETURN_FLOAT8(result);
+}
+
+/*
+ *		datanh			- returns the inverse hyperbolic tangent of arg1
+ */
+Datum
+datanh(PG_FUNCTION_ARGS)
+{
+	float8		arg1 = PG_GETARG_FLOAT8(0);
+	float8		result;
+
+	/*
+	 * atanh is only defined for inputs between -1 and 1.  By checking this
+	 * ourselves, we need not worry about checking for an EDOM error, which is
+	 * a good thing because some implementations will report that for NaN.
+	 */
+	if (arg1 < -1.0 || arg1 > 1.0)
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("input is out of range")));
+
+	/*
+	 * Also handle the infinity cases ourselves; this is helpful because old
+	 * glibc versions may produce the wrong errno for this.  All other inputs
+	 * cannot produce an error.
+	 */
+	if (arg1 == -1.0)
+		result = -get_float8_infinity();
+	else if (arg1 == 1.0)
+		result = get_float8_infinity();
+	else
+		result = atanh(arg1);
+
+	PG_RETURN_FLOAT8(result);
+}
+
+
+/* ========== ERROR FUNCTIONS ========== */
+
+
+/*
+ *		derf			- returns the error function: erf(arg1)
+ */
+Datum
+derf(PG_FUNCTION_ARGS)
+{
+	float8		arg1 = PG_GETARG_FLOAT8(0);
+	float8		result;
+
+	/*
+	 * For erf, we don't need an errno check because it never overflows.
+	 */
+	result = erf(arg1);
+
+	if (unlikely(isinf(result)))
+		float_overflow_error();
+
+	PG_RETURN_FLOAT8(result);
+}
+
+/*
+ *		derfc			- returns the complementary error function: 1 - erf(arg1)
+ */
+Datum
+derfc(PG_FUNCTION_ARGS)
+{
+	float8		arg1 = PG_GETARG_FLOAT8(0);
+	float8		result;
+
+	/*
+	 * For erfc, we don't need an errno check because it never overflows.
+	 */
+	result = erfc(arg1);
+
+	if (unlikely(isinf(result)))
+		float_overflow_error();
+
+	PG_RETURN_FLOAT8(result);
+}
+
+
+/* ========== GAMMA FUNCTIONS ========== */
+
+
+/*
+ *		dgamma			- returns the gamma function of arg1
+ */
+Datum
+dgamma(PG_FUNCTION_ARGS)
+{
+	float8		arg1 = PG_GETARG_FLOAT8(0);
+	float8		result;
+
+	/*
+	 * Handle NaN and Inf cases explicitly.  This simplifies the overflow
+	 * checks on platforms that do not set errno.
+	 */
+	if (isnan(arg1))
+		result = arg1;
+	else if (isinf(arg1))
+	{
+		/* Per POSIX, an input of -Inf causes a domain error */
+		if (arg1 < 0)
+		{
+			float_overflow_error();
+			result = get_float8_nan();	/* keep compiler quiet */
+		}
+		else
+			result = arg1;
+	}
+	else
+	{
+		/*
+		 * Note: the POSIX/C99 gamma function is called "tgamma", not "gamma".
+		 *
+		 * On some platforms, tgamma() will not set errno but just return Inf,
+		 * NaN, or zero to report overflow/underflow; therefore, test those
+		 * cases explicitly (note that, like the exponential function, the
+		 * gamma function has no zeros).
+		 */
+		errno = 0;
+		result = tgamma(arg1);
+
+		if (errno != 0 || isinf(result) || isnan(result))
+		{
+			if (result != 0.0)
+				float_overflow_error();
+			else
+				float_underflow_error();
+		}
+		else if (result == 0.0)
+			float_underflow_error();
+	}
+
+	PG_RETURN_FLOAT8(result);
+}
+
+
+/*
+ *		dlgamma			- natural logarithm of absolute value of gamma of arg1
+ */
+Datum
+dlgamma(PG_FUNCTION_ARGS)
+{
+	float8		arg1 = PG_GETARG_FLOAT8(0);
+	float8		result;
+
+	/* On some versions of AIX, lgamma(NaN) fails with ERANGE */
+#if defined(_AIX)
+	if (isnan(arg1))
+		PG_RETURN_FLOAT8(arg1);
+#endif
+
+	/*
+	 * Note: lgamma may not be thread-safe because it may write to a global
+	 * variable signgam, which may not be thread-local. However, this doesn't
+	 * matter to us, since we don't use signgam.
+	 */
+	errno = 0;
+	result = lgamma(arg1);
+
+	/*
+	 * If an ERANGE error occurs, it means there was an overflow or a pole
+	 * error (which happens for zero and negative integer inputs).
+	 *
+	 * On some platforms, lgamma() will not set errno but just return infinity
+	 * to report overflow, but it should never underflow.
+	 */
+	if (errno == ERANGE || (isinf(result) && !isinf(arg1)))
+		float_overflow_error();
+
+	PG_RETURN_FLOAT8(result);
 }
 
 
@@ -2480,7 +3051,8 @@ float8_combine(PG_FUNCTION_ARGS)
 		Sx = float8_pl(Sx1, Sx2);
 		tmp = Sx1 / N1 - Sx2 / N2;
 		Sxx = Sxx1 + Sxx2 + N1 * N2 * tmp * tmp / N;
-		check_float8_val(Sxx, isinf(Sxx1) || isinf(Sxx2), true);
+		if (unlikely(isinf(Sxx)) && !isinf(Sxx1) && !isinf(Sxx2))
+			float_overflow_error();
 	}
 
 	/*
@@ -2505,9 +3077,7 @@ float8_combine(PG_FUNCTION_ARGS)
 		transdatums[1] = Float8GetDatumFast(Sx);
 		transdatums[2] = Float8GetDatumFast(Sxx);
 
-		result = construct_array(transdatums, 3,
-								 FLOAT8OID,
-								 sizeof(float8), FLOAT8PASSBYVAL, 'd');
+		result = construct_array_builtin(transdatums, 3, FLOAT8OID);
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -2549,12 +3119,21 @@ float8_accum(PG_FUNCTION_ARGS)
 		if (isinf(Sx) || isinf(Sxx))
 		{
 			if (!isinf(transvalues[1]) && !isinf(newval))
-				ereport(ERROR,
-						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-						 errmsg("value out of range: overflow")));
+				float_overflow_error();
 
 			Sxx = get_float8_nan();
 		}
+	}
+	else
+	{
+		/*
+		 * At the first input, we normally can leave Sxx as 0.  However, if
+		 * the first input is Inf or NaN, we'd better force Sxx to NaN;
+		 * otherwise we will falsely report variance zero when there are no
+		 * more inputs.
+		 */
+		if (isnan(newval) || isinf(newval))
+			Sxx = get_float8_nan();
 	}
 
 	/*
@@ -2579,9 +3158,7 @@ float8_accum(PG_FUNCTION_ARGS)
 		transdatums[1] = Float8GetDatumFast(Sx);
 		transdatums[2] = Float8GetDatumFast(Sxx);
 
-		result = construct_array(transdatums, 3,
-								 FLOAT8OID,
-								 sizeof(float8), FLOAT8PASSBYVAL, 'd');
+		result = construct_array_builtin(transdatums, 3, FLOAT8OID);
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -2625,12 +3202,21 @@ float4_accum(PG_FUNCTION_ARGS)
 		if (isinf(Sx) || isinf(Sxx))
 		{
 			if (!isinf(transvalues[1]) && !isinf(newval))
-				ereport(ERROR,
-						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-						 errmsg("value out of range: overflow")));
+				float_overflow_error();
 
 			Sxx = get_float8_nan();
 		}
+	}
+	else
+	{
+		/*
+		 * At the first input, we normally can leave Sxx as 0.  However, if
+		 * the first input is Inf or NaN, we'd better force Sxx to NaN;
+		 * otherwise we will falsely report variance zero when there are no
+		 * more inputs.
+		 */
+		if (isnan(newval) || isinf(newval))
+			Sxx = get_float8_nan();
 	}
 
 	/*
@@ -2655,9 +3241,7 @@ float4_accum(PG_FUNCTION_ARGS)
 		transdatums[1] = Float8GetDatumFast(Sx);
 		transdatums[2] = Float8GetDatumFast(Sxx);
 
-		result = construct_array(transdatums, 3,
-								 FLOAT8OID,
-								 sizeof(float8), FLOAT8PASSBYVAL, 'd');
+		result = construct_array_builtin(transdatums, 3, FLOAT8OID);
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -2779,9 +3363,21 @@ float8_stddev_samp(PG_FUNCTION_ARGS)
  * As with the preceding aggregates, we use the Youngs-Cramer algorithm to
  * reduce rounding errors in the aggregate final functions.
  *
- * The transition datatype for all these aggregates is a 6-element array of
+ * The transition datatype for all these aggregates is an 8-element array of
  * float8, holding the values N, Sx=sum(X), Sxx=sum((X-Sx/N)^2), Sy=sum(Y),
- * Syy=sum((Y-Sy/N)^2), Sxy=sum((X-Sx/N)*(Y-Sy/N)) in that order.
+ * Syy=sum((Y-Sy/N)^2), Sxy=sum((X-Sx/N)*(Y-Sy/N)), commonX, and commonY
+ * in that order.
+ *
+ * commonX is defined as the common X value if all the X values were the same,
+ * else NaN; likewise for commonY.  This is useful for deciding whether corr()
+ * and related functions should return NULL.  This representation cannot
+ * distinguish the-values-were-all-NaN from the-values-were-not-all-the-same,
+ * but that's okay because for this purpose we use the IEEE float arithmetic
+ * principle that two NaNs are never equal.  The SQL standard doesn't mention
+ * NaNs, but it says that NULL is to be returned when N*sum(X*X) equals
+ * sum(X)*sum(X) (etc), and that shouldn't be considered true for NaNs.
+ * Testing this as written in the spec would be highly subject to roundoff
+ * error, so instead we directly track whether all the inputs are equal.
  *
  * Note that Y is the first argument to all these aggregates!
  *
@@ -2805,17 +3401,21 @@ float8_regr_accum(PG_FUNCTION_ARGS)
 				Sy,
 				Syy,
 				Sxy,
+				commonX,
+				commonY,
 				tmpX,
 				tmpY,
 				scale;
 
-	transvalues = check_float8_array(transarray, "float8_regr_accum", 6);
+	transvalues = check_float8_array(transarray, "float8_regr_accum", 8);
 	N = transvalues[0];
 	Sx = transvalues[1];
 	Sxx = transvalues[2];
 	Sy = transvalues[3];
 	Syy = transvalues[4];
 	Sxy = transvalues[5];
+	commonX = transvalues[6];
+	commonY = transvalues[7];
 
 	/*
 	 * Use the Youngs-Cramer algorithm to incorporate the new values into the
@@ -2826,12 +3426,44 @@ float8_regr_accum(PG_FUNCTION_ARGS)
 	Sy += newvalY;
 	if (transvalues[0] > 0.0)
 	{
+		/*
+		 * Check to see if we have seen distinct inputs.  We can use a test
+		 * that's a bit cheaper than float8_ne() because if commonX is already
+		 * NaN, it does not matter whether the != test returns true or not.
+		 */
+		if (newvalX != commonX || isnan(newvalX))
+			commonX = get_float8_nan();
+		if (newvalY != commonY || isnan(newvalY))
+			commonY = get_float8_nan();
+
 		tmpX = newvalX * N - Sx;
 		tmpY = newvalY * N - Sy;
 		scale = 1.0 / (N * transvalues[0]);
-		Sxx += tmpX * tmpX * scale;
-		Syy += tmpY * tmpY * scale;
-		Sxy += tmpX * tmpY * scale;
+
+		/*
+		 * If we have not seen distinct inputs, then Sxx, Syy, and/or Sxy
+		 * should remain zero (since Sx's exact value would be N * commonX,
+		 * etc).  Updating them would just create the possibility of injecting
+		 * roundoff error, and we need exact zero results so that the final
+		 * functions will return NULL in the right cases.
+		 */
+		if (isnan(commonX))
+			Sxx += tmpX * tmpX * scale;
+		if (isnan(commonY))
+			Syy += tmpY * tmpY * scale;
+		if (isnan(commonX) && isnan(commonY))
+			Sxy += tmpX * tmpY * scale;
+		else if (isnan(newvalX) || isinf(newvalX) ||
+				 isnan(newvalY) || isinf(newvalY))
+		{
+			/*
+			 * If one input has been constant so far, but the other one is Inf
+			 * or NaN this time, we must force Sxy to NaN to avoid falsely
+			 * reporting variance zero (compare the special case for the first
+			 * inputs, below).  Sxx and Syy don't have this issue.
+			 */
+			Sxy = get_float8_nan();
+		}
 
 		/*
 		 * Overflow check.  We only report an overflow error when finite
@@ -2848,9 +3480,7 @@ float8_regr_accum(PG_FUNCTION_ARGS)
 				(isinf(Sxy) &&
 				 !isinf(transvalues[1]) && !isinf(newvalX) &&
 				 !isinf(transvalues[3]) && !isinf(newvalY)))
-				ereport(ERROR,
-						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-						 errmsg("value out of range: overflow")));
+				float_overflow_error();
 
 			if (isinf(Sxx))
 				Sxx = get_float8_nan();
@@ -2859,6 +3489,22 @@ float8_regr_accum(PG_FUNCTION_ARGS)
 			if (isinf(Sxy))
 				Sxy = get_float8_nan();
 		}
+	}
+	else
+	{
+		/*
+		 * At the first input, we normally can leave Sxx et al as 0.  However,
+		 * if the first input is Inf or NaN, we'd better force the dependent
+		 * sums to NaN; otherwise we will falsely report variance zero when
+		 * there are no more inputs.
+		 */
+		if (isnan(newvalX) || isinf(newvalX))
+			Sxx = Sxy = get_float8_nan();
+		if (isnan(newvalY) || isinf(newvalY))
+			Syy = Sxy = get_float8_nan();
+
+		commonX = newvalX;
+		commonY = newvalY;
 	}
 
 	/*
@@ -2874,12 +3520,14 @@ float8_regr_accum(PG_FUNCTION_ARGS)
 		transvalues[3] = Sy;
 		transvalues[4] = Syy;
 		transvalues[5] = Sxy;
+		transvalues[6] = commonX;
+		transvalues[7] = commonY;
 
 		PG_RETURN_ARRAYTYPE_P(transarray);
 	}
 	else
 	{
-		Datum		transdatums[6];
+		Datum		transdatums[8];
 		ArrayType  *result;
 
 		transdatums[0] = Float8GetDatumFast(N);
@@ -2888,10 +3536,10 @@ float8_regr_accum(PG_FUNCTION_ARGS)
 		transdatums[3] = Float8GetDatumFast(Sy);
 		transdatums[4] = Float8GetDatumFast(Syy);
 		transdatums[5] = Float8GetDatumFast(Sxy);
+		transdatums[6] = Float8GetDatumFast(commonX);
+		transdatums[7] = Float8GetDatumFast(commonY);
 
-		result = construct_array(transdatums, 6,
-								 FLOAT8OID,
-								 sizeof(float8), FLOAT8PASSBYVAL, 'd');
+		result = construct_array_builtin(transdatums, 8, FLOAT8OID);
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -2900,7 +3548,7 @@ float8_regr_accum(PG_FUNCTION_ARGS)
 /*
  * float8_regr_combine
  *
- * An aggregate combine function used to combine two 6 fields
+ * An aggregate combine function used to combine two 8-fields
  * aggregate transition data into a single transition data.
  * This function is used only in two stage aggregation and
  * shouldn't be called outside aggregate context.
@@ -2918,12 +3566,16 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 				Sy1,
 				Syy1,
 				Sxy1,
+				Cx1,
+				Cy1,
 				N2,
 				Sx2,
 				Sxx2,
 				Sy2,
 				Syy2,
 				Sxy2,
+				Cx2,
+				Cy2,
 				tmp1,
 				tmp2,
 				N,
@@ -2931,10 +3583,12 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 				Sxx,
 				Sy,
 				Syy,
-				Sxy;
+				Sxy,
+				Cx,
+				Cy;
 
-	transvalues1 = check_float8_array(transarray1, "float8_regr_combine", 6);
-	transvalues2 = check_float8_array(transarray2, "float8_regr_combine", 6);
+	transvalues1 = check_float8_array(transarray1, "float8_regr_combine", 8);
+	transvalues2 = check_float8_array(transarray2, "float8_regr_combine", 8);
 
 	N1 = transvalues1[0];
 	Sx1 = transvalues1[1];
@@ -2942,6 +3596,8 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 	Sy1 = transvalues1[3];
 	Syy1 = transvalues1[4];
 	Sxy1 = transvalues1[5];
+	Cx1 = transvalues1[6];
+	Cy1 = transvalues1[7];
 
 	N2 = transvalues2[0];
 	Sx2 = transvalues2[1];
@@ -2949,6 +3605,8 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 	Sy2 = transvalues2[3];
 	Syy2 = transvalues2[4];
 	Sxy2 = transvalues2[5];
+	Cx2 = transvalues2[6];
+	Cy2 = transvalues2[7];
 
 	/*--------------------
 	 * The transition values combine using a generalization of the
@@ -2974,6 +3632,8 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 		Sy = Sy2;
 		Syy = Syy2;
 		Sxy = Sxy2;
+		Cx = Cx2;
+		Cy = Cy2;
 	}
 	else if (N2 == 0.0)
 	{
@@ -2983,6 +3643,8 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 		Sy = Sy1;
 		Syy = Syy1;
 		Sxy = Sxy1;
+		Cx = Cx1;
+		Cy = Cy1;
 	}
 	else
 	{
@@ -2990,13 +3652,24 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 		Sx = float8_pl(Sx1, Sx2);
 		tmp1 = Sx1 / N1 - Sx2 / N2;
 		Sxx = Sxx1 + Sxx2 + N1 * N2 * tmp1 * tmp1 / N;
-		check_float8_val(Sxx, isinf(Sxx1) || isinf(Sxx2), true);
+		if (unlikely(isinf(Sxx)) && !isinf(Sxx1) && !isinf(Sxx2))
+			float_overflow_error();
 		Sy = float8_pl(Sy1, Sy2);
 		tmp2 = Sy1 / N1 - Sy2 / N2;
 		Syy = Syy1 + Syy2 + N1 * N2 * tmp2 * tmp2 / N;
-		check_float8_val(Syy, isinf(Syy1) || isinf(Syy2), true);
+		if (unlikely(isinf(Syy)) && !isinf(Syy1) && !isinf(Syy2))
+			float_overflow_error();
 		Sxy = Sxy1 + Sxy2 + N1 * N2 * tmp1 * tmp2 / N;
-		check_float8_val(Sxy, isinf(Sxy1) || isinf(Sxy2), true);
+		if (unlikely(isinf(Sxy)) && !isinf(Sxy1) && !isinf(Sxy2))
+			float_overflow_error();
+		if (float8_eq(Cx1, Cx2))
+			Cx = Cx1;
+		else
+			Cx = get_float8_nan();
+		if (float8_eq(Cy1, Cy2))
+			Cy = Cy1;
+		else
+			Cy = get_float8_nan();
 	}
 
 	/*
@@ -3012,12 +3685,14 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 		transvalues1[3] = Sy;
 		transvalues1[4] = Syy;
 		transvalues1[5] = Sxy;
+		transvalues1[6] = Cx;
+		transvalues1[7] = Cy;
 
 		PG_RETURN_ARRAYTYPE_P(transarray1);
 	}
 	else
 	{
-		Datum		transdatums[6];
+		Datum		transdatums[8];
 		ArrayType  *result;
 
 		transdatums[0] = Float8GetDatumFast(N);
@@ -3026,10 +3701,10 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 		transdatums[3] = Float8GetDatumFast(Sy);
 		transdatums[4] = Float8GetDatumFast(Syy);
 		transdatums[5] = Float8GetDatumFast(Sxy);
+		transdatums[6] = Float8GetDatumFast(Cx);
+		transdatums[7] = Float8GetDatumFast(Cy);
 
-		result = construct_array(transdatums, 6,
-								 FLOAT8OID,
-								 sizeof(float8), FLOAT8PASSBYVAL, 'd');
+		result = construct_array_builtin(transdatums, 8, FLOAT8OID);
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -3044,7 +3719,7 @@ float8_regr_sxx(PG_FUNCTION_ARGS)
 	float8		N,
 				Sxx;
 
-	transvalues = check_float8_array(transarray, "float8_regr_sxx", 6);
+	transvalues = check_float8_array(transarray, "float8_regr_sxx", 8);
 	N = transvalues[0];
 	Sxx = transvalues[2];
 
@@ -3065,7 +3740,7 @@ float8_regr_syy(PG_FUNCTION_ARGS)
 	float8		N,
 				Syy;
 
-	transvalues = check_float8_array(transarray, "float8_regr_syy", 6);
+	transvalues = check_float8_array(transarray, "float8_regr_syy", 8);
 	N = transvalues[0];
 	Syy = transvalues[4];
 
@@ -3086,7 +3761,7 @@ float8_regr_sxy(PG_FUNCTION_ARGS)
 	float8		N,
 				Sxy;
 
-	transvalues = check_float8_array(transarray, "float8_regr_sxy", 6);
+	transvalues = check_float8_array(transarray, "float8_regr_sxy", 8);
 	N = transvalues[0];
 	Sxy = transvalues[5];
 
@@ -3105,15 +3780,21 @@ float8_regr_avgx(PG_FUNCTION_ARGS)
 	ArrayType  *transarray = PG_GETARG_ARRAYTYPE_P(0);
 	float8	   *transvalues;
 	float8		N,
-				Sx;
+				Sx,
+				commonX;
 
-	transvalues = check_float8_array(transarray, "float8_regr_avgx", 6);
+	transvalues = check_float8_array(transarray, "float8_regr_avgx", 8);
 	N = transvalues[0];
 	Sx = transvalues[1];
+	commonX = transvalues[6];
 
 	/* if N is 0 we should return NULL */
 	if (N < 1.0)
 		PG_RETURN_NULL();
+
+	/* if all inputs were the same just return that, avoiding roundoff error */
+	if (!isnan(commonX))
+		PG_RETURN_FLOAT8(commonX);
 
 	PG_RETURN_FLOAT8(Sx / N);
 }
@@ -3124,15 +3805,21 @@ float8_regr_avgy(PG_FUNCTION_ARGS)
 	ArrayType  *transarray = PG_GETARG_ARRAYTYPE_P(0);
 	float8	   *transvalues;
 	float8		N,
-				Sy;
+				Sy,
+				commonY;
 
-	transvalues = check_float8_array(transarray, "float8_regr_avgy", 6);
+	transvalues = check_float8_array(transarray, "float8_regr_avgy", 8);
 	N = transvalues[0];
 	Sy = transvalues[3];
+	commonY = transvalues[7];
 
 	/* if N is 0 we should return NULL */
 	if (N < 1.0)
 		PG_RETURN_NULL();
+
+	/* if all inputs were the same just return that, avoiding roundoff error */
+	if (!isnan(commonY))
+		PG_RETURN_FLOAT8(commonY);
 
 	PG_RETURN_FLOAT8(Sy / N);
 }
@@ -3145,7 +3832,7 @@ float8_covar_pop(PG_FUNCTION_ARGS)
 	float8		N,
 				Sxy;
 
-	transvalues = check_float8_array(transarray, "float8_covar_pop", 6);
+	transvalues = check_float8_array(transarray, "float8_covar_pop", 8);
 	N = transvalues[0];
 	Sxy = transvalues[5];
 
@@ -3164,7 +3851,7 @@ float8_covar_samp(PG_FUNCTION_ARGS)
 	float8		N,
 				Sxy;
 
-	transvalues = check_float8_array(transarray, "float8_covar_samp", 6);
+	transvalues = check_float8_array(transarray, "float8_covar_samp", 8);
 	N = transvalues[0];
 	Sxy = transvalues[5];
 
@@ -3183,9 +3870,12 @@ float8_corr(PG_FUNCTION_ARGS)
 	float8		N,
 				Sxx,
 				Syy,
-				Sxy;
+				Sxy,
+				product,
+				sqrtproduct,
+				result;
 
-	transvalues = check_float8_array(transarray, "float8_corr", 6);
+	transvalues = check_float8_array(transarray, "float8_corr", 8);
 	N = transvalues[0];
 	Sxx = transvalues[2];
 	Syy = transvalues[4];
@@ -3201,7 +3891,29 @@ float8_corr(PG_FUNCTION_ARGS)
 	if (Sxx == 0 || Syy == 0)
 		PG_RETURN_NULL();
 
-	PG_RETURN_FLOAT8(Sxy / sqrt(Sxx * Syy));
+	/*
+	 * The product Sxx * Syy might underflow or overflow.  If so, we can
+	 * recover by computing sqrt(Sxx) * sqrt(Syy) instead of sqrt(Sxx * Syy).
+	 * However, the double sqrt() calculation is a bit slower and less
+	 * accurate, so don't do it if we don't have to.
+	 */
+	product = Sxx * Syy;
+	if (product == 0 || isinf(product))
+		sqrtproduct = sqrt(Sxx) * sqrt(Syy);
+	else
+		sqrtproduct = sqrt(product);
+	result = Sxy / sqrtproduct;
+
+	/*
+	 * Despite all these precautions, this formula can yield results outside
+	 * [-1, 1] due to roundoff error.  Clamp it to the expected range.
+	 */
+	if (result < -1)
+		result = -1;
+	else if (result > 1)
+		result = 1;
+
+	PG_RETURN_FLOAT8(result);
 }
 
 Datum
@@ -3212,9 +3924,14 @@ float8_regr_r2(PG_FUNCTION_ARGS)
 	float8		N,
 				Sxx,
 				Syy,
-				Sxy;
+				Sxy,
+				numerator,
+				denominator,
+				sqrtdenominator,
+				sqrtresult,
+				result;
 
-	transvalues = check_float8_array(transarray, "float8_regr_r2", 6);
+	transvalues = check_float8_array(transarray, "float8_regr_r2", 8);
 	N = transvalues[0];
 	Sxx = transvalues[2];
 	Syy = transvalues[4];
@@ -3234,7 +3951,35 @@ float8_regr_r2(PG_FUNCTION_ARGS)
 	if (Syy == 0)
 		PG_RETURN_FLOAT8(1.0);
 
-	PG_RETURN_FLOAT8((Sxy * Sxy) / (Sxx * Syy));
+	/*
+	 * The products Sxy * Sxy and/or Sxx * Syy might underflow or overflow. If
+	 * so, we can recover by computing Sxy / (sqrt(Sxx) * sqrt(Syy)) and
+	 * squaring it instead.  However, the double sqrt() calculation is a bit
+	 * slower and less accurate, so don't do it if we don't have to.
+	 */
+	numerator = Sxy * Sxy;
+	denominator = Sxx * Syy;
+	if (numerator == 0 || isinf(numerator) ||
+		denominator == 0 || isinf(denominator))
+	{
+		sqrtdenominator = sqrt(Sxx) * sqrt(Syy);
+		sqrtresult = Sxy / sqrtdenominator;
+		result = sqrtresult * sqrtresult;
+	}
+	else
+		result = numerator / denominator;
+
+	/*
+	 * Despite all these precautions, this formula can yield results outside
+	 * [0, 1] due to roundoff error.  Clamp it to the expected range.
+	 *
+	 * Note that result is guaranteed to be non-negative because Sxx and Syy
+	 * are non-negative, so we only need to clamp the upper end of the range.
+	 */
+	if (result > 1)
+		result = 1;
+
+	PG_RETURN_FLOAT8(result);
 }
 
 Datum
@@ -3246,7 +3991,7 @@ float8_regr_slope(PG_FUNCTION_ARGS)
 				Sxx,
 				Sxy;
 
-	transvalues = check_float8_array(transarray, "float8_regr_slope", 6);
+	transvalues = check_float8_array(transarray, "float8_regr_slope", 8);
 	N = transvalues[0];
 	Sxx = transvalues[2];
 	Sxy = transvalues[5];
@@ -3273,9 +4018,10 @@ float8_regr_intercept(PG_FUNCTION_ARGS)
 				Sx,
 				Sxx,
 				Sy,
-				Sxy;
+				Sxy,
+				dy;
 
-	transvalues = check_float8_array(transarray, "float8_regr_intercept", 6);
+	transvalues = check_float8_array(transarray, "float8_regr_intercept", 8);
 	N = transvalues[0];
 	Sx = transvalues[1];
 	Sxx = transvalues[2];
@@ -3292,7 +4038,41 @@ float8_regr_intercept(PG_FUNCTION_ARGS)
 	if (Sxx == 0)
 		PG_RETURN_NULL();
 
-	PG_RETURN_FLOAT8((Sy - Sx * Sxy / Sxx) / N);
+	/*
+	 * The intercept is given by (Sy - dy) / N, where dy = Sx * Sxy / Sxx.
+	 * However, when computing dy, the intermediate product Sx * Sxy might
+	 * underflow or overflow.  If so, we can recover by decomposing Sx, Sxy,
+	 * and Sxx into normalized mantissa and integer power-of-two components,
+	 * computing the corresponding components of dy, and then recomposing dy.
+	 * We avoid doing this if Sx, Sxy, or Sxx are infinite or NaN, since the
+	 * exponent returned by frexp() is unspecified in those cases (and the
+	 * final result would be the same in any case).
+	 */
+	dy = Sx * Sxy / Sxx;
+	if ((dy == 0 || isinf(dy)) &&
+		!(isinf(Sx) || isinf(Sxy) || isinf(Sxx) ||
+		  isnan(Sx) || isnan(Sxy) || isnan(Sxx)))
+	{
+		float8		m_Sx,
+					m_Sxy,
+					m_Sxx,
+					m_dy;
+		int			n_Sx,
+					n_Sxy,
+					n_Sxx,
+					n_dy;
+
+		m_Sx = frexp(Sx, &n_Sx);
+		m_Sxy = frexp(Sxy, &n_Sxy);
+		m_Sxx = frexp(Sxx, &n_Sxx);
+
+		m_dy = m_Sx * m_Sxy / m_Sxx;
+		n_dy = n_Sx + n_Sxy - n_Sxx;
+
+		dy = ldexp(m_dy, n_dy);
+	}
+
+	PG_RETURN_FLOAT8((Sy - dy) / N);
 }
 
 
@@ -3515,10 +4295,11 @@ float84ge(PG_FUNCTION_ARGS)
  * in the histogram. width_bucket() returns an integer indicating the
  * bucket number that 'operand' belongs to in an equiwidth histogram
  * with the specified characteristics. An operand smaller than the
- * lower bound is assigned to bucket 0. An operand greater than the
- * upper bound is assigned to an additional bucket (with number
- * count+1). We don't allow "NaN" for any of the float8 inputs, and we
- * don't allow either of the histogram bounds to be +/- infinity.
+ * lower bound is assigned to bucket 0. An operand greater than or equal
+ * to the upper bound is assigned to an additional bucket (with number
+ * count+1). We don't allow the histogram bounds to be NaN or +/- infinity,
+ * but we do allow those values for the operand (taking NaN to be larger
+ * than any other value, as we do in comparisons).
  */
 Datum
 width_bucket_float8(PG_FUNCTION_ARGS)
@@ -3529,17 +4310,16 @@ width_bucket_float8(PG_FUNCTION_ARGS)
 	int32		count = PG_GETARG_INT32(3);
 	int32		result;
 
-	if (count <= 0.0)
+	if (count <= 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_ARGUMENT_FOR_WIDTH_BUCKET_FUNCTION),
 				 errmsg("count must be greater than zero")));
 
-	if (isnan(operand) || isnan(bound1) || isnan(bound2))
+	if (isnan(bound1) || isnan(bound2))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_ARGUMENT_FOR_WIDTH_BUCKET_FUNCTION),
-				 errmsg("operand, lower bound, and upper bound cannot be NaN")));
+				 errmsg("lower and upper bounds cannot be NaN")));
 
-	/* Note that we allow "operand" to be infinite */
 	if (isinf(bound1) || isinf(bound2))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_ARGUMENT_FOR_WIDTH_BUCKET_FUNCTION),
@@ -3547,21 +4327,45 @@ width_bucket_float8(PG_FUNCTION_ARGS)
 
 	if (bound1 < bound2)
 	{
-		if (operand < bound1)
-			result = 0;
-		else if (operand >= bound2)
+		if (isnan(operand) || operand >= bound2)
 		{
 			if (pg_add_s32_overflow(count, 1, &result))
 				ereport(ERROR,
 						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 						 errmsg("integer out of range")));
 		}
+		else if (operand < bound1)
+			result = 0;
 		else
-			result = ((float8) count * (operand - bound1) / (bound2 - bound1)) + 1;
+		{
+			if (!isinf(bound2 - bound1))
+			{
+				/* The quotient is surely in [0,1], so this can't overflow */
+				result = count * ((operand - bound1) / (bound2 - bound1));
+			}
+			else
+			{
+				/*
+				 * We get here if bound2 - bound1 overflows DBL_MAX.  Since
+				 * both bounds are finite, their difference can't exceed twice
+				 * DBL_MAX; so we can perform the computation without overflow
+				 * by dividing all the inputs by 2.  That should be exact too,
+				 * except in the case where a very small operand underflows to
+				 * zero, which would have negligible impact on the result
+				 * given such large bounds.
+				 */
+				result = count * ((operand / 2 - bound1 / 2) / (bound2 / 2 - bound1 / 2));
+			}
+			/* The quotient could round to 1.0, which would be a lie */
+			if (result >= count)
+				result = count - 1;
+			/* Having done that, we can add 1 without fear of overflow */
+			result++;
+		}
 	}
 	else if (bound1 > bound2)
 	{
-		if (operand > bound1)
+		if (isnan(operand) || operand > bound1)
 			result = 0;
 		else if (operand <= bound2)
 		{
@@ -3571,7 +4375,15 @@ width_bucket_float8(PG_FUNCTION_ARGS)
 						 errmsg("integer out of range")));
 		}
 		else
-			result = ((float8) count * (bound1 - operand) / (bound1 - bound2)) + 1;
+		{
+			if (!isinf(bound1 - bound2))
+				result = count * ((bound1 - operand) / (bound1 - bound2));
+			else
+				result = count * ((bound1 / 2 - operand / 2) / (bound1 / 2 - bound2 / 2));
+			if (result >= count)
+				result = count - 1;
+			result++;
+		}
 	}
 	else
 	{
@@ -3583,28 +4395,3 @@ width_bucket_float8(PG_FUNCTION_ARGS)
 
 	PG_RETURN_INT32(result);
 }
-
-/* ========== PRIVATE ROUTINES ========== */
-
-#ifndef HAVE_CBRT
-
-static double
-cbrt(double x)
-{
-	int			isneg = (x < 0.0);
-	double		absx = fabs(x);
-	double		tmpres = pow(absx, (double) 1.0 / (double) 3.0);
-
-	/*
-	 * The result is somewhat inaccurate --- not really pow()'s fault, as the
-	 * exponent it's handed contains roundoff error.  We can improve the
-	 * accuracy by doing one iteration of Newton's formula.  Beware of zero
-	 * input however.
-	 */
-	if (tmpres > 0.0)
-		tmpres -= (tmpres - absx / (tmpres * tmpres)) / (double) 3.0;
-
-	return isneg ? -tmpres : tmpres;
-}
-
-#endif							/* !HAVE_CBRT */

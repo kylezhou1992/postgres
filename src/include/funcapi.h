@@ -8,7 +8,7 @@
  * or call FUNCAPI-callable functions or macros.
  *
  *
- * Copyright (c) 2002-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2026, PostgreSQL Global Development Group
  *
  * src/include/funcapi.h
  *
@@ -17,11 +17,10 @@
 #ifndef FUNCAPI_H
 #define FUNCAPI_H
 
-#include "fmgr.h"
 #include "access/tupdesc.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
-
+#include "fmgr.h"
 
 /*-------------------------------------------------------------------------
  *	Support to ease writing Functions returning composite types
@@ -150,39 +149,39 @@ typedef enum TypeFuncClass
 	TYPEFUNC_COMPOSITE,			/* determinable rowtype result */
 	TYPEFUNC_COMPOSITE_DOMAIN,	/* domain over determinable rowtype result */
 	TYPEFUNC_RECORD,			/* indeterminate rowtype result */
-	TYPEFUNC_OTHER				/* bogus type, eg pseudotype */
+	TYPEFUNC_OTHER,				/* bogus type, eg pseudotype */
 } TypeFuncClass;
 
 extern TypeFuncClass get_call_result_type(FunctionCallInfo fcinfo,
-					 Oid *resultTypeId,
-					 TupleDesc *resultTupleDesc);
+										  Oid *resultTypeId,
+										  TupleDesc *resultTupleDesc);
 extern TypeFuncClass get_expr_result_type(Node *expr,
-					 Oid *resultTypeId,
-					 TupleDesc *resultTupleDesc);
+										  Oid *resultTypeId,
+										  TupleDesc *resultTupleDesc);
 extern TypeFuncClass get_func_result_type(Oid functionId,
-					 Oid *resultTypeId,
-					 TupleDesc *resultTupleDesc);
+										  Oid *resultTypeId,
+										  TupleDesc *resultTupleDesc);
 
 extern TupleDesc get_expr_result_tupdesc(Node *expr, bool noError);
 
 extern bool resolve_polymorphic_argtypes(int numargs, Oid *argtypes,
-							 char *argmodes,
-							 Node *call_expr);
+										 char *argmodes,
+										 Node *call_expr);
 
-extern int get_func_arg_info(HeapTuple procTup,
-				  Oid **p_argtypes, char ***p_argnames,
-				  char **p_argmodes);
+extern int	get_func_arg_info(HeapTuple procTup,
+							  Oid **p_argtypes, char ***p_argnames,
+							  char **p_argmodes);
 
-extern int get_func_input_arg_names(Datum proargnames, Datum proargmodes,
-						 char ***arg_names);
+extern int	get_func_input_arg_names(Datum proargnames, Datum proargmodes,
+									 char ***arg_names);
 
 extern int	get_func_trftypes(HeapTuple procTup, Oid **p_trftypes);
 extern char *get_func_result_name(Oid functionId);
 
 extern TupleDesc build_function_result_tupdesc_d(char prokind,
-								Datum proallargtypes,
-								Datum proargmodes,
-								Datum proargnames);
+												 Datum proallargtypes,
+												 Datum proargmodes,
+												 Datum proargnames);
 extern TupleDesc build_function_result_tupdesc_t(HeapTuple procTuple);
 
 
@@ -205,7 +204,7 @@ extern TupleDesc build_function_result_tupdesc_t(HeapTuple procTuple);
  * Datum HeapTupleHeaderGetDatum(HeapTupleHeader tuple) - convert a
  *		HeapTupleHeader to a Datum.
  *
- * Macro declarations:
+ * Inline declarations:
  * HeapTupleGetDatum(HeapTuple tuple) - convert a HeapTuple to a Datum.
  *
  * Obsolete routines and macros:
@@ -218,10 +217,6 @@ extern TupleDesc build_function_result_tupdesc_t(HeapTuple procTuple);
  *----------
  */
 
-#define HeapTupleGetDatum(tuple)		HeapTupleHeaderGetDatum((tuple)->t_data)
-/* obsolete version of above */
-#define TupleGetDatum(_slot, _tuple)	HeapTupleGetDatum(_tuple)
-
 extern TupleDesc RelationNameGetTupleDesc(const char *relname);
 extern TupleDesc TypeGetTupleDesc(Oid typeoid, List *colaliases);
 
@@ -231,11 +226,20 @@ extern AttInMetadata *TupleDescGetAttInMetadata(TupleDesc tupdesc);
 extern HeapTuple BuildTupleFromCStrings(AttInMetadata *attinmeta, char **values);
 extern Datum HeapTupleHeaderGetDatum(HeapTupleHeader tuple);
 
+static inline Datum
+HeapTupleGetDatum(const HeapTupleData *tuple)
+{
+	return HeapTupleHeaderGetDatum(tuple->t_data);
+}
+
+/* obsolete version of above */
+#define TupleGetDatum(_slot, _tuple)	HeapTupleGetDatum(_tuple)
+
 
 /*----------
  *		Support for Set Returning Functions (SRFs)
  *
- * The basic API for SRFs looks something like:
+ * The basic API for SRFs using ValuePerCall mode looks something like this:
  *
  * Datum
  * my_Set_Returning_Function(PG_FUNCTION_ARGS)
@@ -252,7 +256,7 @@ extern Datum HeapTupleHeaderGetDatum(HeapTupleHeader tuple);
  *		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
  *		<user defined code>
  *		<if returning composite>
- *			<build TupleDesc, and perhaps AttInMetaData>
+ *			<build TupleDesc, and perhaps AttInMetadata>
  *		<endif returning composite>
  *		<user defined code>
  *		// return to original context when allocating transient memory
@@ -272,10 +276,28 @@ extern Datum HeapTupleHeaderGetDatum(HeapTupleHeader tuple);
  *		SRF_RETURN_DONE(funcctx);
  * }
  *
+ * NOTE: there is no guarantee that a SRF using ValuePerCall mode will be
+ * run to completion; for example, a query with LIMIT might stop short of
+ * fetching all the rows.  Therefore, do not expect that you can do resource
+ * cleanup just before SRF_RETURN_DONE().  You need not worry about releasing
+ * memory allocated in multi_call_memory_ctx, but holding file descriptors or
+ * other non-memory resources open across calls is a bug.  SRFs that need
+ * such resources should not use these macros, but instead populate a
+ * tuplestore during a single call, as set up by InitMaterializedSRF() (see
+ * fmgr/README).  Alternatively, set up a callback to release resources
+ * at query shutdown, using RegisterExprContextCallback().
+ *
  *----------
  */
 
 /* from funcapi.c */
+
+/* flag bits for InitMaterializedSRF() */
+#define MAT_SRF_USE_EXPECTED_DESC	0x01	/* use expectedDesc as tupdesc. */
+#define MAT_SRF_BLESS				0x02	/* "Bless" a tuple descriptor with
+											 * BlessTupleDesc(). */
+extern void InitMaterializedSRF(FunctionCallInfo fcinfo, uint32 flags);
+
 extern FuncCallContext *init_MultiFuncCall(PG_FUNCTION_ARGS);
 extern FuncCallContext *per_MultiFuncCall(PG_FUNCTION_ARGS);
 extern void end_MultiFuncCall(PG_FUNCTION_ARGS, FuncCallContext *funcctx);
@@ -331,8 +353,8 @@ extern void end_MultiFuncCall(PG_FUNCTION_ARGS, FuncCallContext *funcctx);
  * The return result is the number of elements stored, or -1 in the case of
  * "VARIADIC NULL".
  */
-extern int extract_variadic_args(FunctionCallInfo fcinfo, int variadic_start,
-					  bool convert_unknown, Datum **values,
-					  Oid **types, bool **nulls);
+extern int	extract_variadic_args(FunctionCallInfo fcinfo, int variadic_start,
+								  bool convert_unknown, Datum **args,
+								  Oid **types, bool **nulls);
 
 #endif							/* FUNCAPI_H */

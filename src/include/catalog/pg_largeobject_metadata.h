@@ -5,7 +5,7 @@
  *	  (pg_largeobject_metadata)
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_largeobject_metadata.h
@@ -20,21 +20,28 @@
 #define PG_LARGEOBJECT_METADATA_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_largeobject_metadata_d.h"
+#include "catalog/pg_largeobject_metadata_d.h"	/* IWYU pragma: export */
 
 /* ----------------
  *		pg_largeobject_metadata definition. cpp turns this into
  *		typedef struct FormData_pg_largeobject_metadata
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_largeobject_metadata,2995,LargeObjectMetadataRelationId)
 {
-	Oid			lomowner;		/* OID of the largeobject owner */
+	Oid			oid;			/* oid */
+
+	Oid			lomowner BKI_LOOKUP(pg_authid); /* OID of the largeobject
+												 * owner */
 
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
-	aclitem		lomacl[1];		/* access permissions */
+	aclitem		lomacl[];		/* access permissions */
 #endif
 } FormData_pg_largeobject_metadata;
+
+END_CATALOG_STRUCT
 
 /* ----------------
  *		Form_pg_largeobject_metadata corresponds to a pointer to a tuple
@@ -42,5 +49,7 @@ CATALOG(pg_largeobject_metadata,2995,LargeObjectMetadataRelationId)
  * ----------------
  */
 typedef FormData_pg_largeobject_metadata *Form_pg_largeobject_metadata;
+
+DECLARE_UNIQUE_INDEX_PKEY(pg_largeobject_metadata_oid_index, 2996, LargeObjectMetadataOidIndexId, pg_largeobject_metadata, btree(oid oid_ops));
 
 #endif							/* PG_LARGEOBJECT_METADATA_H */

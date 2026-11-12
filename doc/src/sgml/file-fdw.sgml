@@ -1,7 +1,7 @@
 <!-- doc/src/sgml/file-fdw.sgml -->
 
 <sect1 id="file-fdw" xreflabel="file_fdw">
- <title>file_fdw</title>
+ <title>file_fdw &mdash; access data files in the server's file system</title>
 
  <indexterm zone="file-fdw">
   <primary>file_fdw</primary>
@@ -28,7 +28,8 @@
 
    <listitem>
     <para>
-     Specifies the file to be read.  Must be an absolute path name.
+     Specifies the file to be read.  Relative paths are relative to the
+     data directory.
      Either <literal>filename</literal> or <literal>program</literal> must be
      specified, but not both.
     </para>
@@ -64,7 +65,7 @@
 
    <listitem>
     <para>
-     Specifies whether the data has a header line,
+     Specifies whether to skip a header line, or how many header lines to skip,
      the same as <command>COPY</command>'s <literal>HEADER</literal> option.
     </para>
    </listitem>
@@ -115,12 +116,61 @@
   </varlistentry>
 
   <varlistentry>
+   <term><literal>default</literal></term>
+
+   <listitem>
+    <para>
+     Specifies the string that represents a default value,
+     the same as <command>COPY</command>'s <literal>DEFAULT</literal> option.
+    </para>
+   </listitem>
+  </varlistentry>
+
+  <varlistentry>
    <term><literal>encoding</literal></term>
 
    <listitem>
     <para>
      Specifies the data encoding,
      the same as <command>COPY</command>'s <literal>ENCODING</literal> option.
+    </para>
+   </listitem>
+  </varlistentry>
+
+  <varlistentry>
+   <term><literal>on_error</literal></term>
+
+   <listitem>
+    <para>
+     Specifies how to behave when encountering an error converting a column's
+     input value into its data type,
+     the same as <command>COPY</command>'s <literal>ON_ERROR</literal> option.
+    </para>
+   </listitem>
+  </varlistentry>
+
+  <varlistentry>
+   <term><literal>reject_limit</literal></term>
+
+   <listitem>
+    <para>
+     Specifies the maximum number of errors tolerated while converting a column's
+     input value to its data type, the same as <command>COPY</command>'s
+     <literal>REJECT_LIMIT</literal> option.
+     This limit is not enforced when <command>ANALYZE</command> samples rows
+     from the foreign table, so that statistics can still be collected
+     from valid rows.
+    </para>
+   </listitem>
+  </varlistentry>
+
+  <varlistentry>
+   <term><literal>log_verbosity</literal></term>
+
+   <listitem>
+    <para>
+     Specifies the amount of messages emitted by <literal>file_fdw</literal>,
+     the same as <command>COPY</command>'s <literal>LOG_VERBOSITY</literal> option.
     </para>
    </listitem>
   </varlistentry>
@@ -132,7 +182,7 @@
   to be specified without a corresponding value, the foreign table option
   syntax requires a value to be present in all cases.  To activate
   <command>COPY</command> options typically written without a value, you can pass
-  the value TRUE, since all such options are Booleans.
+  the value TRUE, since all such options accept Booleans.
  </para>
 
  <para>
@@ -174,9 +224,8 @@
  </variablelist>
 
  <para>
-  <command>COPY</command>'s <literal>OIDS</literal> and
-  <literal>FORCE_QUOTE</literal> options are currently not supported by
-  <literal>file_fdw</literal>.
+  <command>COPY</command>'s <literal>FORCE_QUOTE</literal> option is
+  currently not supported by <literal>file_fdw</literal>.
  </para>
 
  <para>
@@ -187,8 +236,8 @@
 
  <para>
   Changing table-level options requires being a superuser or having the privileges
-  of the default role <literal>pg_read_server_files</literal> (to use a filename) or
-  the default role <literal>pg_execute_server_programs</literal> (to use a program),
+  of the role <literal>pg_read_server_files</literal> (to use a filename) or
+  the role <literal>pg_execute_server_program</literal> (to use a program),
   for security reasons: only certain users should be able to control which file is
   read or which program is run.  In principle regular users could be allowed to
   change the other options, but that's not supported at present.
@@ -211,12 +260,14 @@
  </para>
 
  <example>
- <title id="csvlog-fdw">Create a Foreign Table for PostgreSQL CSV Logs</title>
+  <title>Create a Foreign Table for PostgreSQL CSV Logs</title>
 
   <para>
    One of the obvious uses for <literal>file_fdw</literal> is to make
    the PostgreSQL activity log available as a table for querying.  To
-   do this, first you must be logging to a CSV file, which here we
+   do this, first you must be <link
+   linkend="runtime-config-logging-csvlog">logging to a CSV file,</link>
+   which here we
    will call <literal>pglog.csv</literal>.  First, install <literal>file_fdw</literal>
    as an extension:
   </para>
@@ -262,9 +313,12 @@ CREATE FOREIGN TABLE pglog (
   query text,
   query_pos integer,
   location text,
-  application_name text
+  application_name text,
+  backend_type text,
+  leader_pid integer,
+  query_id bigint
 ) SERVER pglog
-OPTIONS ( filename '/home/josh/data/log/pglog.csv', format 'csv' );
+OPTIONS ( filename 'log/pglog.csv', format 'csv' );
 </programlisting>
   </para>
 
@@ -272,6 +326,22 @@ OPTIONS ( filename '/home/josh/data/log/pglog.csv', format 'csv' );
    That's it &mdash; now you can query your log directly. In production, of
    course, you would need to define some way to deal with log rotation.
   </para>
+ </example>
+
+ <example>
+  <title>Create a Foreign Table with an Option on a Column</title>
+  <para>
+   To set the <literal>force_null</literal> option for a column, use the
+   <literal>OPTIONS</literal> keyword.
+  </para>
+<programlisting>
+CREATE FOREIGN TABLE films (
+ code char(5) NOT NULL,
+ title text NOT NULL,
+ rating text OPTIONS (force_null 'true')
+) SERVER film_server
+OPTIONS ( filename 'films/db.csv', format 'csv' );
+</programlisting>
  </example>
 
 </sect1>

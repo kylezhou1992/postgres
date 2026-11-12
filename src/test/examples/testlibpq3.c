@@ -11,8 +11,8 @@
  * CREATE SCHEMA testlibpq3;
  * SET search_path = testlibpq3;
  * CREATE TABLE test1 (i int4, t text, b bytea);
- * INSERT INTO test1 values (1, 'joe''s place', '\\000\\001\\002\\003\\004');
- * INSERT INTO test1 values (2, 'ho there', '\\004\\003\\002\\001\\000');
+ * INSERT INTO test1 values (1, 'joe''s place', '\000\001\002\003\004');
+ * INSERT INTO test1 values (2, 'ho there', '\004\003\002\001\000');
  *
  * The expected output is:
  *
@@ -137,12 +137,11 @@ main(int argc, char **argv)
 	/* Check to see that the backend connection was successfully made */
 	if (PQstatus(conn) != CONNECTION_OK)
 	{
-		fprintf(stderr, "Connection to database failed: %s",
-				PQerrorMessage(conn));
+		fprintf(stderr, "%s", PQerrorMessage(conn));
 		exit_nicely(conn);
 	}
 
-	/* Set always-secure search path, so malicous users can't take control. */
+	/* Set always-secure search path, so malicious users can't take control. */
 	res = PQexec(conn, "SET search_path = testlibpq3");
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 	{

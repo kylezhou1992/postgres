@@ -3,7 +3,7 @@
  * nbtcompare.c
  *	  Comparison functions for btree access method.
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -57,7 +57,10 @@
 
 #include <limits.h>
 
+#include "common/int.h"
 #include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
+#include "utils/skipsupport.h"
 #include "utils/sortsupport.h"
 
 #ifdef STRESS_SORT_INT_MIN
@@ -78,6 +81,51 @@ btboolcmp(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32((int32) a - (int32) b);
 }
 
+static Datum
+bool_decrement(Relation rel, Datum existing, bool *underflow)
+{
+	bool		bexisting = DatumGetBool(existing);
+
+	if (bexisting == false)
+	{
+		/* return value is undefined */
+		*underflow = true;
+		return (Datum) 0;
+	}
+
+	*underflow = false;
+	return BoolGetDatum(bexisting - 1);
+}
+
+static Datum
+bool_increment(Relation rel, Datum existing, bool *overflow)
+{
+	bool		bexisting = DatumGetBool(existing);
+
+	if (bexisting == true)
+	{
+		/* return value is undefined */
+		*overflow = true;
+		return (Datum) 0;
+	}
+
+	*overflow = false;
+	return BoolGetDatum(bexisting + 1);
+}
+
+Datum
+btboolskipsupport(PG_FUNCTION_ARGS)
+{
+	SkipSupport sksup = (SkipSupport) PG_GETARG_POINTER(0);
+
+	sksup->decrement = bool_decrement;
+	sksup->increment = bool_increment;
+	sksup->low_elem = BoolGetDatum(false);
+	sksup->high_elem = BoolGetDatum(true);
+
+	PG_RETURN_VOID();
+}
+
 Datum
 btint2cmp(PG_FUNCTION_ARGS)
 {
@@ -87,21 +135,57 @@ btint2cmp(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32((int32) a - (int32) b);
 }
 
-static int
-btint2fastcmp(Datum x, Datum y, SortSupport ssup)
-{
-	int16		a = DatumGetInt16(x);
-	int16		b = DatumGetInt16(y);
-
-	return (int) a - (int) b;
-}
-
 Datum
 btint2sortsupport(PG_FUNCTION_ARGS)
 {
 	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
 
-	ssup->comparator = btint2fastcmp;
+	ssup->comparator = ssup_datum_int32_cmp;
+	PG_RETURN_VOID();
+}
+
+static Datum
+int2_decrement(Relation rel, Datum existing, bool *underflow)
+{
+	int16		iexisting = DatumGetInt16(existing);
+
+	if (iexisting == PG_INT16_MIN)
+	{
+		/* return value is undefined */
+		*underflow = true;
+		return (Datum) 0;
+	}
+
+	*underflow = false;
+	return Int16GetDatum(iexisting - 1);
+}
+
+static Datum
+int2_increment(Relation rel, Datum existing, bool *overflow)
+{
+	int16		iexisting = DatumGetInt16(existing);
+
+	if (iexisting == PG_INT16_MAX)
+	{
+		/* return value is undefined */
+		*overflow = true;
+		return (Datum) 0;
+	}
+
+	*overflow = false;
+	return Int16GetDatum(iexisting + 1);
+}
+
+Datum
+btint2skipsupport(PG_FUNCTION_ARGS)
+{
+	SkipSupport sksup = (SkipSupport) PG_GETARG_POINTER(0);
+
+	sksup->decrement = int2_decrement;
+	sksup->increment = int2_increment;
+	sksup->low_elem = Int16GetDatum(PG_INT16_MIN);
+	sksup->high_elem = Int16GetDatum(PG_INT16_MAX);
+
 	PG_RETURN_VOID();
 }
 
@@ -111,26 +195,7 @@ btint4cmp(PG_FUNCTION_ARGS)
 	int32		a = PG_GETARG_INT32(0);
 	int32		b = PG_GETARG_INT32(1);
 
-	if (a > b)
-		PG_RETURN_INT32(A_GREATER_THAN_B);
-	else if (a == b)
-		PG_RETURN_INT32(0);
-	else
-		PG_RETURN_INT32(A_LESS_THAN_B);
-}
-
-static int
-btint4fastcmp(Datum x, Datum y, SortSupport ssup)
-{
-	int32		a = DatumGetInt32(x);
-	int32		b = DatumGetInt32(y);
-
-	if (a > b)
-		return A_GREATER_THAN_B;
-	else if (a == b)
-		return 0;
-	else
-		return A_LESS_THAN_B;
+	PG_RETURN_INT32(pg_cmp_s32(a, b));
 }
 
 Datum
@@ -138,7 +203,52 @@ btint4sortsupport(PG_FUNCTION_ARGS)
 {
 	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
 
-	ssup->comparator = btint4fastcmp;
+	ssup->comparator = ssup_datum_int32_cmp;
+	PG_RETURN_VOID();
+}
+
+static Datum
+int4_decrement(Relation rel, Datum existing, bool *underflow)
+{
+	int32		iexisting = DatumGetInt32(existing);
+
+	if (iexisting == PG_INT32_MIN)
+	{
+		/* return value is undefined */
+		*underflow = true;
+		return (Datum) 0;
+	}
+
+	*underflow = false;
+	return Int32GetDatum(iexisting - 1);
+}
+
+static Datum
+int4_increment(Relation rel, Datum existing, bool *overflow)
+{
+	int32		iexisting = DatumGetInt32(existing);
+
+	if (iexisting == PG_INT32_MAX)
+	{
+		/* return value is undefined */
+		*overflow = true;
+		return (Datum) 0;
+	}
+
+	*overflow = false;
+	return Int32GetDatum(iexisting + 1);
+}
+
+Datum
+btint4skipsupport(PG_FUNCTION_ARGS)
+{
+	SkipSupport sksup = (SkipSupport) PG_GETARG_POINTER(0);
+
+	sksup->decrement = int4_decrement;
+	sksup->increment = int4_increment;
+	sksup->low_elem = Int32GetDatum(PG_INT32_MIN);
+	sksup->high_elem = Int32GetDatum(PG_INT32_MAX);
+
 	PG_RETURN_VOID();
 }
 
@@ -148,26 +258,7 @@ btint8cmp(PG_FUNCTION_ARGS)
 	int64		a = PG_GETARG_INT64(0);
 	int64		b = PG_GETARG_INT64(1);
 
-	if (a > b)
-		PG_RETURN_INT32(A_GREATER_THAN_B);
-	else if (a == b)
-		PG_RETURN_INT32(0);
-	else
-		PG_RETURN_INT32(A_LESS_THAN_B);
-}
-
-static int
-btint8fastcmp(Datum x, Datum y, SortSupport ssup)
-{
-	int64		a = DatumGetInt64(x);
-	int64		b = DatumGetInt64(y);
-
-	if (a > b)
-		return A_GREATER_THAN_B;
-	else if (a == b)
-		return 0;
-	else
-		return A_LESS_THAN_B;
+	PG_RETURN_INT32(pg_cmp_s64(a, b));
 }
 
 Datum
@@ -175,7 +266,52 @@ btint8sortsupport(PG_FUNCTION_ARGS)
 {
 	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
 
-	ssup->comparator = btint8fastcmp;
+	ssup->comparator = ssup_datum_int64_cmp;
+	PG_RETURN_VOID();
+}
+
+static Datum
+int8_decrement(Relation rel, Datum existing, bool *underflow)
+{
+	int64		iexisting = DatumGetInt64(existing);
+
+	if (iexisting == PG_INT64_MIN)
+	{
+		/* return value is undefined */
+		*underflow = true;
+		return (Datum) 0;
+	}
+
+	*underflow = false;
+	return Int64GetDatum(iexisting - 1);
+}
+
+static Datum
+int8_increment(Relation rel, Datum existing, bool *overflow)
+{
+	int64		iexisting = DatumGetInt64(existing);
+
+	if (iexisting == PG_INT64_MAX)
+	{
+		/* return value is undefined */
+		*overflow = true;
+		return (Datum) 0;
+	}
+
+	*overflow = false;
+	return Int64GetDatum(iexisting + 1);
+}
+
+Datum
+btint8skipsupport(PG_FUNCTION_ARGS)
+{
+	SkipSupport sksup = (SkipSupport) PG_GETARG_POINTER(0);
+
+	sksup->decrement = int8_decrement;
+	sksup->increment = int8_increment;
+	sksup->low_elem = Int64GetDatum(PG_INT64_MIN);
+	sksup->high_elem = Int64GetDatum(PG_INT64_MAX);
+
 	PG_RETURN_VOID();
 }
 
@@ -277,26 +413,125 @@ btoidcmp(PG_FUNCTION_ARGS)
 		PG_RETURN_INT32(A_LESS_THAN_B);
 }
 
-static int
-btoidfastcmp(Datum x, Datum y, SortSupport ssup)
-{
-	Oid			a = DatumGetObjectId(x);
-	Oid			b = DatumGetObjectId(y);
-
-	if (a > b)
-		return A_GREATER_THAN_B;
-	else if (a == b)
-		return 0;
-	else
-		return A_LESS_THAN_B;
-}
-
 Datum
 btoidsortsupport(PG_FUNCTION_ARGS)
 {
 	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
 
-	ssup->comparator = btoidfastcmp;
+	ssup->comparator = ssup_datum_uint32_cmp;
+	PG_RETURN_VOID();
+}
+
+static Datum
+oid_decrement(Relation rel, Datum existing, bool *underflow)
+{
+	Oid			oexisting = DatumGetObjectId(existing);
+
+	if (oexisting == InvalidOid)
+	{
+		/* return value is undefined */
+		*underflow = true;
+		return (Datum) 0;
+	}
+
+	*underflow = false;
+	return ObjectIdGetDatum(oexisting - 1);
+}
+
+static Datum
+oid_increment(Relation rel, Datum existing, bool *overflow)
+{
+	Oid			oexisting = DatumGetObjectId(existing);
+
+	if (oexisting == OID_MAX)
+	{
+		/* return value is undefined */
+		*overflow = true;
+		return (Datum) 0;
+	}
+
+	*overflow = false;
+	return ObjectIdGetDatum(oexisting + 1);
+}
+
+Datum
+btoidskipsupport(PG_FUNCTION_ARGS)
+{
+	SkipSupport sksup = (SkipSupport) PG_GETARG_POINTER(0);
+
+	sksup->decrement = oid_decrement;
+	sksup->increment = oid_increment;
+	sksup->low_elem = ObjectIdGetDatum(InvalidOid);
+	sksup->high_elem = ObjectIdGetDatum(OID_MAX);
+
+	PG_RETURN_VOID();
+}
+
+Datum
+btoid8cmp(PG_FUNCTION_ARGS)
+{
+	Oid8		a = PG_GETARG_OID8(0);
+	Oid8		b = PG_GETARG_OID8(1);
+
+	if (a > b)
+		PG_RETURN_INT32(A_GREATER_THAN_B);
+	else if (a == b)
+		PG_RETURN_INT32(0);
+	else
+		PG_RETURN_INT32(A_LESS_THAN_B);
+}
+
+Datum
+btoid8sortsupport(PG_FUNCTION_ARGS)
+{
+	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
+
+	ssup->comparator = ssup_datum_uint64_cmp;
+	PG_RETURN_VOID();
+}
+
+static Datum
+oid8_decrement(Relation rel, Datum existing, bool *underflow)
+{
+	Oid8		oexisting = DatumGetObjectId8(existing);
+
+	if (oexisting == InvalidOid8)
+	{
+		/* return value is undefined */
+		*underflow = true;
+		return (Datum) 0;
+	}
+
+	*underflow = false;
+	return ObjectId8GetDatum(oexisting - 1);
+}
+
+static Datum
+oid8_increment(Relation rel, Datum existing, bool *overflow)
+{
+	Oid8		oexisting = DatumGetObjectId8(existing);
+
+	if (oexisting == OID8_MAX)
+	{
+		/* return value is undefined */
+		*overflow = true;
+		return (Datum) 0;
+	}
+
+	*overflow = false;
+	return ObjectId8GetDatum(oexisting + 1);
+}
+
+Datum
+btoid8skipsupport(PG_FUNCTION_ARGS)
+{
+	SkipSupport sksup = (SkipSupport) PG_GETARG_POINTER(0);
+
+	sksup->decrement = oid8_decrement;
+	sksup->increment = oid8_increment;
+	sksup->low_elem = ObjectId8GetDatum(InvalidOid8);
+	sksup->high_elem = ObjectId8GetDatum(OID8_MAX);
+
 	PG_RETURN_VOID();
 }
 
@@ -306,6 +541,9 @@ btoidvectorcmp(PG_FUNCTION_ARGS)
 	oidvector  *a = (oidvector *) PG_GETARG_POINTER(0);
 	oidvector  *b = (oidvector *) PG_GETARG_POINTER(1);
 	int			i;
+
+	check_valid_oidvector(a);
+	check_valid_oidvector(b);
 
 	/* We arbitrarily choose to sort first by vector length */
 	if (a->dim1 != b->dim1)
@@ -334,29 +572,49 @@ btcharcmp(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32((int32) ((uint8) a) - (int32) ((uint8) b));
 }
 
-Datum
-btnamecmp(PG_FUNCTION_ARGS)
+static Datum
+char_decrement(Relation rel, Datum existing, bool *underflow)
 {
-	Name		a = PG_GETARG_NAME(0);
-	Name		b = PG_GETARG_NAME(1);
+	uint8		cexisting = DatumGetUInt8(existing);
 
-	PG_RETURN_INT32(strncmp(NameStr(*a), NameStr(*b), NAMEDATALEN));
+	if (cexisting == 0)
+	{
+		/* return value is undefined */
+		*underflow = true;
+		return (Datum) 0;
+	}
+
+	*underflow = false;
+	return CharGetDatum((uint8) cexisting - 1);
 }
 
-static int
-btnamefastcmp(Datum x, Datum y, SortSupport ssup)
+static Datum
+char_increment(Relation rel, Datum existing, bool *overflow)
 {
-	Name		a = DatumGetName(x);
-	Name		b = DatumGetName(y);
+	uint8		cexisting = DatumGetUInt8(existing);
 
-	return strncmp(NameStr(*a), NameStr(*b), NAMEDATALEN);
+	if (cexisting == UCHAR_MAX)
+	{
+		/* return value is undefined */
+		*overflow = true;
+		return (Datum) 0;
+	}
+
+	*overflow = false;
+	return CharGetDatum((uint8) cexisting + 1);
 }
 
 Datum
-btnamesortsupport(PG_FUNCTION_ARGS)
+btcharskipsupport(PG_FUNCTION_ARGS)
 {
-	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
+	SkipSupport sksup = (SkipSupport) PG_GETARG_POINTER(0);
 
-	ssup->comparator = btnamefastcmp;
+	sksup->decrement = char_decrement;
+	sksup->increment = char_increment;
+
+	/* btcharcmp compares chars as unsigned */
+	sksup->low_elem = UInt8GetDatum(0);
+	sksup->high_elem = UInt8GetDatum(UCHAR_MAX);
+
 	PG_RETURN_VOID();
 }

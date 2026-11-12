@@ -14,7 +14,24 @@ include $(top_builddir)/src/Makefile.global
 
 override CPPFLAGS := -I$(srcdir) $(CPPFLAGS)
 
-OBJS = decode.o launcher.o logical.o logicalfuncs.o message.o origin.o \
-	   proto.o relation.o reorderbuffer.o snapbuild.o tablesync.o worker.o
+OBJS = \
+	applyparallelworker.o \
+	conflict.o \
+	decode.o \
+	launcher.o \
+	logical.o \
+	logicalctl.o \
+	logicalfuncs.o \
+	message.o \
+	origin.o \
+	proto.o \
+	relation.o \
+	reorderbuffer.o \
+	sequencesync.o \
+	slotsync.o \
+	snapbuild.o \
+	syncutils.o \
+	tablesync.o \
+	worker.o
 
 include $(top_srcdir)/src/backend/common.mk

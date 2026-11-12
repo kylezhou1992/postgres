@@ -3,7 +3,7 @@
  * fe-lobj.c
  *	  Front-end large object interface
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -43,8 +43,6 @@
 
 static int	lo_initialize(PGconn *conn);
 static Oid	lo_import_internal(PGconn *conn, const char *filename, Oid oid);
-static pg_int64 lo_hton64(pg_int64 host64);
-static pg_int64 lo_ntoh64(pg_int64 net64);
 
 /*
  * lo_open
@@ -61,11 +59,8 @@ lo_open(PGconn *conn, Oid lobjId, int mode)
 	PQArgBlock	argv[2];
 	PGresult   *res;
 
-	if (conn == NULL || conn->lobjfuncs == NULL)
-	{
-		if (lo_initialize(conn) < 0)
-			return -1;
-	}
+	if (lo_initialize(conn) < 0)
+		return -1;
 
 	argv[0].isint = 1;
 	argv[0].len = 4;
@@ -75,7 +70,7 @@ lo_open(PGconn *conn, Oid lobjId, int mode)
 	argv[1].len = 4;
 	argv[1].u.integer = mode;
 
-	res = PQfn(conn, conn->lobjfuncs->fn_lo_open, &fd, &result_len, 1, argv, 2);
+	res = PQnfn(conn, conn->lobjfuncs->fn_lo_open, &fd, -1, &result_len, 1, argv, 2);
 	if (PQresultStatus(res) == PGRES_COMMAND_OK)
 	{
 		PQclear(res);
@@ -103,17 +98,14 @@ lo_close(PGconn *conn, int fd)
 	int			retval;
 	int			result_len;
 
-	if (conn == NULL || conn->lobjfuncs == NULL)
-	{
-		if (lo_initialize(conn) < 0)
-			return -1;
-	}
+	if (lo_initialize(conn) < 0)
+		return -1;
 
 	argv[0].isint = 1;
 	argv[0].len = 4;
 	argv[0].u.integer = fd;
-	res = PQfn(conn, conn->lobjfuncs->fn_lo_close,
-			   &retval, &result_len, 1, argv, 1);
+	res = PQnfn(conn, conn->lobjfuncs->fn_lo_close,
+				&retval, -1, &result_len, 1, argv, 1);
 	if (PQresultStatus(res) == PGRES_COMMAND_OK)
 	{
 		PQclear(res);
@@ -141,17 +133,14 @@ lo_truncate(PGconn *conn, int fd, size_t len)
 	int			retval;
 	int			result_len;
 
-	if (conn == NULL || conn->lobjfuncs == NULL)
-	{
-		if (lo_initialize(conn) < 0)
-			return -1;
-	}
+	if (lo_initialize(conn) < 0)
+		return -1;
 
 	/* Must check this on-the-fly because it's not there pre-8.3 */
 	if (conn->lobjfuncs->fn_lo_truncate == 0)
 	{
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("cannot determine OID of function lo_truncate\n"));
+		libpq_append_conn_error(conn, "cannot determine OID of function %s",
+								"lo_truncate");
 		return -1;
 	}
 
@@ -166,8 +155,7 @@ lo_truncate(PGconn *conn, int fd, size_t len)
 	 */
 	if (len > (size_t) INT_MAX)
 	{
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("argument of lo_truncate exceeds integer range\n"));
+		libpq_append_conn_error(conn, "argument of lo_truncate exceeds integer range");
 		return -1;
 	}
 
@@ -179,8 +167,8 @@ lo_truncate(PGconn *conn, int fd, size_t len)
 	argv[1].len = 4;
 	argv[1].u.integer = (int) len;
 
-	res = PQfn(conn, conn->lobjfuncs->fn_lo_truncate,
-			   &retval, &result_len, 1, argv, 2);
+	res = PQnfn(conn, conn->lobjfuncs->fn_lo_truncate,
+				&retval, -1, &result_len, 1, argv, 2);
 
 	if (PQresultStatus(res) == PGRES_COMMAND_OK)
 	{
@@ -202,23 +190,20 @@ lo_truncate(PGconn *conn, int fd, size_t len)
  * returns -1 upon failure
  */
 int
-lo_truncate64(PGconn *conn, int fd, pg_int64 len)
+lo_truncate64(PGconn *conn, int fd, int64_t len)
 {
 	PQArgBlock	argv[2];
 	PGresult   *res;
 	int			retval;
 	int			result_len;
 
-	if (conn == NULL || conn->lobjfuncs == NULL)
-	{
-		if (lo_initialize(conn) < 0)
-			return -1;
-	}
+	if (lo_initialize(conn) < 0)
+		return -1;
 
 	if (conn->lobjfuncs->fn_lo_truncate64 == 0)
 	{
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("cannot determine OID of function lo_truncate64\n"));
+		libpq_append_conn_error(conn, "cannot determine OID of function %s",
+								"lo_truncate64");
 		return -1;
 	}
 
@@ -226,13 +211,13 @@ lo_truncate64(PGconn *conn, int fd, pg_int64 len)
 	argv[0].len = 4;
 	argv[0].u.integer = fd;
 
-	len = lo_hton64(len);
+	len = pg_hton64(len);
 	argv[1].isint = 0;
 	argv[1].len = 8;
 	argv[1].u.ptr = (int *) &len;
 
-	res = PQfn(conn, conn->lobjfuncs->fn_lo_truncate64,
-			   &retval, &result_len, 1, argv, 2);
+	res = PQnfn(conn, conn->lobjfuncs->fn_lo_truncate64,
+				&retval, -1, &result_len, 1, argv, 2);
 
 	if (PQresultStatus(res) == PGRES_COMMAND_OK)
 	{
@@ -261,11 +246,8 @@ lo_read(PGconn *conn, int fd, char *buf, size_t len)
 	PGresult   *res;
 	int			result_len;
 
-	if (conn == NULL || conn->lobjfuncs == NULL)
-	{
-		if (lo_initialize(conn) < 0)
-			return -1;
-	}
+	if (lo_initialize(conn) < 0)
+		return -1;
 
 	/*
 	 * Long ago, somebody thought it'd be a good idea to declare this function
@@ -275,8 +257,7 @@ lo_read(PGconn *conn, int fd, char *buf, size_t len)
 	 */
 	if (len > (size_t) INT_MAX)
 	{
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("argument of lo_read exceeds integer range\n"));
+		libpq_append_conn_error(conn, "argument of lo_read exceeds integer range");
 		return -1;
 	}
 
@@ -288,8 +269,8 @@ lo_read(PGconn *conn, int fd, char *buf, size_t len)
 	argv[1].len = 4;
 	argv[1].u.integer = (int) len;
 
-	res = PQfn(conn, conn->lobjfuncs->fn_lo_read,
-			   (void *) buf, &result_len, 0, argv, 2);
+	res = PQnfn(conn, conn->lobjfuncs->fn_lo_read,
+				(void *) buf, len, &result_len, 0, argv, 2);
 	if (PQresultStatus(res) == PGRES_COMMAND_OK)
 	{
 		PQclear(res);
@@ -316,11 +297,8 @@ lo_write(PGconn *conn, int fd, const char *buf, size_t len)
 	int			result_len;
 	int			retval;
 
-	if (conn == NULL || conn->lobjfuncs == NULL)
-	{
-		if (lo_initialize(conn) < 0)
-			return -1;
-	}
+	if (lo_initialize(conn) < 0)
+		return -1;
 
 	/*
 	 * Long ago, somebody thought it'd be a good idea to declare this function
@@ -330,8 +308,7 @@ lo_write(PGconn *conn, int fd, const char *buf, size_t len)
 	 */
 	if (len > (size_t) INT_MAX)
 	{
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("argument of lo_write exceeds integer range\n"));
+		libpq_append_conn_error(conn, "argument of lo_write exceeds integer range");
 		return -1;
 	}
 
@@ -341,10 +318,10 @@ lo_write(PGconn *conn, int fd, const char *buf, size_t len)
 
 	argv[1].isint = 0;
 	argv[1].len = (int) len;
-	argv[1].u.ptr = (int *) buf;
+	argv[1].u.ptr = (int *) unconstify(char *, buf);
 
-	res = PQfn(conn, conn->lobjfuncs->fn_lo_write,
-			   &retval, &result_len, 1, argv, 2);
+	res = PQnfn(conn, conn->lobjfuncs->fn_lo_write,
+				&retval, -1, &result_len, 1, argv, 2);
 	if (PQresultStatus(res) == PGRES_COMMAND_OK)
 	{
 		PQclear(res);
@@ -369,11 +346,8 @@ lo_lseek(PGconn *conn, int fd, int offset, int whence)
 	int			retval;
 	int			result_len;
 
-	if (conn == NULL || conn->lobjfuncs == NULL)
-	{
-		if (lo_initialize(conn) < 0)
-			return -1;
-	}
+	if (lo_initialize(conn) < 0)
+		return -1;
 
 	argv[0].isint = 1;
 	argv[0].len = 4;
@@ -387,8 +361,8 @@ lo_lseek(PGconn *conn, int fd, int offset, int whence)
 	argv[2].len = 4;
 	argv[2].u.integer = whence;
 
-	res = PQfn(conn, conn->lobjfuncs->fn_lo_lseek,
-			   &retval, &result_len, 1, argv, 3);
+	res = PQnfn(conn, conn->lobjfuncs->fn_lo_lseek,
+				&retval, -1, &result_len, 1, argv, 3);
 	if (PQresultStatus(res) == PGRES_COMMAND_OK)
 	{
 		PQclear(res);
@@ -405,24 +379,21 @@ lo_lseek(PGconn *conn, int fd, int offset, int whence)
  * lo_lseek64
  *	  change the current read or write location on a large object
  */
-pg_int64
-lo_lseek64(PGconn *conn, int fd, pg_int64 offset, int whence)
+int64_t
+lo_lseek64(PGconn *conn, int fd, int64_t offset, int whence)
 {
 	PQArgBlock	argv[3];
 	PGresult   *res;
-	pg_int64	retval;
+	int64		retval;
 	int			result_len;
 
-	if (conn == NULL || conn->lobjfuncs == NULL)
-	{
-		if (lo_initialize(conn) < 0)
-			return -1;
-	}
+	if (lo_initialize(conn) < 0)
+		return -1;
 
 	if (conn->lobjfuncs->fn_lo_lseek64 == 0)
 	{
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("cannot determine OID of function lo_lseek64\n"));
+		libpq_append_conn_error(conn, "cannot determine OID of function %s",
+								"lo_lseek64");
 		return -1;
 	}
 
@@ -430,7 +401,7 @@ lo_lseek64(PGconn *conn, int fd, pg_int64 offset, int whence)
 	argv[0].len = 4;
 	argv[0].u.integer = fd;
 
-	offset = lo_hton64(offset);
+	offset = pg_hton64(offset);
 	argv[1].isint = 0;
 	argv[1].len = 8;
 	argv[1].u.ptr = (int *) &offset;
@@ -439,12 +410,12 @@ lo_lseek64(PGconn *conn, int fd, pg_int64 offset, int whence)
 	argv[2].len = 4;
 	argv[2].u.integer = whence;
 
-	res = PQfn(conn, conn->lobjfuncs->fn_lo_lseek64,
-			   (void *) &retval, &result_len, 0, argv, 3);
+	res = PQnfn(conn, conn->lobjfuncs->fn_lo_lseek64,
+				(void *) &retval, sizeof(retval), &result_len, 0, argv, 3);
 	if (PQresultStatus(res) == PGRES_COMMAND_OK && result_len == 8)
 	{
 		PQclear(res);
-		return lo_ntoh64(retval);
+		return pg_ntoh64(retval);
 	}
 	else
 	{
@@ -469,17 +440,14 @@ lo_creat(PGconn *conn, int mode)
 	int			retval;
 	int			result_len;
 
-	if (conn == NULL || conn->lobjfuncs == NULL)
-	{
-		if (lo_initialize(conn) < 0)
-			return InvalidOid;
-	}
+	if (lo_initialize(conn) < 0)
+		return InvalidOid;
 
 	argv[0].isint = 1;
 	argv[0].len = 4;
 	argv[0].u.integer = mode;
-	res = PQfn(conn, conn->lobjfuncs->fn_lo_creat,
-			   &retval, &result_len, 1, argv, 1);
+	res = PQnfn(conn, conn->lobjfuncs->fn_lo_creat,
+				&retval, -1, &result_len, 1, argv, 1);
 	if (PQresultStatus(res) == PGRES_COMMAND_OK)
 	{
 		PQclear(res);
@@ -508,25 +476,22 @@ lo_create(PGconn *conn, Oid lobjId)
 	int			retval;
 	int			result_len;
 
-	if (conn == NULL || conn->lobjfuncs == NULL)
-	{
-		if (lo_initialize(conn) < 0)
-			return InvalidOid;
-	}
+	if (lo_initialize(conn) < 0)
+		return InvalidOid;
 
 	/* Must check this on-the-fly because it's not there pre-8.1 */
 	if (conn->lobjfuncs->fn_lo_create == 0)
 	{
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("cannot determine OID of function lo_create\n"));
+		libpq_append_conn_error(conn, "cannot determine OID of function %s",
+								"lo_create");
 		return InvalidOid;
 	}
 
 	argv[0].isint = 1;
 	argv[0].len = 4;
 	argv[0].u.integer = lobjId;
-	res = PQfn(conn, conn->lobjfuncs->fn_lo_create,
-			   &retval, &result_len, 1, argv, 1);
+	res = PQnfn(conn, conn->lobjfuncs->fn_lo_create,
+				&retval, -1, &result_len, 1, argv, 1);
 	if (PQresultStatus(res) == PGRES_COMMAND_OK)
 	{
 		PQclear(res);
@@ -552,18 +517,15 @@ lo_tell(PGconn *conn, int fd)
 	PGresult   *res;
 	int			result_len;
 
-	if (conn == NULL || conn->lobjfuncs == NULL)
-	{
-		if (lo_initialize(conn) < 0)
-			return -1;
-	}
+	if (lo_initialize(conn) < 0)
+		return -1;
 
 	argv[0].isint = 1;
 	argv[0].len = 4;
 	argv[0].u.integer = fd;
 
-	res = PQfn(conn, conn->lobjfuncs->fn_lo_tell,
-			   &retval, &result_len, 1, argv, 1);
+	res = PQnfn(conn, conn->lobjfuncs->fn_lo_tell,
+				&retval, -1, &result_len, 1, argv, 1);
 	if (PQresultStatus(res) == PGRES_COMMAND_OK)
 	{
 		PQclear(res);
@@ -580,24 +542,21 @@ lo_tell(PGconn *conn, int fd)
  * lo_tell64
  *	  returns the current seek location of the large object
  */
-pg_int64
+int64_t
 lo_tell64(PGconn *conn, int fd)
 {
-	pg_int64	retval;
+	int64		retval;
 	PQArgBlock	argv[1];
 	PGresult   *res;
 	int			result_len;
 
-	if (conn == NULL || conn->lobjfuncs == NULL)
-	{
-		if (lo_initialize(conn) < 0)
-			return -1;
-	}
+	if (lo_initialize(conn) < 0)
+		return -1;
 
 	if (conn->lobjfuncs->fn_lo_tell64 == 0)
 	{
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("cannot determine OID of function lo_tell64\n"));
+		libpq_append_conn_error(conn, "cannot determine OID of function %s",
+								"lo_tell64");
 		return -1;
 	}
 
@@ -605,12 +564,12 @@ lo_tell64(PGconn *conn, int fd)
 	argv[0].len = 4;
 	argv[0].u.integer = fd;
 
-	res = PQfn(conn, conn->lobjfuncs->fn_lo_tell64,
-			   (void *) &retval, &result_len, 0, argv, 1);
+	res = PQnfn(conn, conn->lobjfuncs->fn_lo_tell64,
+				(void *) &retval, sizeof(retval), &result_len, 0, argv, 1);
 	if (PQresultStatus(res) == PGRES_COMMAND_OK && result_len == 8)
 	{
 		PQclear(res);
-		return lo_ntoh64(retval);
+		return pg_ntoh64(retval);
 	}
 	else
 	{
@@ -632,18 +591,15 @@ lo_unlink(PGconn *conn, Oid lobjId)
 	int			result_len;
 	int			retval;
 
-	if (conn == NULL || conn->lobjfuncs == NULL)
-	{
-		if (lo_initialize(conn) < 0)
-			return -1;
-	}
+	if (lo_initialize(conn) < 0)
+		return -1;
 
 	argv[0].isint = 1;
 	argv[0].len = 4;
 	argv[0].u.integer = lobjId;
 
-	res = PQfn(conn, conn->lobjfuncs->fn_lo_unlink,
-			   &retval, &result_len, 1, argv, 1);
+	res = PQnfn(conn, conn->lobjfuncs->fn_lo_unlink,
+				&retval, -1, &result_len, 1, argv, 1);
 	if (PQresultStatus(res) == PGRES_COMMAND_OK)
 	{
 		PQclear(res);
@@ -689,12 +645,18 @@ static Oid
 lo_import_internal(PGconn *conn, const char *filename, Oid oid)
 {
 	int			fd;
-	int			nbytes,
-				tmp;
+	ssize_t		nbytes;
+	int			tmp;
 	char		buf[LO_BUFSIZE];
 	Oid			lobjOid;
 	int			lobj;
 	char		sebuf[PG_STRERROR_R_BUFLEN];
+
+	if (conn == NULL)
+		return InvalidOid;
+
+	/* Since this is the beginning of a query cycle, reset the error state */
+	pqClearConnErrorState(conn);
 
 	/*
 	 * open the file to be read in
@@ -702,9 +664,8 @@ lo_import_internal(PGconn *conn, const char *filename, Oid oid)
 	fd = open(filename, O_RDONLY | PG_BINARY, 0666);
 	if (fd < 0)
 	{							/* error */
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("could not open file \"%s\": %s\n"),
-						  filename, strerror_r(errno, sebuf, sizeof(sebuf)));
+		libpq_append_conn_error(conn, "could not open file \"%s\": %s",
+								filename, strerror_r(errno, sebuf, sizeof(sebuf)));
 		return InvalidOid;
 	}
 
@@ -757,10 +718,11 @@ lo_import_internal(PGconn *conn, const char *filename, Oid oid)
 
 		(void) lo_close(conn, lobj);
 		(void) close(fd);
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("could not read from file \"%s\": %s\n"),
-						  filename,
-						  strerror_r(save_errno, sebuf, sizeof(sebuf)));
+		/* deliberately overwrite any error from lo_close */
+		pqClearConnErrorState(conn);
+		libpq_append_conn_error(conn, "could not read from file \"%s\": %s",
+								filename,
+								strerror_r(save_errno, sebuf, sizeof(sebuf)));
 		return InvalidOid;
 	}
 
@@ -785,8 +747,7 @@ lo_export(PGconn *conn, Oid lobjId, const char *filename)
 {
 	int			result = 1;
 	int			fd;
-	int			nbytes,
-				tmp;
+	int			nbytes;
 	char		buf[LO_BUFSIZE];
 	int			lobj;
 	char		sebuf[PG_STRERROR_R_BUFLEN];
@@ -811,10 +772,11 @@ lo_export(PGconn *conn, Oid lobjId, const char *filename)
 		int			save_errno = errno;
 
 		(void) lo_close(conn, lobj);
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("could not open file \"%s\": %s\n"),
-						  filename,
-						  strerror_r(save_errno, sebuf, sizeof(sebuf)));
+		/* deliberately overwrite any error from lo_close */
+		pqClearConnErrorState(conn);
+		libpq_append_conn_error(conn, "could not open file \"%s\": %s",
+								filename,
+								strerror_r(save_errno, sebuf, sizeof(sebuf)));
 		return -1;
 	}
 
@@ -823,6 +785,8 @@ lo_export(PGconn *conn, Oid lobjId, const char *filename)
 	 */
 	while ((nbytes = lo_read(conn, lobj, buf, LO_BUFSIZE)) > 0)
 	{
+		ssize_t		tmp;
+
 		tmp = write(fd, buf, nbytes);
 		if (tmp != nbytes)
 		{
@@ -831,10 +795,11 @@ lo_export(PGconn *conn, Oid lobjId, const char *filename)
 
 			(void) lo_close(conn, lobj);
 			(void) close(fd);
-			printfPQExpBuffer(&conn->errorMessage,
-							  libpq_gettext("could not write to file \"%s\": %s\n"),
-							  filename,
-							  strerror_r(save_errno, sebuf, sizeof(sebuf)));
+			/* deliberately overwrite any error from lo_close */
+			pqClearConnErrorState(conn);
+			libpq_append_conn_error(conn, "could not write to file \"%s\": %s",
+									filename,
+									strerror_r(save_errno, sebuf, sizeof(sebuf)));
 			return -1;
 		}
 	}
@@ -853,11 +818,10 @@ lo_export(PGconn *conn, Oid lobjId, const char *filename)
 	}
 
 	/* if we already failed, don't overwrite that msg with a close error */
-	if (close(fd) && result >= 0)
+	if (close(fd) != 0 && result >= 0)
 	{
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("could not write to file \"%s\": %s\n"),
-						  filename, strerror_r(errno, sebuf, sizeof(sebuf)));
+		libpq_append_conn_error(conn, "could not write to file \"%s\": %s",
+								filename, strerror_r(errno, sebuf, sizeof(sebuf)));
 		result = -1;
 	}
 
@@ -868,9 +832,11 @@ lo_export(PGconn *conn, Oid lobjId, const char *filename)
 /*
  * lo_initialize
  *
- * Initialize the large object interface for an existing connection.
- * We ask the backend about the functions OID's in pg_proc for all
- * functions that are required for large object operations.
+ * Initialize for a new large-object operation on an existing connection.
+ * Return 0 if OK, -1 on failure.
+ *
+ * If we haven't previously done so, we collect the function OIDs from
+ * pg_proc for all functions that are required for large object operations.
  */
 static int
 lo_initialize(PGconn *conn)
@@ -882,54 +848,50 @@ lo_initialize(PGconn *conn)
 	const char *fname;
 	Oid			foid;
 
-	if (!conn)
+	/* Nothing we can do with no connection */
+	if (conn == NULL)
 		return -1;
 
+	/* Since this is the beginning of a query cycle, reset the error state */
+	pqClearConnErrorState(conn);
+
+	/* Nothing else to do if we already collected info */
+	if (conn->lobjfuncs != NULL)
+		return 0;
+
 	/*
-	 * Allocate the structure to hold the functions OID's
+	 * Allocate the structure to hold the function OIDs.  We don't store it
+	 * into the PGconn until it's successfully filled.
 	 */
 	lobjfuncs = (PGlobjfuncs *) malloc(sizeof(PGlobjfuncs));
 	if (lobjfuncs == NULL)
 	{
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("out of memory\n"));
+		libpq_append_conn_error(conn, "out of memory");
 		return -1;
 	}
-	MemSet((char *) lobjfuncs, 0, sizeof(PGlobjfuncs));
+	MemSet(lobjfuncs, 0, sizeof(PGlobjfuncs));
 
 	/*
-	 * Execute the query to get all the functions at once.  In 7.3 and later
-	 * we need to be schema-safe.  lo_create only exists in 8.1 and up.
-	 * lo_truncate only exists in 8.3 and up.
+	 * Execute the query to get all the functions at once.  (Not all of them
+	 * may exist in older server versions.)
 	 */
-	if (conn->sversion >= 70300)
-		query = "select proname, oid from pg_catalog.pg_proc "
-			"where proname in ("
-			"'lo_open', "
-			"'lo_close', "
-			"'lo_creat', "
-			"'lo_create', "
-			"'lo_unlink', "
-			"'lo_lseek', "
-			"'lo_lseek64', "
-			"'lo_tell', "
-			"'lo_tell64', "
-			"'lo_truncate', "
-			"'lo_truncate64', "
-			"'loread', "
-			"'lowrite') "
-			"and pronamespace = (select oid from pg_catalog.pg_namespace "
-			"where nspname = 'pg_catalog')";
-	else
-		query = "select proname, oid from pg_proc "
-			"where proname = 'lo_open' "
-			"or proname = 'lo_close' "
-			"or proname = 'lo_creat' "
-			"or proname = 'lo_unlink' "
-			"or proname = 'lo_lseek' "
-			"or proname = 'lo_tell' "
-			"or proname = 'loread' "
-			"or proname = 'lowrite'";
+	query = "select proname, oid from pg_catalog.pg_proc "
+		"where proname in ("
+		"'lo_open', "
+		"'lo_close', "
+		"'lo_creat', "
+		"'lo_create', "
+		"'lo_unlink', "
+		"'lo_lseek', "
+		"'lo_lseek64', "
+		"'lo_tell', "
+		"'lo_tell64', "
+		"'lo_truncate', "
+		"'lo_truncate64', "
+		"'loread', "
+		"'lowrite') "
+		"and pronamespace = (select oid from pg_catalog.pg_namespace "
+		"where nspname = 'pg_catalog')";
 
 	res = PQexec(conn, query);
 	if (res == NULL)
@@ -942,8 +904,7 @@ lo_initialize(PGconn *conn)
 	{
 		free(lobjfuncs);
 		PQclear(res);
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("query to initialize large object functions did not return data\n"));
+		libpq_append_conn_error(conn, "query to initialize large object functions did not return data");
 		return -1;
 	}
 
@@ -991,57 +952,57 @@ lo_initialize(PGconn *conn)
 	 */
 	if (lobjfuncs->fn_lo_open == 0)
 	{
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("cannot determine OID of function lo_open\n"));
+		libpq_append_conn_error(conn, "cannot determine OID of function %s",
+								"lo_open");
 		free(lobjfuncs);
 		return -1;
 	}
 	if (lobjfuncs->fn_lo_close == 0)
 	{
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("cannot determine OID of function lo_close\n"));
+		libpq_append_conn_error(conn, "cannot determine OID of function %s",
+								"lo_close");
 		free(lobjfuncs);
 		return -1;
 	}
 	if (lobjfuncs->fn_lo_creat == 0)
 	{
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("cannot determine OID of function lo_creat\n"));
+		libpq_append_conn_error(conn, "cannot determine OID of function %s",
+								"lo_creat");
 		free(lobjfuncs);
 		return -1;
 	}
 	if (lobjfuncs->fn_lo_unlink == 0)
 	{
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("cannot determine OID of function lo_unlink\n"));
+		libpq_append_conn_error(conn, "cannot determine OID of function %s",
+								"lo_unlink");
 		free(lobjfuncs);
 		return -1;
 	}
 	if (lobjfuncs->fn_lo_lseek == 0)
 	{
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("cannot determine OID of function lo_lseek\n"));
+		libpq_append_conn_error(conn, "cannot determine OID of function %s",
+								"lo_lseek");
 		free(lobjfuncs);
 		return -1;
 	}
 	if (lobjfuncs->fn_lo_tell == 0)
 	{
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("cannot determine OID of function lo_tell\n"));
+		libpq_append_conn_error(conn, "cannot determine OID of function %s",
+								"lo_tell");
 		free(lobjfuncs);
 		return -1;
 	}
 	if (lobjfuncs->fn_lo_read == 0)
 	{
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("cannot determine OID of function loread\n"));
+		libpq_append_conn_error(conn, "cannot determine OID of function %s",
+								"loread");
 		free(lobjfuncs);
 		return -1;
 	}
 	if (lobjfuncs->fn_lo_write == 0)
 	{
-		printfPQExpBuffer(&conn->errorMessage,
-						  libpq_gettext("cannot determine OID of function lowrite\n"));
+		libpq_append_conn_error(conn, "cannot determine OID of function %s",
+								"lowrite");
 		free(lobjfuncs);
 		return -1;
 	}
@@ -1051,52 +1012,4 @@ lo_initialize(PGconn *conn)
 	 */
 	conn->lobjfuncs = lobjfuncs;
 	return 0;
-}
-
-/*
- * lo_hton64
- *	  converts a 64-bit integer from host byte order to network byte order
- */
-static pg_int64
-lo_hton64(pg_int64 host64)
-{
-	union
-	{
-		pg_int64	i64;
-		uint32		i32[2];
-	}			swap;
-	uint32		t;
-
-	/* High order half first, since we're doing MSB-first */
-	t = (uint32) (host64 >> 32);
-	swap.i32[0] = pg_hton32(t);
-
-	/* Now the low order half */
-	t = (uint32) host64;
-	swap.i32[1] = pg_hton32(t);
-
-	return swap.i64;
-}
-
-/*
- * lo_ntoh64
- *	  converts a 64-bit integer from network byte order to host byte order
- */
-static pg_int64
-lo_ntoh64(pg_int64 net64)
-{
-	union
-	{
-		pg_int64	i64;
-		uint32		i32[2];
-	}			swap;
-	pg_int64	result;
-
-	swap.i64 = net64;
-
-	result = (uint32) pg_ntoh32(swap.i32[0]);
-	result <<= 32;
-	result |= (uint32) pg_ntoh32(swap.i32[1]);
-
-	return result;
 }

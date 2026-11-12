@@ -7,14 +7,8 @@
 #include "postgres.h"
 
 #include "mb/pg_wchar.h"
-#include "utils/memutils.h"
-
-#include "plpython.h"
-
-#include "plpy_util.h"
-
 #include "plpy_elog.h"
-
+#include "plpy_util.h"
 
 /*
  * Convert a Python unicode object to a Python string/bytes object in
@@ -46,8 +40,8 @@ PLyUnicode_Bytes(PyObject *unicode)
 	 *
 	 * PyUnicode_AsEncodedString could be used to encode the object directly
 	 * in the server encoding, but Python doesn't support all the encodings
-	 * that PostgreSQL does (EUC_TW and MULE_INTERNAL). UTF-8 is used as an
-	 * intermediary in PLyUnicode_FromString as well.
+	 * that PostgreSQL does (EUC_TW). UTF-8 is used as an intermediary in
+	 * PLyUnicode_FromString as well.
 	 */
 	if (GetDatabaseEncoding() != PG_UTF8)
 	{
@@ -82,12 +76,6 @@ PLyUnicode_Bytes(PyObject *unicode)
  * Convert a Python unicode object to a C string in PostgreSQL server
  * encoding.  No Python object reference is passed out of this
  * function.  The result is palloc'ed.
- *
- * Note that this function is disguised as PyString_AsString() when
- * using Python 3.  That function returns a pointer into the internal
- * memory of the argument, which isn't exactly the interface of this
- * function.  But in either case you get a rather short-lived
- * reference that you ought to better leave alone.
  */
 char *
 PLyUnicode_AsString(PyObject *unicode)
@@ -99,7 +87,6 @@ PLyUnicode_AsString(PyObject *unicode)
 	return rv;
 }
 
-#if PY_MAJOR_VERSION >= 3
 /*
  * Convert a C string in the PostgreSQL server encoding to a Python
  * unicode object.  Reference ownership is passed to the caller.
@@ -130,5 +117,3 @@ PLyUnicode_FromString(const char *s)
 {
 	return PLyUnicode_FromStringAndSize(s, strlen(s));
 }
-
-#endif							/* PY_MAJOR_VERSION >= 3 */

@@ -6,7 +6,7 @@
  *	  message integrity and endpoint authentication.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,25 +24,22 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <netinet/in.h>
-#ifdef HAVE_NETINET_TCP_H
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
-#endif
 
 #include "libpq/libpq.h"
 #include "miscadmin.h"
-#include "pgstat.h"
+#include "storage/latch.h"
 #include "tcop/tcopprot.h"
-#include "utils/memutils.h"
-#include "storage/ipc.h"
-#include "storage/proc.h"
-
+#include "utils/injection_point.h"
+#include "utils/wait_event.h"
 
 char	   *ssl_library;
 char	   *ssl_cert_file;
 char	   *ssl_key_file;
 char	   *ssl_ca_file;
 char	   *ssl_crl_file;
+char	   *ssl_crl_dir;
 char	   *ssl_dh_params_file;
 char	   *ssl_passphrase_command;
 bool		ssl_passphrase_command_supports_reload;
@@ -53,12 +50,19 @@ bool		ssl_loaded_verify_locations = false;
 
 /* GUC variable controlling SSL cipher list */
 char	   *SSLCipherSuites = NULL;
+char	   *SSLCipherList = NULL;
 
-/* GUC variable for default ECHD curve. */
+/* GUC variable for default ECDH curve. */
 char	   *SSLECDHCurve;
 
 /* GUC variable: if false, prefer client ciphers */
 bool		SSLPreferServerCiphers;
+
+int			ssl_min_protocol_version = PG_TLS1_2_VERSION;
+int			ssl_max_protocol_version = PG_TLS_ANY;
+
+/* GUC variable: if false, discards hostname extensions in handshake */
+bool		ssl_sni = false;
 
 /* ------------------------------------------------------------ */
 /*			 Procedures common to all secure sessions			*/
@@ -111,17 +115,53 @@ secure_loaded_verify_locations(void)
 int
 secure_open_server(Port *port)
 {
-	int			r = 0;
-
 #ifdef USE_SSL
+	int			r = 0;
+	ssize_t		len;
+
+	/* push unencrypted buffered data back through SSL setup */
+	len = pq_buffer_remaining_data();
+	if (len > 0)
+	{
+		char	   *buf = palloc(len);
+
+		pq_startmsgread();
+		if (pq_getbytes(buf, len) == EOF)
+			return STATUS_ERROR;	/* shouldn't be possible */
+		pq_endmsgread();
+		port->raw_buf = buf;
+		port->raw_buf_remaining = len;
+		port->raw_buf_consumed = 0;
+	}
+	Assert(pq_buffer_remaining_data() == 0);
+
+	INJECTION_POINT("backend-ssl-startup", NULL);
+
 	r = be_tls_open_server(port);
 
-	ereport(DEBUG2,
-			(errmsg("SSL connection from \"%s\"",
-					port->peer_cn ? port->peer_cn : "(anonymous)")));
-#endif
+	if (port->raw_buf_remaining > 0)
+	{
+		/*
+		 * This shouldn't be possible -- it would mean the client sent
+		 * encrypted data before we established a session key...
+		 */
+		elog(LOG, "buffered unencrypted data remains after negotiating SSL connection");
+		return STATUS_ERROR;
+	}
+	if (port->raw_buf != NULL)
+	{
+		pfree(port->raw_buf);
+		port->raw_buf = NULL;
+	}
 
+	ereport(DEBUG2,
+			(errmsg_internal("SSL connection from DN:\"%s\" CN:\"%s\"",
+							 port->peer_dn ? port->peer_dn : "(anonymous)",
+							 port->peer_cn ? port->peer_cn : "(anonymous)")));
 	return r;
+#else
+	return 0;
+#endif
 }
 
 /*
@@ -157,6 +197,14 @@ retry:
 	}
 	else
 #endif
+#ifdef ENABLE_GSS
+	if (port->gss && port->gss->enc)
+	{
+		n = be_gssapi_read(port, ptr, len);
+		waitfor = WL_SOCKET_READABLE;
+	}
+	else
+#endif
 	{
 		n = secure_raw_read(port, ptr, len);
 		waitfor = WL_SOCKET_READABLE;
@@ -169,7 +217,7 @@ retry:
 
 		Assert(waitfor);
 
-		ModifyWaitEvent(FeBeWaitSet, 0, waitfor, NULL);
+		ModifyWaitEvent(FeBeWaitSet, FeBeWaitSetSocketPos, waitfor, NULL);
 
 		WaitEventSetWait(FeBeWaitSet, -1 /* no timeout */ , &event, 1,
 						 WAIT_EVENT_CLIENT_READ);
@@ -177,7 +225,7 @@ retry:
 		/*
 		 * If the postmaster has died, it's not safe to continue running,
 		 * because it is the postmaster's job to kill us if some other backend
-		 * exists uncleanly.  Moreover, we won't run very well in this state;
+		 * exits uncleanly.  Moreover, we won't run very well in this state;
 		 * helper processes like walwriter and the bgwriter will exit, so
 		 * performance may be poor.  Finally, if we don't exit, pg_ctl will be
 		 * unable to restart the postmaster without manual intervention, so no
@@ -225,6 +273,19 @@ secure_raw_read(Port *port, void *ptr, size_t len)
 {
 	ssize_t		n;
 
+	/* Read from the "unread" buffered data first. c.f. libpq-be.h */
+	if (port->raw_buf_remaining > 0)
+	{
+		/* consume up to len bytes from the raw_buf */
+		if (len > port->raw_buf_remaining)
+			len = port->raw_buf_remaining;
+		Assert(port->raw_buf);
+		memcpy(ptr, port->raw_buf + port->raw_buf_consumed, len);
+		port->raw_buf_consumed += len;
+		port->raw_buf_remaining -= len;
+		return len;
+	}
+
 	/*
 	 * Try to read from the socket without blocking. If it succeeds we're
 	 * done, otherwise we'll wait for the socket using the latch mechanism.
@@ -245,7 +306,7 @@ secure_raw_read(Port *port, void *ptr, size_t len)
  *	Write data to a secure connection.
  */
 ssize_t
-secure_write(Port *port, void *ptr, size_t len)
+secure_write(Port *port, const void *ptr, size_t len)
 {
 	ssize_t		n;
 	int			waitfor;
@@ -262,6 +323,14 @@ retry:
 	}
 	else
 #endif
+#ifdef ENABLE_GSS
+	if (port->gss && port->gss->enc)
+	{
+		n = be_gssapi_write(port, ptr, len);
+		waitfor = WL_SOCKET_WRITEABLE;
+	}
+	else
+#endif
 	{
 		n = secure_raw_write(port, ptr, len);
 		waitfor = WL_SOCKET_WRITEABLE;
@@ -273,7 +342,7 @@ retry:
 
 		Assert(waitfor);
 
-		ModifyWaitEvent(FeBeWaitSet, 0, waitfor, NULL);
+		ModifyWaitEvent(FeBeWaitSet, FeBeWaitSetSocketPos, waitfor, NULL);
 
 		WaitEventSetWait(FeBeWaitSet, -1 /* no timeout */ , &event, 1,
 						 WAIT_EVENT_CLIENT_WRITE);

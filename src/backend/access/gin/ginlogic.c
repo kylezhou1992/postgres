@@ -24,7 +24,7 @@
  * is used for.)
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -35,12 +35,6 @@
 #include "postgres.h"
 
 #include "access/gin_private.h"
-#include "access/reloptions.h"
-#include "catalog/pg_collation.h"
-#include "catalog/pg_type.h"
-#include "miscadmin.h"
-#include "storage/indexfsm.h"
-#include "storage/lmgr.h"
 
 
 /*
@@ -81,7 +75,7 @@ directBoolConsistentFn(GinScanKey key)
 										  PointerGetDatum(key->entryRes),
 										  UInt16GetDatum(key->strategy),
 										  key->query,
-										  UInt32GetDatum(key->nuserentries),
+										  Int32GetDatum(key->nuserentries),
 										  PointerGetDatum(key->extra_data),
 										  PointerGetDatum(&key->recheckCurItem),
 										  PointerGetDatum(key->queryValues),
@@ -94,13 +88,12 @@ directBoolConsistentFn(GinScanKey key)
 static GinTernaryValue
 directTriConsistentFn(GinScanKey key)
 {
-	return DatumGetGinTernaryValue(FunctionCall7Coll(
-													 key->triConsistentFmgrInfo,
+	return DatumGetGinTernaryValue(FunctionCall7Coll(key->triConsistentFmgrInfo,
 													 key->collation,
 													 PointerGetDatum(key->entryRes),
 													 UInt16GetDatum(key->strategy),
 													 key->query,
-													 UInt32GetDatum(key->nuserentries),
+													 Int32GetDatum(key->nuserentries),
 													 PointerGetDatum(key->extra_data),
 													 PointerGetDatum(key->queryValues),
 													 PointerGetDatum(key->queryCategories)));
@@ -116,13 +109,12 @@ shimBoolConsistentFn(GinScanKey key)
 {
 	GinTernaryValue result;
 
-	result = DatumGetGinTernaryValue(FunctionCall7Coll(
-													   key->triConsistentFmgrInfo,
+	result = DatumGetGinTernaryValue(FunctionCall7Coll(key->triConsistentFmgrInfo,
 													   key->collation,
 													   PointerGetDatum(key->entryRes),
 													   UInt16GetDatum(key->strategy),
 													   key->query,
-													   UInt32GetDatum(key->nuserentries),
+													   Int32GetDatum(key->nuserentries),
 													   PointerGetDatum(key->extra_data),
 													   PointerGetDatum(key->queryValues),
 													   PointerGetDatum(key->queryCategories)));
@@ -148,16 +140,17 @@ shimBoolConsistentFn(GinScanKey key)
  * every combination is O(n^2), so this is only feasible for a small number of
  * MAYBE inputs.
  *
- * NB: This function modifies the key->entryRes array!
+ * NB: This function modifies the key->entryRes array.  For now that's okay
+ * so long as we restore the entry-time contents before returning.  This may
+ * need revisiting if we ever invent multithreaded GIN scans, though.
  */
 static GinTernaryValue
 shimTriConsistentFn(GinScanKey key)
 {
 	int			nmaybe;
-	int			maybeEntries[MAX_MAYBE_ENTRIES];
-	int			i;
+	uint32		maybeEntries[MAX_MAYBE_ENTRIES];
 	bool		boolResult;
-	bool		recheck = false;
+	bool		recheck;
 	GinTernaryValue curResult;
 
 	/*
@@ -166,7 +159,7 @@ shimTriConsistentFn(GinScanKey key)
 	 * test all combinations, so give up and return MAYBE.
 	 */
 	nmaybe = 0;
-	for (i = 0; i < key->nentries; i++)
+	for (uint32 i = 0; i < key->nentries; i++)
 	{
 		if (key->entryRes[i] == GIN_MAYBE)
 		{
@@ -177,19 +170,22 @@ shimTriConsistentFn(GinScanKey key)
 	}
 
 	/*
-	 * If none of the inputs were MAYBE, so we can just call consistent
-	 * function as is.
+	 * If none of the inputs were MAYBE, we can just call the consistent
+	 * function as-is.
 	 */
 	if (nmaybe == 0)
 		return directBoolConsistentFn(key);
 
 	/* First call consistent function with all the maybe-inputs set FALSE */
-	for (i = 0; i < nmaybe; i++)
+	for (int i = 0; i < nmaybe; i++)
 		key->entryRes[maybeEntries[i]] = GIN_FALSE;
 	curResult = directBoolConsistentFn(key);
+	recheck = key->recheckCurItem;
 
 	for (;;)
 	{
+		int			i;
+
 		/* Twiddle the entries for next combination. */
 		for (i = 0; i < nmaybe; i++)
 		{
@@ -208,12 +204,19 @@ shimTriConsistentFn(GinScanKey key)
 		recheck |= key->recheckCurItem;
 
 		if (curResult != boolResult)
-			return GIN_MAYBE;
+		{
+			curResult = GIN_MAYBE;
+			break;
+		}
 	}
 
 	/* TRUE with recheck is taken to mean MAYBE */
 	if (curResult == GIN_TRUE && recheck)
 		curResult = GIN_MAYBE;
+
+	/* We must restore the original state of the entryRes array */
+	for (int i = 0; i < nmaybe; i++)
+		key->entryRes[maybeEntries[i]] = GIN_MAYBE;
 
 	return curResult;
 }

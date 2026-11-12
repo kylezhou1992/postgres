@@ -3,7 +3,7 @@
  * dict_snowball.c
  *		Snowball dictionary
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/snowball/dict_snowball.c
@@ -12,9 +12,11 @@
  */
 #include "postgres.h"
 
+#include "catalog/pg_collation_d.h"
 #include "commands/defrem.h"
-#include "tsearch/ts_locale.h"
-#include "tsearch/ts_utils.h"
+#include "mb/pg_wchar.h"
+#include "tsearch/ts_public.h"
+#include "utils/formatting.h"
 
 /* Some platforms define MAXINT and/or MININT, causing conflicts */
 #ifdef MAXINT
@@ -24,10 +26,13 @@
 #undef MININT
 #endif
 
-/* Now we can include the original Snowball header.h */
-#include "snowball/libstemmer/header.h"
+/* Now we can include the original Snowball snowball_runtime.h */
+#include "snowball/libstemmer/snowball_runtime.h"
+#include "snowball/libstemmer/stem_ISO_8859_1_basque.h"
+#include "snowball/libstemmer/stem_ISO_8859_1_catalan.h"
 #include "snowball/libstemmer/stem_ISO_8859_1_danish.h"
 #include "snowball/libstemmer/stem_ISO_8859_1_dutch.h"
+#include "snowball/libstemmer/stem_ISO_8859_1_dutch_porter.h"
 #include "snowball/libstemmer/stem_ISO_8859_1_english.h"
 #include "snowball/libstemmer/stem_ISO_8859_1_finnish.h"
 #include "snowball/libstemmer/stem_ISO_8859_1_french.h"
@@ -41,15 +46,23 @@
 #include "snowball/libstemmer/stem_ISO_8859_1_spanish.h"
 #include "snowball/libstemmer/stem_ISO_8859_1_swedish.h"
 #include "snowball/libstemmer/stem_ISO_8859_2_hungarian.h"
-#include "snowball/libstemmer/stem_ISO_8859_2_romanian.h"
+#include "snowball/libstemmer/stem_ISO_8859_2_polish.h"
 #include "snowball/libstemmer/stem_KOI8_R_russian.h"
 #include "snowball/libstemmer/stem_UTF_8_arabic.h"
+#include "snowball/libstemmer/stem_UTF_8_armenian.h"
+#include "snowball/libstemmer/stem_UTF_8_basque.h"
+#include "snowball/libstemmer/stem_UTF_8_catalan.h"
 #include "snowball/libstemmer/stem_UTF_8_danish.h"
 #include "snowball/libstemmer/stem_UTF_8_dutch.h"
+#include "snowball/libstemmer/stem_UTF_8_dutch_porter.h"
 #include "snowball/libstemmer/stem_UTF_8_english.h"
+#include "snowball/libstemmer/stem_UTF_8_esperanto.h"
+#include "snowball/libstemmer/stem_UTF_8_estonian.h"
 #include "snowball/libstemmer/stem_UTF_8_finnish.h"
 #include "snowball/libstemmer/stem_UTF_8_french.h"
 #include "snowball/libstemmer/stem_UTF_8_german.h"
+#include "snowball/libstemmer/stem_UTF_8_greek.h"
+#include "snowball/libstemmer/stem_UTF_8_hindi.h"
 #include "snowball/libstemmer/stem_UTF_8_hungarian.h"
 #include "snowball/libstemmer/stem_UTF_8_indonesian.h"
 #include "snowball/libstemmer/stem_UTF_8_irish.h"
@@ -57,16 +70,22 @@
 #include "snowball/libstemmer/stem_UTF_8_lithuanian.h"
 #include "snowball/libstemmer/stem_UTF_8_nepali.h"
 #include "snowball/libstemmer/stem_UTF_8_norwegian.h"
+#include "snowball/libstemmer/stem_UTF_8_polish.h"
 #include "snowball/libstemmer/stem_UTF_8_porter.h"
 #include "snowball/libstemmer/stem_UTF_8_portuguese.h"
 #include "snowball/libstemmer/stem_UTF_8_romanian.h"
 #include "snowball/libstemmer/stem_UTF_8_russian.h"
+#include "snowball/libstemmer/stem_UTF_8_serbian.h"
 #include "snowball/libstemmer/stem_UTF_8_spanish.h"
 #include "snowball/libstemmer/stem_UTF_8_swedish.h"
 #include "snowball/libstemmer/stem_UTF_8_tamil.h"
 #include "snowball/libstemmer/stem_UTF_8_turkish.h"
+#include "snowball/libstemmer/stem_UTF_8_yiddish.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "dict_snowball",
+					.version = PG_VERSION
+);
 
 PG_FUNCTION_INFO_V1(dsnowball_init);
 
@@ -91,8 +110,11 @@ static const stemmer_module stemmer_modules[] =
 	/*
 	 * Stemmers list from Snowball distribution
 	 */
+	STEMMER_MODULE(basque, PG_LATIN1, ISO_8859_1),
+	STEMMER_MODULE(catalan, PG_LATIN1, ISO_8859_1),
 	STEMMER_MODULE(danish, PG_LATIN1, ISO_8859_1),
 	STEMMER_MODULE(dutch, PG_LATIN1, ISO_8859_1),
+	STEMMER_MODULE(dutch_porter, PG_LATIN1, ISO_8859_1),
 	STEMMER_MODULE(english, PG_LATIN1, ISO_8859_1),
 	STEMMER_MODULE(finnish, PG_LATIN1, ISO_8859_1),
 	STEMMER_MODULE(french, PG_LATIN1, ISO_8859_1),
@@ -106,15 +128,23 @@ static const stemmer_module stemmer_modules[] =
 	STEMMER_MODULE(spanish, PG_LATIN1, ISO_8859_1),
 	STEMMER_MODULE(swedish, PG_LATIN1, ISO_8859_1),
 	STEMMER_MODULE(hungarian, PG_LATIN2, ISO_8859_2),
-	STEMMER_MODULE(romanian, PG_LATIN2, ISO_8859_2),
+	STEMMER_MODULE(polish, PG_LATIN2, ISO_8859_2),
 	STEMMER_MODULE(russian, PG_KOI8R, KOI8_R),
 	STEMMER_MODULE(arabic, PG_UTF8, UTF_8),
+	STEMMER_MODULE(armenian, PG_UTF8, UTF_8),
+	STEMMER_MODULE(basque, PG_UTF8, UTF_8),
+	STEMMER_MODULE(catalan, PG_UTF8, UTF_8),
 	STEMMER_MODULE(danish, PG_UTF8, UTF_8),
 	STEMMER_MODULE(dutch, PG_UTF8, UTF_8),
+	STEMMER_MODULE(dutch_porter, PG_UTF8, UTF_8),
 	STEMMER_MODULE(english, PG_UTF8, UTF_8),
+	STEMMER_MODULE(esperanto, PG_UTF8, UTF_8),
+	STEMMER_MODULE(estonian, PG_UTF8, UTF_8),
 	STEMMER_MODULE(finnish, PG_UTF8, UTF_8),
 	STEMMER_MODULE(french, PG_UTF8, UTF_8),
 	STEMMER_MODULE(german, PG_UTF8, UTF_8),
+	STEMMER_MODULE(greek, PG_UTF8, UTF_8),
+	STEMMER_MODULE(hindi, PG_UTF8, UTF_8),
 	STEMMER_MODULE(hungarian, PG_UTF8, UTF_8),
 	STEMMER_MODULE(indonesian, PG_UTF8, UTF_8),
 	STEMMER_MODULE(irish, PG_UTF8, UTF_8),
@@ -123,13 +153,16 @@ static const stemmer_module stemmer_modules[] =
 	STEMMER_MODULE(nepali, PG_UTF8, UTF_8),
 	STEMMER_MODULE(norwegian, PG_UTF8, UTF_8),
 	STEMMER_MODULE(porter, PG_UTF8, UTF_8),
+	STEMMER_MODULE(polish, PG_UTF8, UTF_8),
 	STEMMER_MODULE(portuguese, PG_UTF8, UTF_8),
 	STEMMER_MODULE(romanian, PG_UTF8, UTF_8),
 	STEMMER_MODULE(russian, PG_UTF8, UTF_8),
+	STEMMER_MODULE(serbian, PG_UTF8, UTF_8),
 	STEMMER_MODULE(spanish, PG_UTF8, UTF_8),
 	STEMMER_MODULE(swedish, PG_UTF8, UTF_8),
 	STEMMER_MODULE(tamil, PG_UTF8, UTF_8),
 	STEMMER_MODULE(turkish, PG_UTF8, UTF_8),
+	STEMMER_MODULE(yiddish, PG_UTF8, UTF_8),
 
 	/*
 	 * Stemmer with PG_SQL_ASCII encoding should be valid for any server
@@ -206,7 +239,7 @@ dsnowball_init(PG_FUNCTION_ARGS)
 	bool		stoploaded = false;
 	ListCell   *l;
 
-	d = (DictSnowball *) palloc0(sizeof(DictSnowball));
+	d = palloc0_object(DictSnowball);
 
 	foreach(l, dictoptions)
 	{
@@ -218,7 +251,7 @@ dsnowball_init(PG_FUNCTION_ARGS)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("multiple StopWords parameters")));
-			readstoplist(defGetString(defel), &d->stoplist, lowerstr);
+			readstoplist(defGetString(defel), &d->stoplist, str_tolower);
 			stoploaded = true;
 		}
 		else if (strcmp(defel->defname, "language") == 0)
@@ -254,11 +287,27 @@ dsnowball_lexize(PG_FUNCTION_ARGS)
 	DictSnowball *d = (DictSnowball *) PG_GETARG_POINTER(0);
 	char	   *in = (char *) PG_GETARG_POINTER(1);
 	int32		len = PG_GETARG_INT32(2);
-	char	   *txt = lowerstr_with_len(in, len);
-	TSLexeme   *res = palloc0(sizeof(TSLexeme) * 2);
+	char	   *txt = str_tolower(in, len, DEFAULT_COLLATION_OID);
+	TSLexeme   *res = palloc0_array(TSLexeme, 2);
 
-	if (*txt == '\0' || searchstoplist(&(d->stoplist), txt))
+	/*
+	 * Do not pass strings exceeding 1000 bytes to the stemmer, as they're
+	 * surely not words in any human language.  This restriction avoids
+	 * wasting cycles on stuff like base64-encoded data, and it protects us
+	 * against possible inefficiency or misbehavior in the stemmer.  (For
+	 * example, the Turkish stemmer has an indefinite recursion, so it can
+	 * crash on long-enough strings.)  However, Snowball dictionaries are
+	 * defined to recognize all strings, so we can't reject the string as an
+	 * unknown word.
+	 */
+	if (len > 1000)
 	{
+		/* return the lexeme lowercased, but otherwise unmodified */
+		res->lexeme = txt;
+	}
+	else if (*txt == '\0' || searchstoplist(&(d->stoplist), txt))
+	{
+		/* empty or stopword, so report as stopword */
 		pfree(txt);
 	}
 	else

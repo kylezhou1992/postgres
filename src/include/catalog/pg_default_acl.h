@@ -5,7 +5,7 @@
  *	  (pg_default_acl)
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_default_acl.h
@@ -20,23 +20,31 @@
 #define PG_DEFAULT_ACL_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_default_acl_d.h"
+#include "catalog/pg_default_acl_d.h"	/* IWYU pragma: export */
 
 /* ----------------
  *		pg_default_acl definition.  cpp turns this into
  *		typedef struct FormData_pg_default_acl
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_default_acl,826,DefaultAclRelationId)
 {
-	Oid			defaclrole;		/* OID of role owning this ACL */
-	Oid			defaclnamespace;	/* OID of namespace, or 0 for all */
+	Oid			oid;			/* oid */
+	Oid			defaclrole BKI_LOOKUP(pg_authid);	/* OID of role owning this
+													 * ACL */
+	Oid			defaclnamespace BKI_LOOKUP_OPT(pg_namespace);	/* OID of namespace, or
+																 * 0 for all */
 	char		defaclobjtype;	/* see DEFACLOBJ_xxx constants below */
 
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
-	aclitem		defaclacl[1] BKI_FORCE_NOT_NULL;	/* permissions to add at CREATE time */
+	aclitem		defaclacl[] BKI_FORCE_NOT_NULL; /* permissions to add at
+												 * CREATE time */
 #endif
 } FormData_pg_default_acl;
+
+END_CATALOG_STRUCT
 
 /* ----------------
  *		Form_pg_default_acl corresponds to a pointer to a tuple with
@@ -44,6 +52,13 @@ CATALOG(pg_default_acl,826,DefaultAclRelationId)
  * ----------------
  */
 typedef FormData_pg_default_acl *Form_pg_default_acl;
+
+DECLARE_TOAST(pg_default_acl, 4143, 4144);
+
+DECLARE_UNIQUE_INDEX(pg_default_acl_role_nsp_obj_index, 827, DefaultAclRoleNspObjIndexId, pg_default_acl, btree(defaclrole oid_ops, defaclnamespace oid_ops, defaclobjtype char_ops));
+DECLARE_UNIQUE_INDEX_PKEY(pg_default_acl_oid_index, 828, DefaultAclOidIndexId, pg_default_acl, btree(oid oid_ops));
+
+MAKE_SYSCACHE(DEFACLROLENSPOBJ, pg_default_acl_role_nsp_obj_index, 8);
 
 #ifdef EXPOSE_TO_CLIENT_CODE
 
@@ -57,6 +72,7 @@ typedef FormData_pg_default_acl *Form_pg_default_acl;
 #define DEFACLOBJ_FUNCTION		'f' /* function */
 #define DEFACLOBJ_TYPE			'T' /* type */
 #define DEFACLOBJ_NAMESPACE		'n' /* namespace */
+#define DEFACLOBJ_LARGEOBJECT	'L' /* large object */
 
 #endif							/* EXPOSE_TO_CLIENT_CODE */
 

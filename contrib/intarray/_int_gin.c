@@ -3,10 +3,9 @@
  */
 #include "postgres.h"
 
+#include "_int.h"
 #include "access/gin.h"
 #include "access/stratnum.h"
-
-#include "_int.h"
 
 PG_FUNCTION_INFO_V1(ginint4_queryextract);
 
@@ -43,7 +42,7 @@ ginint4_queryextract(PG_FUNCTION_ARGS)
 		/*
 		 * Extract all the VAL items as things we want GIN to check for.
 		 */
-		res = (Datum *) palloc(sizeof(Datum) * query->size);
+		res = palloc_array(Datum, query->size);
 		*nentries = 0;
 
 		for (i = 0; i < query->size; i++)
@@ -66,7 +65,7 @@ ginint4_queryextract(PG_FUNCTION_ARGS)
 			int32	   *arr;
 			int32		i;
 
-			res = (Datum *) palloc(sizeof(Datum) * (*nentries));
+			res = palloc_array(Datum, *nentries);
 
 			arr = ARRPTR(query);
 			for (i = 0; i < *nentries; i++)
@@ -113,8 +112,9 @@ ginint4_consistent(PG_FUNCTION_ARGS)
 	bool	   *check = (bool *) PG_GETARG_POINTER(0);
 	StrategyNumber strategy = PG_GETARG_UINT16(1);
 	int32		nkeys = PG_GETARG_INT32(3);
-
-	/* Pointer	   *extra_data = (Pointer *) PG_GETARG_POINTER(4); */
+#ifdef NOT_USED
+	Pointer    *extra_data = (Pointer *) PG_GETARG_POINTER(4);
+#endif
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(5);
 	bool		res = false;
 	int32		i;

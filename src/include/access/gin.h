@@ -2,7 +2,7 @@
  * gin.h
  *	  Public header file for Generalized Inverted Index access method.
  *
- *	Copyright (c) 2006-2018, PostgreSQL Global Development Group
+ *	Copyright (c) 2006-2026, PostgreSQL Global Development Group
  *
  *	src/include/access/gin.h
  *--------------------------------------------------------------------------
@@ -13,6 +13,8 @@
 #include "access/xlogreader.h"
 #include "lib/stringinfo.h"
 #include "storage/block.h"
+#include "storage/dsm.h"
+#include "storage/shm_toc.h"
 #include "utils/relcache.h"
 
 
@@ -25,7 +27,8 @@
 #define GIN_CONSISTENT_PROC			   4
 #define GIN_COMPARE_PARTIAL_PROC	   5
 #define GIN_TRICONSISTENT_PROC		   6
-#define GINNProcs					   6
+#define GIN_OPTIONS_PROC	   7
+#define GINNProcs					   7
 
 /*
  * searchMode settings for extractQueryFn.
@@ -34,6 +37,17 @@
 #define GIN_SEARCH_MODE_INCLUDE_EMPTY	1
 #define GIN_SEARCH_MODE_ALL				2
 #define GIN_SEARCH_MODE_EVERYTHING		3	/* for internal use only */
+
+/*
+ * Constant definition for progress reporting.  Phase numbers must match
+ * ginbuildphasename.
+ */
+/* PROGRESS_CREATEIDX_SUBPHASE_INITIALIZE is 1 (see progress.h) */
+#define PROGRESS_GIN_PHASE_INDEXBUILD_TABLESCAN		2
+#define PROGRESS_GIN_PHASE_PERFORMSORT_1			3
+#define PROGRESS_GIN_PHASE_MERGE_1					4
+#define PROGRESS_GIN_PHASE_PERFORMSORT_2			5
+#define PROGRESS_GIN_PHASE_MERGE_2					6
 
 /*
  * GinStatsData represents stats data for planner use
@@ -56,21 +70,37 @@ typedef struct GinStatsData
  */
 typedef char GinTernaryValue;
 
+StaticAssertDecl(sizeof(GinTernaryValue) == sizeof(bool),
+				 "sizes of GinTernaryValue and bool are not equal");
+
 #define GIN_FALSE		0		/* item is not present / does not match */
 #define GIN_TRUE		1		/* item is present / matches */
 #define GIN_MAYBE		2		/* don't know if item is present / don't know
 								 * if matches */
 
-#define DatumGetGinTernaryValue(X) ((GinTernaryValue)(X))
-#define GinTernaryValueGetDatum(X) ((Datum)(X))
+static inline GinTernaryValue
+DatumGetGinTernaryValue(Datum X)
+{
+	return (GinTernaryValue) X;
+}
+
+static inline Datum
+GinTernaryValueGetDatum(GinTernaryValue X)
+{
+	return (Datum) X;
+}
+
 #define PG_RETURN_GIN_TERNARY_VALUE(x) return GinTernaryValueGetDatum(x)
 
 /* GUC parameters */
 extern PGDLLIMPORT int GinFuzzySearchLimit;
-extern int	gin_pending_list_limit;
+extern PGDLLIMPORT int gin_pending_list_limit;
 
 /* ginutil.c */
 extern void ginGetStats(Relation index, GinStatsData *stats);
-extern void ginUpdateStats(Relation index, const GinStatsData *stats);
+extern void ginUpdateStats(Relation index, const GinStatsData *stats,
+						   bool is_build);
+
+extern void _gin_parallel_build_main(dsm_segment *seg, shm_toc *toc);
 
 #endif							/* GIN_H */

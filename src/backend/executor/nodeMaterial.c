@@ -3,7 +3,7 @@
  * nodeMaterial.c
  *	  Routines to handle materialization nodes.
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,6 +24,7 @@
 #include "executor/executor.h"
 #include "executor/nodeMaterial.h"
 #include "miscadmin.h"
+#include "utils/tuplestore.h"
 
 /* ----------------------------------------------------------------
  *		ExecMaterial
@@ -146,10 +147,8 @@ ExecMaterial(PlanState *pstate)
 		if (tuplestorestate)
 			tuplestore_puttupleslot(tuplestorestate, outerslot);
 
-		/*
-		 * We can just return the subplan's returned tuple, without copying.
-		 */
-		return outerslot;
+		ExecCopySlot(slot, outerslot);
+		return slot;
 	}
 
 	/*
@@ -198,6 +197,7 @@ ExecInitMaterial(Material *node, EState *estate, int eflags)
 
 	matstate->eof_underlying = false;
 	matstate->tuplestorestate = NULL;
+	matstate->shared_info = NULL;
 
 	/*
 	 * Miscellaneous initialization
@@ -223,13 +223,13 @@ ExecInitMaterial(Material *node, EState *estate, int eflags)
 	 *
 	 * material nodes only return tuples from their materialized relation.
 	 */
-	ExecInitResultTupleSlotTL(estate, &matstate->ss.ps);
+	ExecInitResultTupleSlotTL(&matstate->ss.ps, &TTSOpsMinimalTuple);
 	matstate->ss.ps.ps_ProjInfo = NULL;
 
 	/*
 	 * initialize tuple type.
 	 */
-	ExecCreateScanSlotFromOuterPlan(estate, &matstate->ss);
+	ExecCreateScanSlotFromOuterPlan(estate, &matstate->ss, &TTSOpsMinimalTuple);
 
 	return matstate;
 }
@@ -242,9 +242,27 @@ void
 ExecEndMaterial(MaterialState *node)
 {
 	/*
-	 * clean out the tuple table
+	 * When ending a parallel worker, copy the tuplestore usage details into
+	 * shared memory so that they can be picked up by the main process to
+	 * report in EXPLAIN ANALYZE.  The Gather node above us may be rescanned,
+	 * in which case a new set of workers will write to the same slots, so
+	 * merge with any existing values rather than overwriting them.
 	 */
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
+	if (node->shared_info != NULL && IsParallelWorker() &&
+		node->tuplestorestate != NULL)
+	{
+		MaterialInstrumentation *si;
+		bool		usedDisk;
+		int64		maxSpaceUsed;
+
+		Assert(ParallelWorkerNumber < node->shared_info->num_workers);
+
+		tuplestore_get_stats(node->tuplestorestate, &usedDisk, &maxSpaceUsed);
+
+		si = &node->shared_info->sinstrument[ParallelWorkerNumber];
+		si->maxSpaceUsed = Max(si->maxSpaceUsed, maxSpaceUsed);
+		si->usedDisk |= usedDisk;
+	}
 
 	/*
 	 * Release tuplestore resources
@@ -334,9 +352,9 @@ ExecReScanMaterial(MaterialState *node)
 			return;
 
 		/*
-		 * If subnode is to be rescanned then we forget previous stored
-		 * results; we have to re-read the subplan and re-store.  Also, if we
-		 * told tuplestore it needn't support rescan, we lose and must
+		 * If subnode is to be rescanned then we clear out the previously
+		 * stored results; we have to re-read the subplan and re-store.  Also,
+		 * if we told tuplestore it needn't support rescan, we lose and must
 		 * re-read.  (This last should not happen in common cases; else our
 		 * caller lied by not passing EXEC_FLAG_REWIND to us.)
 		 *
@@ -346,8 +364,11 @@ ExecReScanMaterial(MaterialState *node)
 		if (outerPlan->chgParam != NULL ||
 			(node->eflags & EXEC_FLAG_REWIND) == 0)
 		{
-			tuplestore_end(node->tuplestorestate);
-			node->tuplestorestate = NULL;
+			/*
+			 * It's important to use tuplestore_clear() here so that we keep
+			 * track of the maximum storage used by all rescans.
+			 */
+			tuplestore_clear(node->tuplestorestate);
 			if (outerPlan->chgParam == NULL)
 				ExecReScan(outerPlan);
 			node->eof_underlying = false;
@@ -367,4 +388,90 @@ ExecReScanMaterial(MaterialState *node)
 			ExecReScan(outerPlan);
 		node->eof_underlying = false;
 	}
+}
+
+/* ----------------------------------------------------------------
+ *						Parallel Query Support
+ * ----------------------------------------------------------------
+ */
+
+/* ----------------------------------------------------------------
+ *		ExecMaterialEstimate
+ *
+ *		Estimate space required to propagate material statistics.
+ * ----------------------------------------------------------------
+ */
+void
+ExecMaterialEstimate(MaterialState *node, ParallelContext *pcxt)
+{
+	Size		size;
+
+	/* don't need this if not instrumenting or no workers */
+	if (!node->ss.ps.instrument || pcxt->nworkers == 0)
+		return;
+
+	size = mul_size(pcxt->nworkers, sizeof(MaterialInstrumentation));
+	size = add_size(size, offsetof(SharedMaterialInfo, sinstrument));
+	shm_toc_estimate_chunk(&pcxt->estimator, size);
+	shm_toc_estimate_keys(&pcxt->estimator, 1);
+}
+
+/* ----------------------------------------------------------------
+ *		ExecMaterialInitializeDSM
+ *
+ *		Initialize DSM space for material statistics.
+ * ----------------------------------------------------------------
+ */
+void
+ExecMaterialInitializeDSM(MaterialState *node, ParallelContext *pcxt)
+{
+	Size		size;
+
+	/* don't need this if not instrumenting or no workers */
+	if (!node->ss.ps.instrument || pcxt->nworkers == 0)
+		return;
+
+	size = offsetof(SharedMaterialInfo, sinstrument)
+		+ pcxt->nworkers * sizeof(MaterialInstrumentation);
+	node->shared_info = shm_toc_allocate(pcxt->toc, size);
+	/* ensure any unfilled slots will contain zeroes */
+	memset(node->shared_info, 0, size);
+	node->shared_info->num_workers = pcxt->nworkers;
+	shm_toc_insert(pcxt->toc, node->ss.ps.plan->plan_node_id,
+				   node->shared_info);
+}
+
+/* ----------------------------------------------------------------
+ *		ExecMaterialInitializeWorker
+ *
+ *		Attach worker to DSM space for material statistics.
+ * ----------------------------------------------------------------
+ */
+void
+ExecMaterialInitializeWorker(MaterialState *node, ParallelWorkerContext *pwcxt)
+{
+	node->shared_info =
+		shm_toc_lookup(pwcxt->toc, node->ss.ps.plan->plan_node_id, true);
+}
+
+/* ----------------------------------------------------------------
+ *		ExecMaterialRetrieveInstrumentation
+ *
+ *		Transfer material statistics from DSM to private memory.
+ * ----------------------------------------------------------------
+ */
+void
+ExecMaterialRetrieveInstrumentation(MaterialState *node)
+{
+	Size		size;
+	SharedMaterialInfo *si;
+
+	if (node->shared_info == NULL)
+		return;
+
+	size = offsetof(SharedMaterialInfo, sinstrument)
+		+ node->shared_info->num_workers * sizeof(MaterialInstrumentation);
+	si = palloc(size);
+	memcpy(si, node->shared_info, size);
+	node->shared_info = si;
 }

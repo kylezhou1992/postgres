@@ -1,7 +1,7 @@
 <!-- doc/src/sgml/dblink.sgml -->
 
 <sect1 id="dblink" xreflabel="dblink">
- <title>dblink</title>
+ <title>dblink &mdash; connect to other PostgreSQL databases</title>
 
  <indexterm zone="dblink">
   <primary>dblink</primary>
@@ -12,6 +12,41 @@
   other <productname>PostgreSQL</productname> databases from within a database
   session.
  </para>
+
+ <para>
+  <filename>dblink</filename> can report the following wait events under the wait
+  event type <literal>Extension</literal>.
+ </para>
+
+ <variablelist>
+  <varlistentry>
+   <term><literal>DblinkConnect</literal></term>
+   <listitem>
+    <para>
+     Waiting to establish a connection to a remote server.
+    </para>
+   </listitem>
+  </varlistentry>
+
+  <varlistentry>
+   <term><literal>DblinkGetConnect</literal></term>
+   <listitem>
+    <para>
+     Waiting to establish a connection to a remote server when it could not
+     be found in the list of already-opened connections.
+    </para>
+   </listitem>
+  </varlistentry>
+
+  <varlistentry>
+   <term><literal>DblinkGetResult</literal></term>
+   <listitem>
+    <para>
+     Waiting to receive the results of a query from a remote server.
+    </para>
+   </listitem>
+  </varlistentry>
+ </variablelist>
 
  <para>
   See also <xref linkend="postgres-fdw"/>, which provides roughly the same
@@ -116,9 +151,26 @@ dblink_connect(text connname, text connstr) returns text
    </para>
 
    <para>
+    The foreign-data wrapper <filename>dblink_fdw</filename> has an additional
+    Boolean option <literal>use_scram_passthrough</literal> that controls
+    whether <filename>dblink</filename> will use the SCRAM pass-through
+    authentication to connect to the remote database.  It can be specified
+    for a foreign server or a user mapping.  A user mapping setting overrides
+    the foreign server setting.  With SCRAM pass-through authentication,
+    <filename>dblink</filename> uses SCRAM-hashed secrets instead of plain-text
+    user passwords to connect to the remote server. This avoids storing
+    plain-text user passwords in PostgreSQL system catalogs.
+    See the documentation of the equivalent <link
+    linkend="postgres-fdw-option-use-scram-passthrough"><literal>use_scram_passthrough</literal></link>
+    option of postgres_fdw for further details and restrictions.
+   </para>
+
+   <para>
     Only superusers may use <function>dblink_connect</function> to create
-    non-password-authenticated connections.  If non-superusers need this
-    capability, use <function>dblink_connect_u</function> instead.
+    connections that use neither password authentication, SCRAM pass-through,
+    nor GSSAPI-authentication.
+    If non-superusers need this capability, use
+    <function>dblink_connect_u</function> instead.
    </para>
 
    <para>
@@ -145,9 +197,9 @@ SELECT dblink_connect('myconn', 'dbname=postgres options=-csearch_path=');
 (1 row)
 
 -- FOREIGN DATA WRAPPER functionality
--- Note: local connection must require password authentication for this to work properly
---       Otherwise, you will receive the following error from dblink_connect():
---       ----------------------------------------------------------------------
+-- Note: local connections that don't use SCRAM pass-through require password
+--       authentication for this to work properly. Otherwise, you will receive
+--       the following error from dblink_connect():
 --       ERROR:  password is required
 --       DETAIL:  Non-superuser cannot connect if the server does not request a password.
 --       HINT:  Target server's authentication method must be changed.
@@ -162,13 +214,13 @@ GRANT SELECT ON TABLE foo TO regress_dblink_user;
 \set ORIGINAL_USER :USER
 \c - regress_dblink_user
 SELECT dblink_connect('myconn', 'fdtest');
- dblink_connect 
+ dblink_connect
 ----------------
  OK
 (1 row)
 
-SELECT * FROM dblink('myconn','SELECT * FROM foo') AS t(a int, b text, c text[]);
- a  | b |       c       
+SELECT * FROM dblink('myconn', 'SELECT * FROM foo') AS t(a int, b text, c text[]);
+ a  | b |       c
 ----+---+---------------
   0 | a | {a0,b0,c0}
   1 | b | {a1,b1,c1}
@@ -394,7 +446,7 @@ dblink(text sql [, bool fail_on_error]) returns setof record
      <listitem>
       <para>
        The SQL query that you wish to execute in the remote database,
-       for example <literal>select * from foo</literal>.
+       for example <literal>SELECT * FROM foo</literal>.
       </para>
      </listitem>
     </varlistentry>
@@ -428,7 +480,7 @@ dblink(text sql [, bool fail_on_error]) returns setof record
 <programlisting>
 SELECT *
     FROM dblink('dbname=mydb options=-csearch_path=',
-                'select proname, prosrc from pg_proc')
+                'SELECT proname, prosrc FROM pg_proc')
       AS t1(proname name, prosrc text)
     WHERE proname LIKE 'bytea%';
 </programlisting>
@@ -463,7 +515,7 @@ SELECT *
 CREATE VIEW myremote_pg_proc AS
   SELECT *
     FROM dblink('dbname=postgres options=-csearch_path=',
-                'select proname, prosrc from pg_proc')
+                'SELECT proname, prosrc FROM pg_proc')
     AS t1(proname name, prosrc text);
 
 SELECT * FROM myremote_pg_proc WHERE proname LIKE 'bytea%';
@@ -475,7 +527,7 @@ SELECT * FROM myremote_pg_proc WHERE proname LIKE 'bytea%';
 
 <screen>
 SELECT * FROM dblink('dbname=postgres options=-csearch_path=',
-                     'select proname, prosrc from pg_proc')
+                     'SELECT proname, prosrc FROM pg_proc')
   AS t1(proname name, prosrc text) WHERE proname LIKE 'bytea%';
   proname   |   prosrc
 ------------+------------
@@ -499,7 +551,7 @@ SELECT dblink_connect('dbname=postgres options=-csearch_path=');
  OK
 (1 row)
 
-SELECT * FROM dblink('select proname, prosrc from pg_proc')
+SELECT * FROM dblink('SELECT proname, prosrc FROM pg_proc')
   AS t1(proname name, prosrc text) WHERE proname LIKE 'bytea%';
   proname   |   prosrc
 ------------+------------
@@ -523,7 +575,7 @@ SELECT dblink_connect('myconn', 'dbname=regression options=-csearch_path=');
  OK
 (1 row)
 
-SELECT * FROM dblink('myconn', 'select proname, prosrc from pg_proc')
+SELECT * FROM dblink('myconn', 'SELECT proname, prosrc FROM pg_proc')
   AS t1(proname name, prosrc text) WHERE proname LIKE 'bytea%';
   proname   |   prosrc
 ------------+------------
@@ -616,7 +668,7 @@ dblink_exec(text sql [, bool fail_on_error]) returns text
       <para>
        The SQL command that you wish to execute in the remote database,
        for example
-       <literal>insert into foo values(0,'a','{"a0","b0","c0"}')</literal>.
+       <literal>INSERT INTO foo VALUES (0, 'a', '{"a0","b0","c0"}')</literal>.
       </para>
      </listitem>
     </varlistentry>
@@ -653,7 +705,7 @@ SELECT dblink_connect('dbname=dblink_test_standby');
  OK
 (1 row)
 
-SELECT dblink_exec('insert into foo values(21,''z'',''{"a0","b0","c0"}'');');
+SELECT dblink_exec('insert into foo values(21, ''z'', ''{"a0","b0","c0"}'');');
    dblink_exec
 -----------------
  INSERT 943366 1
@@ -665,7 +717,7 @@ SELECT dblink_connect('myconn', 'dbname=regression');
  OK
 (1 row)
 
-SELECT dblink_exec('myconn', 'insert into foo values(21,''z'',''{"a0","b0","c0"}'');');
+SELECT dblink_exec('myconn', 'insert into foo values(21, ''z'', ''{"a0","b0","c0"}'');');
    dblink_exec
 ------------------
  INSERT 6432584 1
@@ -743,7 +795,7 @@ dblink_open(text connname, text cursorname, text sql [, bool fail_on_error]) ret
      <listitem>
       <para>
        The <command>SELECT</command> statement that you wish to execute in the remote
-       database, for example <literal>select * from pg_class</literal>.
+       database, for example <literal>SELECT * FROM pg_class</literal>.
       </para>
      </listitem>
     </varlistentry>
@@ -798,7 +850,7 @@ SELECT dblink_connect('dbname=postgres options=-csearch_path=');
  OK
 (1 row)
 
-SELECT dblink_open('foo', 'select proname, prosrc from pg_proc');
+SELECT dblink_open('foo', 'SELECT proname, prosrc FROM pg_proc');
  dblink_open
 -------------
  OK
@@ -919,7 +971,7 @@ SELECT dblink_connect('dbname=postgres options=-csearch_path=');
  OK
 (1 row)
 
-SELECT dblink_open('foo', 'select proname, prosrc from pg_proc where proname like ''bytea%''');
+SELECT dblink_open('foo', 'SELECT proname, prosrc FROM pg_proc WHERE proname LIKE ''bytea%''');
  dblink_open
 -------------
  OK
@@ -1056,7 +1108,7 @@ SELECT dblink_connect('dbname=postgres options=-csearch_path=');
  OK
 (1 row)
 
-SELECT dblink_open('foo', 'select proname, prosrc from pg_proc');
+SELECT dblink_open('foo', 'SELECT proname, prosrc FROM pg_proc');
  dblink_open
 -------------
  OK
@@ -1165,8 +1217,22 @@ dblink_error_message(text connname) returns text
    <title>Return Value</title>
 
    <para>
-    Returns last error message, or an empty string if there has been
+    Returns last error message, or <literal>OK</literal> if there has been
     no error in this connection.
+   </para>
+  </refsect1>
+
+  <refsect1>
+   <title>Notes</title>
+
+   <para>
+    When asynchronous queries are initiated by
+    <function>dblink_send_query</function>, the error message associated with
+    the connection might not get updated until the server's response message
+    is consumed. This typically means that <function>dblink_is_busy</function>
+    or <function>dblink_get_result</function> should be called prior to
+    <function>dblink_error_message</function>, so that any error generated by
+    the asynchronous query will be visible.
    </para>
   </refsect1>
 
@@ -1237,7 +1303,7 @@ dblink_send_query(text connname, text sql) returns int
      <listitem>
       <para>
        The SQL statement that you wish to execute in the remote database,
-       for example <literal>select * from pg_class</literal>.
+       for example <literal>SELECT * FROM pg_class</literal>.
       </para>
      </listitem>
     </varlistentry>
@@ -1384,7 +1450,7 @@ dblink_get_notify(text connname) returns setof (notify_name text, be_pid int, ex
 
 <screen>
 SELECT dblink_exec('LISTEN virtual');
- dblink_exec 
+ dblink_exec
 -------------
  LISTEN
 (1 row)
@@ -1469,14 +1535,14 @@ dblink_get_result(text connname [, bool fail_on_error]) returns setof record
    <title>Return Value</title>
 
    <para>
-    For an async query (that is, a SQL statement returning rows),
+    For an async query (that is, an SQL statement returning rows),
     the function returns the row(s) produced by the query.  To use this
     function, you will need to specify the expected set of columns,
     as previously discussed for <function>dblink</function>.
    </para>
 
    <para>
-    For an async command (that is, a SQL statement not returning rows),
+    For an async command (that is, an SQL statement not returning rows),
     the function returns a single row with a single text column containing
     the command's status string.  It is still necessary to specify that
     the result will have a single text column in the calling <literal>FROM</literal>
@@ -1519,7 +1585,7 @@ contrib_regression=# SELECT dblink_connect('dtest1', 'dbname=contrib_regression'
 (1 row)
 
 contrib_regression=# SELECT * FROM
-contrib_regression-# dblink_send_query('dtest1', 'select * from foo where f1 &lt; 3') AS t1;
+contrib_regression-# dblink_send_query('dtest1', 'SELECT * FROM foo WHERE f1 &lt; 3') AS t1;
  t1
 ----
   1
@@ -1539,7 +1605,7 @@ contrib_regression=# SELECT * FROM dblink_get_result('dtest1') AS t1(f1 int, f2 
 (0 rows)
 
 contrib_regression=# SELECT * FROM
-contrib_regression-# dblink_send_query('dtest1', 'select * from foo where f1 &lt; 3; select * from foo where f1 &gt; 6') AS t1;
+contrib_regression-# dblink_send_query('dtest1', 'SELECT * FROM foo WHERE f1 &lt; 3; SELECT * FROM foo WHERE f1 &gt; 6') AS t1;
  t1
 ----
   1
@@ -1764,7 +1830,7 @@ dblink_build_sql_insert(text relname,
    <para>
     <function>dblink_build_sql_insert</function> can be useful in doing selective
     replication of a local table to a remote database.  It selects a row
-    from the local table based on primary key, and then builds a SQL
+    from the local table based on primary key, and then builds an SQL
     <command>INSERT</command> command that will duplicate that row, but with
     the primary key values replaced by the values in the last argument.
     (To make an exact copy of the row, just specify the same values for
@@ -1896,7 +1962,7 @@ dblink_build_sql_delete(text relname,
 
    <para>
     <function>dblink_build_sql_delete</function> can be useful in doing selective
-    replication of a local table to a remote database.  It builds a SQL
+    replication of a local table to a remote database.  It builds an SQL
     <command>DELETE</command> command that will delete the row with the given
     primary key values.
    </para>
@@ -2016,7 +2082,7 @@ dblink_build_sql_update(text relname,
    <para>
     <function>dblink_build_sql_update</function> can be useful in doing selective
     replication of a local table to a remote database.  It selects a row
-    from the local table based on primary key, and then builds a SQL
+    from the local table based on primary key, and then builds an SQL
     <command>UPDATE</command> command that will duplicate that row, but with
     the primary key values replaced by the values in the last argument.
     (To make an exact copy of the row, just specify the same values for

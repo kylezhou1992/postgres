@@ -13,7 +13,7 @@
  * cutoff value computed from the selection probability by BeginSampleScan.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -26,12 +26,11 @@
 
 #include <math.h>
 
-#include "access/hash.h"
 #include "access/tsmapi.h"
 #include "catalog/pg_type.h"
-#include "optimizer/clauses.h"
-#include "optimizer/cost.h"
-#include "utils/builtins.h"
+#include "common/hashfn.h"
+#include "optimizer/optimizer.h"
+#include "utils/fmgrprotos.h"
 
 
 /* Private state */
@@ -44,19 +43,19 @@ typedef struct
 
 
 static void bernoulli_samplescangetsamplesize(PlannerInfo *root,
-								  RelOptInfo *baserel,
-								  List *paramexprs,
-								  BlockNumber *pages,
-								  double *tuples);
+											  RelOptInfo *baserel,
+											  List *paramexprs,
+											  BlockNumber *pages,
+											  double *tuples);
 static void bernoulli_initsamplescan(SampleScanState *node,
-						 int eflags);
+									 int eflags);
 static void bernoulli_beginsamplescan(SampleScanState *node,
-						  Datum *params,
-						  int nparams,
-						  uint32 seed);
+									  Datum *params,
+									  int nparams,
+									  uint32 seed);
 static OffsetNumber bernoulli_nextsampletuple(SampleScanState *node,
-						  BlockNumber blockno,
-						  OffsetNumber maxoffset);
+											  BlockNumber blockno,
+											  OffsetNumber maxoffset);
 
 
 /*
@@ -127,7 +126,7 @@ bernoulli_samplescangetsamplesize(PlannerInfo *root,
 static void
 bernoulli_initsamplescan(SampleScanState *node, int eflags)
 {
-	node->tsm_state = palloc0(sizeof(BernoulliSamplerData));
+	node->tsm_state = palloc0_object(BernoulliSamplerData);
 }
 
 /*
@@ -215,8 +214,8 @@ bernoulli_nextsampletuple(SampleScanState *node,
 
 		hashinput[1] = tupoffset;
 
-		hash = DatumGetUInt32(hash_any((const unsigned char *) hashinput,
-									   (int) sizeof(hashinput)));
+		hash = hash_bytes((const unsigned char *) hashinput,
+						  (int) sizeof(hashinput));
 		if (hash < sampler->cutoff)
 			break;
 	}

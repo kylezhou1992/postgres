@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  *
  * src/bin/psql/prompt.c
  */
@@ -12,16 +12,12 @@
 #include <win32.h>
 #endif
 
-#ifdef HAVE_UNIX_SOCKETS
-#include <unistd.h>
-#include <netdb.h>
-#endif
-
 #include "common.h"
+#include "common/string.h"
 #include "input.h"
+#include "libpq/pqcomm.h"
 #include "prompt.h"
 #include "settings.h"
-
 
 /*--------------------------
  * get_prompt
@@ -35,15 +31,21 @@
  *		sockets, "[local:/dir/name]" if not default
  * %m - like %M, but hostname only (before first dot), or always "[local]"
  * %p - backend pid
+ * %P - pipeline status: on, off or abort
  * %> - database server port number
  * %n - database user name
+ * %S - search_path
+ * %s - service
  * %/ - current database
  * %~ - like %/ but "~" when database name equals user name
+ * %w - whitespace of the same width as the most recent output of PROMPT1
  * %# - "#" if superuser, ">" otherwise
  * %R - in prompt1 normally =, or ^ if single line mode,
  *			or a ! if session is not connected to a database;
  *		in prompt2 -, *, ', or ";
  *		in prompt3 nothing
+ * %i - "standby" or "primary" depending on the server's in_hot_standby
+ *      status, or "?" if unavailable (empty if unknown)
  * %x - transaction status: empty, *, !, ? (unknown or no connection)
  * %l - The line number inside the current statement, starting from 1.
  * %? - the error code of the last query (not yet implemented)
@@ -66,16 +68,16 @@
  */
 
 char *
-get_prompt(promptStatus_t status, ConditionalStack cstack)
+get_prompt(promptStatus_t prompt_status, ConditionalStack cstack)
 {
 #define MAX_PROMPT_SIZE 256
 	static char destination[MAX_PROMPT_SIZE + 1];
 	char		buf[MAX_PROMPT_SIZE + 1];
 	bool		esc = false;
-	const char *p;
 	const char *prompt_string = "? ";
+	static size_t last_prompt1_width = 0;
 
-	switch (status)
+	switch (prompt_status)
 	{
 		case PROMPT_READY:
 			prompt_string = pset.prompt1;
@@ -97,7 +99,7 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 
 	destination[0] = '\0';
 
-	for (p = prompt_string;
+	for (const char *p = prompt_string;
 		 *p && strlen(destination) < sizeof(destination) - 1;
 		 p++)
 	{
@@ -124,6 +126,13 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 					}
 					break;
 
+					/* Whitespace of the same width as the last PROMPT1 */
+				case 'w':
+					if (pset.db)
+						memset(buf, ' ',
+							   Min(last_prompt1_width, sizeof(buf) - 1));
+					break;
+
 					/* DB server hostname (long/short) */
 				case 'M':
 				case 'm':
@@ -132,13 +141,12 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 						const char *host = PQhost(pset.db);
 
 						/* INET socket */
-						if (host && host[0] && !is_absolute_path(host))
+						if (host && host[0] && !is_unixsock_path(host))
 						{
 							strlcpy(buf, host, sizeof(buf));
 							if (*p == 'm')
 								buf[strcspn(buf, ".")] = '\0';
 						}
-#ifdef HAVE_UNIX_SOCKETS
 						/* UNIX socket */
 						else
 						{
@@ -149,7 +157,6 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 							else
 								snprintf(buf, sizeof(buf), "[local:%s]", host);
 						}
-#endif
 					}
 					break;
 					/* DB server port number */
@@ -162,6 +169,25 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 					if (pset.db)
 						strlcpy(buf, session_username(), sizeof(buf));
 					break;
+					/* search_path */
+				case 'S':
+					if (pset.db)
+					{
+						const char *sp = PQparameterStatus(pset.db, "search_path");
+
+						/* Use ? for versions that don't report search_path. */
+						strlcpy(buf, sp ? sp : "?", sizeof(buf));
+					}
+					break;
+					/* service name */
+				case 's':
+					{
+						const char *service_name = GetVariable(pset.vars, "SERVICE");
+
+						if (service_name)
+							strlcpy(buf, service_name, sizeof(buf));
+					}
+					break;
 					/* backend pid */
 				case 'p':
 					if (pset.db)
@@ -172,7 +198,20 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 							snprintf(buf, sizeof(buf), "%d", pid);
 					}
 					break;
+					/* pipeline status */
+				case 'P':
+					if (pset.db)
+					{
+						PGpipelineStatus plstatus = PQpipelineStatus(pset.db);
 
+						if (plstatus == PQ_PIPELINE_ON)
+							strlcpy(buf, "on", sizeof(buf));
+						else if (plstatus == PQ_PIPELINE_ABORTED)
+							strlcpy(buf, "abort", sizeof(buf));
+						else
+							strlcpy(buf, "off", sizeof(buf));
+					}
+					break;
 				case '0':
 				case '1':
 				case '2':
@@ -181,11 +220,11 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 				case '5':
 				case '6':
 				case '7':
-					*buf = (char) strtol(p, (char **) &p, 8);
+					*buf = (char) strtol(p, unconstify(char **, &p), 8);
 					--p;
 					break;
 				case 'R':
-					switch (status)
+					switch (prompt_status)
 					{
 						case PROMPT_READY:
 							if (cstack != NULL && !conditional_active(cstack))
@@ -220,7 +259,23 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 							break;
 					}
 					break;
+				case 'i':
+					if (pset.db)
+					{
+						const char *hs = PQparameterStatus(pset.db, "in_hot_standby");
 
+						if (hs)
+						{
+							if (strcmp(hs, "on") == 0)
+								strlcpy(buf, "standby", sizeof(buf));
+							else
+								strlcpy(buf, "primary", sizeof(buf));
+						}
+						/* Use ? for versions that don't report in_hot_standby */
+						else
+							buf[0] = '?';
+					}
+					break;
 				case 'x':
 					if (!pset.db)
 						buf[0] = '?';
@@ -261,12 +316,11 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 					/* execute command */
 				case '`':
 					{
+						int			cmdend = strcspn(p + 1, "`");
+						char	   *file = pnstrdup(p + 1, cmdend);
 						FILE	   *fd;
-						char	   *file = pg_strdup(p + 1);
-						int			cmdend;
 
-						cmdend = strcspn(file, "`");
-						file[cmdend] = '\0';
+						fflush(NULL);
 						fd = popen(file, "r");
 						if (fd)
 						{
@@ -274,9 +328,11 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 								buf[0] = '\0';
 							pclose(fd);
 						}
-						if (strlen(buf) > 0 && buf[strlen(buf) - 1] == '\n')
-							buf[strlen(buf) - 1] = '\0';
-						free(file);
+
+						/* strip trailing newline and carriage return */
+						(void) pg_strip_crlf(buf);
+
+						pfree(file);
 						p += cmdend + 1;
 						break;
 					}
@@ -284,17 +340,14 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 					/* interpolate variable */
 				case ':':
 					{
-						char	   *name;
+						int			nameend = strcspn(p + 1, ":");
+						char	   *name = pnstrdup(p + 1, nameend);
 						const char *val;
-						int			nameend;
 
-						name = pg_strdup(p + 1);
-						nameend = strcspn(name, ":");
-						name[nameend] = '\0';
 						val = GetVariable(pset.vars, name);
 						if (val)
 							strlcpy(buf, val, sizeof(buf));
-						free(name);
+						pfree(name);
 						p += nameend + 1;
 						break;
 					}
@@ -317,7 +370,6 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 					buf[0] = *p;
 					buf[1] = '\0';
 					break;
-
 			}
 			esc = false;
 		}
@@ -332,6 +384,52 @@ get_prompt(promptStatus_t status, ConditionalStack cstack)
 
 		if (!esc)
 			strlcat(destination, buf, sizeof(destination));
+	}
+
+	/* Compute the visible width of PROMPT1, for PROMPT2's %w */
+	if (prompt_string == pset.prompt1)
+	{
+		char	   *d = destination;
+		char	   *end = d + strlen(d);
+		bool		visible = true;
+
+		last_prompt1_width = 0;
+		while (*d)
+		{
+#if defined(USE_READLINE) && defined(RL_PROMPT_START_IGNORE)
+			if (*d == RL_PROMPT_START_IGNORE)
+			{
+				visible = false;
+				++d;
+			}
+			else if (*d == RL_PROMPT_END_IGNORE)
+			{
+				visible = true;
+				++d;
+			}
+			else
+#endif
+			{
+				int			chlen,
+							chwidth;
+
+				chlen = PQmblen(d, pset.encoding);
+				if (d + chlen > end)
+					break;		/* Invalid string */
+
+				if (visible)
+				{
+					chwidth = PQdsplen(d, pset.encoding);
+
+					if (*d == '\n')
+						last_prompt1_width = 0;
+					else if (chwidth > 0)
+						last_prompt1_width += chwidth;
+				}
+
+				d += chlen;
+			}
+		}
 	}
 
 	return destination;

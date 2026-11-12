@@ -3,7 +3,7 @@
  * tlist.c
  *	  Target list manipulation routines
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,10 +17,18 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/cost.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/tlist.h"
+#include "rewrite/rewriteManip.h"
 
 
-/* Test if an expression node represents a SRF call.  Beware multiple eval! */
+/*
+ * Test if an expression node represents a SRF call.  Beware multiple eval!
+ *
+ * Please note that this is only meant for use in split_pathtarget_at_srfs();
+ * if you use it anywhere else, your code is almost certainly wrong for SRFs
+ * nested within expressions.  Use expression_returns_set() instead.
+ */
 #define IS_SRF_CALL(node) \
 	((IsA(node, FuncExpr) && ((FuncExpr *) (node))->funcretset) || \
 	 (IsA(node, OpExpr) && ((OpExpr *) (node))->opretset))
@@ -38,6 +46,8 @@ typedef struct
 
 typedef struct
 {
+	PlannerInfo *root;
+	bool		is_grouping_target; /* true if processing grouping target */
 	/* This is a List of bare expressions: */
 	List	   *input_target_exprs; /* exprs available from input */
 	/* These are Lists of Lists of split_pathtarget_items: */
@@ -52,10 +62,16 @@ typedef struct
 	Index		current_sgref;	/* current subexpr's sortgroupref, or 0 */
 } split_pathtarget_context;
 
+static void split_pathtarget_at_srfs_extended(PlannerInfo *root,
+											  PathTarget *target,
+											  PathTarget *input_target,
+											  List **targets,
+											  List **targets_contain_srfs,
+											  bool is_grouping_target);
 static bool split_pathtarget_walker(Node *node,
-						split_pathtarget_context *context);
+									split_pathtarget_context *context);
 static void add_sp_item_to_pathtarget(PathTarget *target,
-						  split_pathtarget_item *item);
+									  split_pathtarget_item *item);
 static void add_sp_items_to_pathtarget(PathTarget *target, List *items);
 
 
@@ -78,34 +94,6 @@ tlist_member(Expr *node, List *targetlist)
 		TargetEntry *tlentry = (TargetEntry *) lfirst(temp);
 
 		if (equal(node, tlentry->expr))
-			return tlentry;
-	}
-	return NULL;
-}
-
-/*
- * tlist_member_ignore_relabel
- *	  Same as above, except that we ignore top-level RelabelType nodes
- *	  while checking for a match.  This is needed for some scenarios
- *	  involving binary-compatible sort operations.
- */
-TargetEntry *
-tlist_member_ignore_relabel(Expr *node, List *targetlist)
-{
-	ListCell   *temp;
-
-	while (node && IsA(node, RelabelType))
-		node = ((RelabelType *) node)->arg;
-
-	foreach(temp, targetlist)
-	{
-		TargetEntry *tlentry = (TargetEntry *) lfirst(temp);
-		Expr	   *tlexpr = tlentry->expr;
-
-		while (tlexpr && IsA(tlexpr, RelabelType))
-			tlexpr = ((RelabelType *) tlexpr)->arg;
-
-		if (equal(node, tlexpr))
 			return tlentry;
 	}
 	return NULL;
@@ -286,7 +274,7 @@ tlist_same_datatypes(List *tlist, List *colTypes, bool junkOK)
 				return false;	/* tlist longer than colTypes */
 			if (exprType((Node *) tle->expr) != lfirst_oid(curColType))
 				return false;
-			curColType = lnext(curColType);
+			curColType = lnext(colTypes, curColType);
 		}
 	}
 	if (curColType != NULL)
@@ -320,7 +308,7 @@ tlist_same_collations(List *tlist, List *colCollations, bool junkOK)
 				return false;	/* tlist longer than colCollations */
 			if (exprCollation((Node *) tle->expr) != lfirst_oid(curColColl))
 				return false;
-			curColColl = lnext(curColColl);
+			curColColl = lnext(colCollations, curColColl);
 		}
 	}
 	if (curColColl != NULL)
@@ -488,7 +476,7 @@ extract_grouping_ops(List *groupClause)
 	Oid		   *groupOperators;
 	ListCell   *glitem;
 
-	groupOperators = (Oid *) palloc(sizeof(Oid) * numCols);
+	groupOperators = palloc_array(Oid, numCols);
 
 	foreach(glitem, groupClause)
 	{
@@ -503,6 +491,31 @@ extract_grouping_ops(List *groupClause)
 }
 
 /*
+ * extract_grouping_collations - make an array of the grouping column collations
+ *		for a SortGroupClause list
+ */
+Oid *
+extract_grouping_collations(List *groupClause, List *tlist)
+{
+	int			numCols = list_length(groupClause);
+	int			colno = 0;
+	Oid		   *grpCollations;
+	ListCell   *glitem;
+
+	grpCollations = palloc_array(Oid, numCols);
+
+	foreach(glitem, groupClause)
+	{
+		SortGroupClause *groupcl = (SortGroupClause *) lfirst(glitem);
+		TargetEntry *tle = get_sortgroupclause_tle(groupcl, tlist);
+
+		grpCollations[colno++] = exprCollation((Node *) tle->expr);
+	}
+
+	return grpCollations;
+}
+
+/*
  * extract_grouping_cols - make an array of the grouping column resnos
  *		for a SortGroupClause list
  */
@@ -514,7 +527,7 @@ extract_grouping_cols(List *groupClause, List *tlist)
 	int			colno = 0;
 	ListCell   *glitem;
 
-	grpColIdx = (AttrNumber *) palloc(sizeof(AttrNumber) * numCols);
+	grpColIdx = palloc_array(AttrNumber, numCols);
 
 	foreach(glitem, groupClause)
 	{
@@ -590,7 +603,7 @@ make_pathtarget_from_tlist(List *tlist)
 	int			i;
 	ListCell   *lc;
 
-	target->sortgrouprefs = (Index *) palloc(list_length(tlist) * sizeof(Index));
+	target->sortgrouprefs = palloc_array(Index, list_length(tlist));
 
 	i = 0;
 	foreach(lc, tlist)
@@ -601,6 +614,13 @@ make_pathtarget_from_tlist(List *tlist)
 		target->sortgrouprefs[i] = tle->ressortgroupref;
 		i++;
 	}
+
+	/*
+	 * Mark volatility as unknown.  The contain_volatile_functions function
+	 * will determine if there are any volatile functions when called for the
+	 * first time with this PathTarget.
+	 */
+	target->has_volatile_expr = VOLATILITY_UNKNOWN;
 
 	return target;
 }
@@ -639,9 +659,8 @@ make_tlist_from_pathtarget(PathTarget *target)
  * copy_pathtarget
  *	  Copy a PathTarget.
  *
- * The new PathTarget has its own List cells, but shares the underlying
- * target expression trees with the old one.  We duplicate the List cells
- * so that items can be added to one target without damaging the other.
+ * The new PathTarget has its own exprs List, but shares the underlying
+ * target expression trees with the old one.
  */
 PathTarget *
 copy_pathtarget(PathTarget *src)
@@ -692,8 +711,7 @@ add_column_to_pathtarget(PathTarget *target, Expr *expr, Index sortgroupref)
 		int			nexprs = list_length(target->exprs);
 
 		/* This might look inefficient, but actually it's usually cheap */
-		target->sortgrouprefs = (Index *)
-			repalloc(target->sortgrouprefs, nexprs * sizeof(Index));
+		target->sortgrouprefs = repalloc_array(target->sortgrouprefs, Index, nexprs);
 		target->sortgrouprefs[nexprs - 1] = sortgroupref;
 	}
 	else if (sortgroupref)
@@ -701,9 +719,19 @@ add_column_to_pathtarget(PathTarget *target, Expr *expr, Index sortgroupref)
 		/* Adding sortgroupref labeling to a previously unlabeled target */
 		int			nexprs = list_length(target->exprs);
 
-		target->sortgrouprefs = (Index *) palloc0(nexprs * sizeof(Index));
+		target->sortgrouprefs = palloc0_array(Index, nexprs);
 		target->sortgrouprefs[nexprs - 1] = sortgroupref;
 	}
+
+	/*
+	 * Reset has_volatile_expr to UNKNOWN.  We just leave it up to
+	 * contain_volatile_functions to set this properly again.  Technically we
+	 * could save some effort here and just check the new Expr, but it seems
+	 * better to keep the logic for setting this flag in one location rather
+	 * than duplicating the logic here.
+	 */
+	if (target->has_volatile_expr == VOLATILITY_NOVOLATILE)
+		target->has_volatile_expr = VOLATILITY_UNKNOWN;
 }
 
 /*
@@ -802,6 +830,51 @@ apply_pathtarget_labeling_to_tlist(List *tlist, PathTarget *target)
 
 /*
  * split_pathtarget_at_srfs
+ *		Split given PathTarget into multiple levels to position SRFs safely,
+ *		performing exact matching against input_target.
+ *
+ * This is a wrapper for split_pathtarget_at_srfs_extended() that is used when
+ * both targets are on the same side of the grouping boundary (i.e., both are
+ * pre-grouping or both are post-grouping).  In this case, no special handling
+ * for the grouping nulling bit is required.
+ *
+ * See split_pathtarget_at_srfs_extended() for more details.
+ */
+void
+split_pathtarget_at_srfs(PlannerInfo *root,
+						 PathTarget *target, PathTarget *input_target,
+						 List **targets, List **targets_contain_srfs)
+{
+	split_pathtarget_at_srfs_extended(root, target, input_target,
+									  targets, targets_contain_srfs,
+									  false);
+}
+
+/*
+ * split_pathtarget_at_srfs_grouping
+ *		Split given PathTarget into multiple levels to position SRFs safely,
+ *		ignoring the grouping nulling bit when matching against input_target.
+ *
+ * This variant is used when the targets cross the grouping boundary (i.e.,
+ * target is post-grouping while input_target is pre-grouping).  In this case,
+ * we need to ignore the grouping nulling bit when checking for expression
+ * availability to avoid incorrectly re-evaluating SRFs that have already been
+ * computed in input_target.
+ *
+ * See split_pathtarget_at_srfs_extended() for more details.
+ */
+void
+split_pathtarget_at_srfs_grouping(PlannerInfo *root,
+								  PathTarget *target, PathTarget *input_target,
+								  List **targets, List **targets_contain_srfs)
+{
+	split_pathtarget_at_srfs_extended(root, target, input_target,
+									  targets, targets_contain_srfs,
+									  true);
+}
+
+/*
+ * split_pathtarget_at_srfs_extended
  *		Split given PathTarget into multiple levels to position SRFs safely
  *
  * The executor can only handle set-returning functions that appear at the
@@ -840,12 +913,19 @@ apply_pathtarget_labeling_to_tlist(List *tlist, PathTarget *target)
  * already meant as a reference to a lower subexpression).  So, don't expand
  * any tlist expressions that appear in input_target, if that's not NULL.
  *
+ * This check requires extra care when processing the grouping target
+ * (indicated by the is_grouping_target flag).  In this case input_target is
+ * pre-grouping while target is post-grouping, so the latter may carry
+ * nullingrels bits from the grouping step that are absent in the former.  We
+ * must ignore those bits to correctly recognize that the tlist expressions are
+ * available in input_target.
+ *
  * It's also important that we preserve any sortgroupref annotation appearing
  * in the given target, especially on expressions matching input_target items.
  *
  * The outputs of this function are two parallel lists, one a list of
  * PathTargets and the other an integer list of bool flags indicating
- * whether the corresponding PathTarget contains any evaluatable SRFs.
+ * whether the corresponding PathTarget contains any evaluable SRFs.
  * The lists are given in the order they'd need to be evaluated in, with
  * the "lowest" PathTarget first.  So the last list entry is always the
  * originally given PathTarget, and any entries before it indicate evaluation
@@ -857,10 +937,11 @@ apply_pathtarget_labeling_to_tlist(List *tlist, PathTarget *target)
  * are only a few possible patterns for which levels contain SRFs.
  * But this representation decouples callers from that knowledge.
  */
-void
-split_pathtarget_at_srfs(PlannerInfo *root,
-						 PathTarget *target, PathTarget *input_target,
-						 List **targets, List **targets_contain_srfs)
+static void
+split_pathtarget_at_srfs_extended(PlannerInfo *root,
+								  PathTarget *target, PathTarget *input_target,
+								  List **targets, List **targets_contain_srfs,
+								  bool is_grouping_target)
 {
 	split_pathtarget_context context;
 	int			max_depth;
@@ -885,7 +966,12 @@ split_pathtarget_at_srfs(PlannerInfo *root,
 		return;
 	}
 
-	/* Pass any input_target exprs down to split_pathtarget_walker() */
+	/*
+	 * Pass 'root', the is_grouping_target flag, and any input_target exprs
+	 * down to split_pathtarget_walker().
+	 */
+	context.root = root;
+	context.is_grouping_target = is_grouping_target;
 	context.input_target_exprs = input_target ? input_target->exprs : NIL;
 
 	/*
@@ -996,7 +1082,7 @@ split_pathtarget_at_srfs(PlannerInfo *root,
 		List	   *level_srfs = (List *) lfirst(lc1);
 		PathTarget *ntarget;
 
-		if (lnext(lc1) == NULL)
+		if (lnext(context.level_srfs, lc1) == NULL)
 		{
 			ntarget = target;
 		}
@@ -1011,13 +1097,15 @@ split_pathtarget_at_srfs(PlannerInfo *root,
 			 * later levels.
 			 */
 			add_sp_items_to_pathtarget(ntarget, level_srfs);
-			for_each_cell(lc, lnext(lc2))
+			for_each_cell(lc, context.level_input_vars,
+						  lnext(context.level_input_vars, lc2))
 			{
 				List	   *input_vars = (List *) lfirst(lc);
 
 				add_sp_items_to_pathtarget(ntarget, input_vars);
 			}
-			for_each_cell(lc, lnext(lc3))
+			for_each_cell(lc, context.level_input_srfs,
+						  lnext(context.level_input_srfs, lc3))
 			{
 				List	   *input_srfs = (List *) lfirst(lc);
 				ListCell   *lcx;
@@ -1054,8 +1142,26 @@ split_pathtarget_at_srfs(PlannerInfo *root,
 static bool
 split_pathtarget_walker(Node *node, split_pathtarget_context *context)
 {
+	Node	   *sanitized_node = node;
+
 	if (node == NULL)
 		return false;
+
+	/*
+	 * If we are crossing the grouping boundary (post-grouping target vs
+	 * pre-grouping input_target), we must ignore the grouping nulling bit to
+	 * correctly check if the subexpression is available in input_target. This
+	 * aligns with the matching logic in set_upper_references().
+	 */
+	if (context->is_grouping_target &&
+		context->root->parse->hasGroupRTE &&
+		context->root->parse->groupingSets != NIL)
+	{
+		sanitized_node =
+			remove_nulling_relids(node,
+								  bms_make_singleton(context->root->group_rtindex),
+								  NULL);
+	}
 
 	/*
 	 * A subexpression that matches an expression already computed in
@@ -1065,9 +1171,9 @@ split_pathtarget_walker(Node *node, split_pathtarget_context *context)
 	 * substructure.  (Note in particular that this preserves the identity of
 	 * any expressions that appear as sortgrouprefs in input_target.)
 	 */
-	if (list_member(context->input_target_exprs, node))
+	if (list_member(context->input_target_exprs, sanitized_node))
 	{
-		split_pathtarget_item *item = palloc(sizeof(split_pathtarget_item));
+		split_pathtarget_item *item = palloc_object(split_pathtarget_item);
 
 		item->expr = node;
 		item->sortgroupref = context->current_sgref;
@@ -1087,7 +1193,7 @@ split_pathtarget_walker(Node *node, split_pathtarget_context *context)
 		IsA(node, GroupingFunc) ||
 		IsA(node, WindowFunc))
 	{
-		split_pathtarget_item *item = palloc(sizeof(split_pathtarget_item));
+		split_pathtarget_item *item = palloc_object(split_pathtarget_item);
 
 		item->expr = node;
 		item->sortgroupref = context->current_sgref;
@@ -1102,7 +1208,7 @@ split_pathtarget_walker(Node *node, split_pathtarget_context *context)
 	 */
 	if (IS_SRF_CALL(node))
 	{
-		split_pathtarget_item *item = palloc(sizeof(split_pathtarget_item));
+		split_pathtarget_item *item = palloc_object(split_pathtarget_item);
 		List	   *save_input_vars = context->current_input_vars;
 		List	   *save_input_srfs = context->current_input_srfs;
 		int			save_current_depth = context->current_depth;
@@ -1117,8 +1223,7 @@ split_pathtarget_walker(Node *node, split_pathtarget_context *context)
 		context->current_depth = 0;
 		context->current_sgref = 0; /* subexpressions are not sortgroup items */
 
-		(void) expression_tree_walker(node, split_pathtarget_walker,
-									  (void *) context);
+		(void) expression_tree_walker(node, split_pathtarget_walker, context);
 
 		/* Depth is one more than any SRF below it */
 		srf_depth = context->current_depth + 1;
@@ -1159,8 +1264,7 @@ split_pathtarget_walker(Node *node, split_pathtarget_context *context)
 	 * examine its inputs.
 	 */
 	context->current_sgref = 0; /* subexpressions are not sortgroup items */
-	return expression_tree_walker(node, split_pathtarget_walker,
-								  (void *) context);
+	return expression_tree_walker(node, split_pathtarget_walker, context);
 }
 
 /*
@@ -1202,8 +1306,8 @@ add_sp_item_to_pathtarget(PathTarget *target, split_pathtarget_item *item)
 			{
 				if (target->sortgrouprefs == NULL)
 				{
-					target->sortgrouprefs = (Index *)
-						palloc0(list_length(target->exprs) * sizeof(Index));
+					target->sortgrouprefs = palloc0_array(Index,
+														  list_length(target->exprs));
 				}
 				target->sortgrouprefs[lci] = item->sortgroupref;
 			}

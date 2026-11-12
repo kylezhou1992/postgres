@@ -4,10 +4,10 @@
 
 EXEC SQL INCLUDE ../regression;
 
-int main() {
+int main(void) {
   EXEC SQL BEGIN DECLARE SECTION;
     char var[25];
-    int i;
+    int i, loopcount;
   EXEC SQL END DECLARE SECTION;
 
   ECPGdebug(1, stderr);
@@ -15,19 +15,9 @@ int main() {
 
   EXEC SQL SET AUTOCOMMIT TO ON;
   EXEC SQL WHENEVER SQLWARNING SQLPRINT;
-  EXEC SQL WHENEVER SQLERROR SQLPRINT;
+  EXEC SQL WHENEVER SQLERROR STOP;
 
   EXEC SQL CREATE TABLE "My_Table" ( Item1 int, Item2 text );
-
-  EXEC SQL SET standard_conforming_strings TO off;
-
-  EXEC SQL SHOW standard_conforming_strings INTO :var;
-  printf("Standard conforming strings: %s\n", var);
-
-  /* this is a\\b actually */
-  EXEC SQL INSERT INTO "My_Table" VALUES ( 1, 'a\\\\b' );
-  /* this is a\\b */
-  EXEC SQL INSERT INTO "My_Table" VALUES ( 1, E'a\\\\b' );
 
   EXEC SQL SET standard_conforming_strings TO on;
 
@@ -46,7 +36,7 @@ int main() {
 
   EXEC SQL WHENEVER NOT FOUND DO BREAK;
 
-  while (true)
+  for (loopcount = 0; loopcount < 100; loopcount++)
   {
 	EXEC SQL FETCH C INTO :i, :var;
 	printf("value: %d %s\n", i, var);

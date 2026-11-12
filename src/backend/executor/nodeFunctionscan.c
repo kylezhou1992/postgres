@@ -3,7 +3,7 @@
  * nodeFunctionscan.c
  *	  Support routines for scanning RangeFunctions (functions in rangetable).
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -26,24 +26,11 @@
 #include "executor/nodeFunctionscan.h"
 #include "funcapi.h"
 #include "nodes/nodeFuncs.h"
-#include "utils/builtins.h"
 #include "utils/memutils.h"
-
-
-/*
- * Runtime data for each function being scanned.
- */
-typedef struct FunctionScanPerFuncState
-{
-	SetExprState *setexpr;		/* state of the expression being evaluated */
-	TupleDesc	tupdesc;		/* desc of the function result type */
-	int			colcount;		/* expected number of result columns */
-	Tuplestorestate *tstore;	/* holds the function result set */
-	int64		rowcount;		/* # of rows in result set, -1 if not known */
-	TupleTableSlot *func_slot;	/* function result slot (or NULL) */
-} FunctionScanPerFuncState;
+#include "utils/tuplestore.h"
 
 static TupleTableSlot *FunctionNext(FunctionScanState *node);
+static void update_storage_stats(FunctionScanState *node);
 
 
 /* ----------------------------------------------------------------
@@ -334,7 +321,7 @@ ExecInitFunctionScan(FunctionScan *node, EState *estate, int eflags)
 	 */
 	ExecAssignExprContext(estate, &scanstate->ss.ps);
 
-	scanstate->funcstates = palloc(nfuncs * sizeof(FunctionScanPerFuncState));
+	scanstate->funcstates = palloc_array(FunctionScanPerFuncState, nfuncs);
 
 	natts = 0;
 	i = 0;
@@ -344,8 +331,6 @@ ExecInitFunctionScan(FunctionScan *node, EState *estate, int eflags)
 		Node	   *funcexpr = rtfunc->funcexpr;
 		int			colcount = rtfunc->funccolcount;
 		FunctionScanPerFuncState *fs = &scanstate->funcstates[i];
-		TypeFuncClass functypclass;
-		Oid			funcrettype;
 		TupleDesc	tupdesc;
 
 		fs->setexpr =
@@ -362,39 +347,18 @@ ExecInitFunctionScan(FunctionScan *node, EState *estate, int eflags)
 		fs->rowcount = -1;
 
 		/*
-		 * Now determine if the function returns a simple or composite type,
-		 * and build an appropriate tupdesc.  Note that in the composite case,
-		 * the function may now return more columns than it did when the plan
-		 * was made; we have to ignore any columns beyond "colcount".
+		 * Now build a tupdesc showing the result type we expect from the
+		 * function.  If we have a coldeflist then that takes priority (note
+		 * the parser enforces that there is one if the function's nominal
+		 * output type is RECORD).  Otherwise use get_expr_result_type.
+		 *
+		 * Note that if the function returns a named composite type, that may
+		 * now contain more or different columns than it did when the plan was
+		 * made.  For both that and the RECORD case, we need to check tuple
+		 * compatibility.  ExecMakeTableFunctionResult handles some of this,
+		 * and CheckVarSlotCompatibility provides a backstop.
 		 */
-		functypclass = get_expr_result_type(funcexpr,
-											&funcrettype,
-											&tupdesc);
-
-		if (functypclass == TYPEFUNC_COMPOSITE ||
-			functypclass == TYPEFUNC_COMPOSITE_DOMAIN)
-		{
-			/* Composite data type, e.g. a table's row type */
-			Assert(tupdesc);
-			Assert(tupdesc->natts >= colcount);
-			/* Must copy it out of typcache for safety */
-			tupdesc = CreateTupleDescCopy(tupdesc);
-		}
-		else if (functypclass == TYPEFUNC_SCALAR)
-		{
-			/* Base data type, i.e. scalar */
-			tupdesc = CreateTemplateTupleDesc(1, false);
-			TupleDescInitEntry(tupdesc,
-							   (AttrNumber) 1,
-							   NULL,	/* don't care about the name here */
-							   funcrettype,
-							   -1,
-							   0);
-			TupleDescInitEntryCollation(tupdesc,
-										(AttrNumber) 1,
-										exprCollation(funcexpr));
-		}
-		else if (functypclass == TYPEFUNC_RECORD)
+		if (rtfunc->funccolnames != NIL)
 		{
 			tupdesc = BuildDescFromLists(rtfunc->funccolnames,
 										 rtfunc->funccoltypes,
@@ -410,8 +374,41 @@ ExecInitFunctionScan(FunctionScan *node, EState *estate, int eflags)
 		}
 		else
 		{
-			/* crummy error message, but parser should have caught this */
-			elog(ERROR, "function in FROM has unsupported return type");
+			TypeFuncClass functypclass;
+			Oid			funcrettype;
+
+			functypclass = get_expr_result_type(funcexpr,
+												&funcrettype,
+												&tupdesc);
+
+			if (functypclass == TYPEFUNC_COMPOSITE ||
+				functypclass == TYPEFUNC_COMPOSITE_DOMAIN)
+			{
+				/* Composite data type, e.g. a table's row type */
+				Assert(tupdesc);
+				/* Must copy it out of typcache for safety */
+				tupdesc = CreateTupleDescCopy(tupdesc);
+			}
+			else if (functypclass == TYPEFUNC_SCALAR)
+			{
+				/* Base data type, i.e. scalar */
+				tupdesc = CreateTemplateTupleDesc(1);
+				TupleDescInitEntry(tupdesc,
+								   (AttrNumber) 1,
+								   NULL,	/* don't care about the name here */
+								   funcrettype,
+								   -1,
+								   0);
+				TupleDescInitEntryCollation(tupdesc,
+											(AttrNumber) 1,
+											exprCollation(funcexpr));
+				TupleDescFinalize(tupdesc);
+			}
+			else
+			{
+				/* crummy error message, but parser should have caught this */
+				elog(ERROR, "function in FROM has unsupported return type");
+			}
 		}
 
 		fs->tupdesc = tupdesc;
@@ -424,7 +421,8 @@ ExecInitFunctionScan(FunctionScan *node, EState *estate, int eflags)
 		 */
 		if (!scanstate->simple)
 		{
-			fs->func_slot = ExecInitExtraTupleSlot(estate, fs->tupdesc);
+			fs->func_slot = ExecInitExtraTupleSlot(estate, fs->tupdesc,
+												   &TTSOpsMinimalTuple);
 		}
 		else
 			fs->func_slot = NULL;
@@ -453,7 +451,7 @@ ExecInitFunctionScan(FunctionScan *node, EState *estate, int eflags)
 		if (node->funcordinality)
 			natts++;
 
-		scan_tupdesc = CreateTemplateTupleDesc(natts, false);
+		scan_tupdesc = CreateTemplateTupleDesc(natts);
 
 		for (i = 0; i < nfuncs; i++)
 		{
@@ -476,18 +474,20 @@ ExecInitFunctionScan(FunctionScan *node, EState *estate, int eflags)
 							   0);
 		}
 
+		TupleDescFinalize(scan_tupdesc);
 		Assert(attno == natts);
 	}
 
 	/*
 	 * Initialize scan slot and type.
 	 */
-	ExecInitScanTupleSlot(estate, &scanstate->ss, scan_tupdesc);
+	ExecInitScanTupleSlot(estate, &scanstate->ss, scan_tupdesc,
+						  &TTSOpsMinimalTuple, 0);
 
 	/*
 	 * Initialize result slot, type and projection.
 	 */
-	ExecInitResultTupleSlotTL(estate, &scanstate->ss.ps);
+	ExecInitResultTypeTL(&scanstate->ss.ps);
 	ExecAssignScanProjectionInfo(&scanstate->ss);
 
 	/*
@@ -507,6 +507,8 @@ ExecInitFunctionScan(FunctionScan *node, EState *estate, int eflags)
 												  "Table function arguments",
 												  ALLOCSET_DEFAULT_SIZES);
 
+	scanstate->shared_info = NULL;
+
 	return scanstate;
 }
 
@@ -522,15 +524,24 @@ ExecEndFunctionScan(FunctionScanState *node)
 	int			i;
 
 	/*
-	 * Free the exprcontext
+	 * When ending a parallel worker, copy the tuplestore usage details into
+	 * shared memory so that they can be picked up by the main process to
+	 * report in EXPLAIN ANALYZE.  The Gather node above us may be rescanned,
+	 * in which case a new set of workers will write to the same slots, so
+	 * merge with any existing values rather than overwriting them.
 	 */
-	ExecFreeExprContext(&node->ss.ps);
+	if (node->shared_info != NULL && IsParallelWorker())
+	{
+		FunctionScanInstrumentation *si;
 
-	/*
-	 * clean out the tuple table
-	 */
-	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
+		/* fetch storage info from tuplestores and store in node->stats */
+		update_storage_stats(node);
+
+		Assert(ParallelWorkerNumber < node->shared_info->num_workers);
+		si = &node->shared_info->sinstrument[ParallelWorkerNumber];
+		si->maxSpaceUsed = Max(si->maxSpaceUsed, node->stats.maxSpaceUsed);
+		si->usedDisk |= node->stats.usedDisk;
+	}
 
 	/*
 	 * Release slots and tuplestore resources
@@ -539,15 +550,47 @@ ExecEndFunctionScan(FunctionScanState *node)
 	{
 		FunctionScanPerFuncState *fs = &node->funcstates[i];
 
-		if (fs->func_slot)
-			ExecClearTuple(fs->func_slot);
-
 		if (fs->tstore != NULL)
 		{
 			tuplestore_end(node->funcstates[i].tstore);
 			fs->tstore = NULL;
 		}
 	}
+}
+
+/*
+ * update_storage_stats
+ *		Update the storage statistics for EXPLAIN ANALYZE with the storage
+ *		space used by each function's tuplestore.
+ *
+ * We expect this to be called before starting new scans so that the
+ * maxSpaceUsed and usedDisk fields are not forgotten between rescans.  We
+ * calculate the total space used by all tuplestores at the end of each scan
+ * and store that if it's higher than any previous scan's.  "usedDisk" is
+ * marked if any tuplestore spilled during any scan.
+ */
+static void
+update_storage_stats(FunctionScanState *node)
+{
+	int64		totalSpaceUsed = 0;
+
+	/* Calculate the sum of the space used by each function's tuplestore. */
+	for (int i = 0; i < node->nfuncs; i++)
+	{
+		FunctionScanPerFuncState *fs = &node->funcstates[i];
+		bool		usedDisk;
+		int64		spaceUsed;
+
+		if (fs->tstore == NULL)
+			continue;
+
+		tuplestore_get_stats(fs->tstore, &usedDisk, &spaceUsed);
+		totalSpaceUsed += spaceUsed;
+		node->stats.usedDisk |= usedDisk;
+	}
+
+	/* Record this one if it beats the previous best. */
+	node->stats.maxSpaceUsed = Max(node->stats.maxSpaceUsed, totalSpaceUsed);
 }
 
 /* ----------------------------------------------------------------
@@ -563,7 +606,8 @@ ExecReScanFunctionScan(FunctionScanState *node)
 	int			i;
 	Bitmapset  *chgparam = node->ss.ps.chgParam;
 
-	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+	if (node->ss.ps.ps_ResultTupleSlot)
+		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
 	for (i = 0; i < node->nfuncs; i++)
 	{
 		FunctionScanPerFuncState *fs = &node->funcstates[i];
@@ -585,6 +629,10 @@ ExecReScanFunctionScan(FunctionScanState *node)
 	if (chgparam)
 	{
 		ListCell   *lc;
+
+		/* Track tuplestore storage stats, if needed */
+		if (node->ss.ps.instrument)
+			update_storage_stats(node);
 
 		i = 0;
 		foreach(lc, scan->functions)
@@ -613,4 +661,91 @@ ExecReScanFunctionScan(FunctionScanState *node)
 		if (node->funcstates[i].tstore != NULL)
 			tuplestore_rescan(node->funcstates[i].tstore);
 	}
+}
+
+/* ----------------------------------------------------------------
+ *						Parallel Query Support
+ * ----------------------------------------------------------------
+ */
+
+/* ----------------------------------------------------------------
+ *		ExecFunctionScanEstimate
+ *
+ *		Estimate space required to propagate function scan statistics.
+ * ----------------------------------------------------------------
+ */
+void
+ExecFunctionScanEstimate(FunctionScanState *node, ParallelContext *pcxt)
+{
+	Size		size;
+
+	/* don't need this if not instrumenting or no workers */
+	if (!node->ss.ps.instrument || pcxt->nworkers == 0)
+		return;
+
+	size = mul_size(pcxt->nworkers, sizeof(FunctionScanInstrumentation));
+	size = add_size(size, offsetof(SharedFunctionScanInfo, sinstrument));
+	shm_toc_estimate_chunk(&pcxt->estimator, size);
+	shm_toc_estimate_keys(&pcxt->estimator, 1);
+}
+
+/* ----------------------------------------------------------------
+ *		ExecFunctionScanInitializeDSM
+ *
+ *		Initialize DSM space for function scan statistics.
+ * ----------------------------------------------------------------
+ */
+void
+ExecFunctionScanInitializeDSM(FunctionScanState *node, ParallelContext *pcxt)
+{
+	Size		size;
+
+	/* don't need this if not instrumenting or no workers */
+	if (!node->ss.ps.instrument || pcxt->nworkers == 0)
+		return;
+
+	size = offsetof(SharedFunctionScanInfo, sinstrument)
+		+ pcxt->nworkers * sizeof(FunctionScanInstrumentation);
+	node->shared_info = shm_toc_allocate(pcxt->toc, size);
+	/* ensure any unfilled slots will contain zeroes */
+	memset(node->shared_info, 0, size);
+	node->shared_info->num_workers = pcxt->nworkers;
+	shm_toc_insert(pcxt->toc, node->ss.ps.plan->plan_node_id,
+				   node->shared_info);
+}
+
+/* ----------------------------------------------------------------
+ *		ExecFunctionScanInitializeWorker
+ *
+ *		Attach worker to DSM space for function scan statistics.
+ * ----------------------------------------------------------------
+ */
+void
+ExecFunctionScanInitializeWorker(FunctionScanState *node,
+								 ParallelWorkerContext *pwcxt)
+{
+	node->shared_info =
+		shm_toc_lookup(pwcxt->toc, node->ss.ps.plan->plan_node_id, true);
+}
+
+/* ----------------------------------------------------------------
+ *		ExecFunctionScanRetrieveInstrumentation
+ *
+ *		Transfer function scan statistics from DSM to private memory.
+ * ----------------------------------------------------------------
+ */
+void
+ExecFunctionScanRetrieveInstrumentation(FunctionScanState *node)
+{
+	Size		size;
+	SharedFunctionScanInfo *si;
+
+	if (node->shared_info == NULL)
+		return;
+
+	size = offsetof(SharedFunctionScanInfo, sinstrument)
+		+ node->shared_info->num_workers * sizeof(FunctionScanInstrumentation);
+	si = palloc(size);
+	memcpy(si, node->shared_info, size);
+	node->shared_info = si;
 }

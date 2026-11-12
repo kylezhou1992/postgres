@@ -4,7 +4,7 @@ MODULES = earthdistance
 
 EXTENSION = earthdistance
 DATA = earthdistance--1.1.sql earthdistance--1.0--1.1.sql \
-	earthdistance--unpackaged--1.0.sql
+	earthdistance--1.1--1.2.sql
 PGFILEDESC = "earthdistance - calculate distances on the surface of the Earth"
 
 REGRESS = earthdistance

@@ -8,34 +8,28 @@
 
 #include <limits.h>
 
-#include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "executor/spi.h"
 #include "mb/pg_wchar.h"
 #include "parser/parse_type.h"
-#include "utils/memutils.h"
-#include "utils/syscache.h"
-
-#include "plpython.h"
-
-#include "plpy_spi.h"
-
 #include "plpy_elog.h"
 #include "plpy_main.h"
 #include "plpy_planobject.h"
 #include "plpy_plpymodule.h"
-#include "plpy_procedure.h"
 #include "plpy_resultobject.h"
-
+#include "plpy_spi.h"
+#include "plpy_util.h"
+#include "utils/memutils.h"
 
 static PyObject *PLy_spi_execute_query(char *query, long limit);
 static PyObject *PLy_spi_execute_fetch_result(SPITupleTable *tuptable,
-							 uint64 rows, int status);
+											  uint64 rows, int status);
 static void PLy_spi_exception_set(PyObject *excclass, ErrorData *edata);
 
 
-/* prepare(query="select * from foo")
+/*
+ * prepare(query="select * from foo")
  * prepare(query="select * from foo where bar = $1", params=["text"])
  * prepare(query="select * from foo where bar = $1", params=["text"], limit=5)
  */
@@ -72,9 +66,8 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 	nargs = list ? PySequence_Length(list) : 0;
 
 	plan->nargs = nargs;
-	plan->types = nargs ? palloc0(sizeof(Oid) * nargs) : NULL;
-	plan->values = nargs ? palloc0(sizeof(Datum) * nargs) : NULL;
-	plan->args = nargs ? palloc0(sizeof(PLyObToDatum) * nargs) : NULL;
+	plan->types = nargs ? palloc0_array(Oid, nargs) : NULL;
+	plan->args = nargs ? palloc0_array(PLyObToDatum, nargs) : NULL;
 
 	MemoryContextSwitchTo(oldcontext);
 
@@ -94,9 +87,12 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 			int32		typmod;
 
 			optr = PySequence_GetItem(list, i);
-			if (PyString_Check(optr))
-				sptr = PyString_AsString(optr);
-			else if (PyUnicode_Check(optr))
+
+			/* PySequence_GetItem() can return NULL, with an exception set */
+			if (optr == NULL)
+				PLy_elog(ERROR, "could not get element %d from sequence", i);
+
+			if (PyUnicode_Check(optr))
 				sptr = PLyUnicode_AsString(optr);
 			else
 			{
@@ -111,7 +107,7 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 			 *information for input conversion.
 			 ********************************************************/
 
-			parseTypeString(sptr, &typeId, &typmod, false);
+			(void) parseTypeString(sptr, &typeId, &typmod, NULL);
 
 			Py_DECREF(optr);
 
@@ -153,7 +149,8 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 	return (PyObject *) plan;
 }
 
-/* execute(query="select * from foo", limit=5)
+/*
+ * execute(query="select * from foo", limit=5)
  * execute(plan=plan, values=(foo, bar), limit=5)
  */
 PyObject *
@@ -181,8 +178,7 @@ PyObject *
 PLy_spi_execute_plan(PyObject *ob, PyObject *list, long limit)
 {
 	volatile int nargs;
-	int			i,
-				rv;
+	int			rv;
 	PLyPlanObject *plan;
 	volatile MemoryContext oldcontext;
 	volatile ResourceOwner oldowner;
@@ -190,7 +186,7 @@ PLy_spi_execute_plan(PyObject *ob, PyObject *list, long limit)
 
 	if (list != NULL)
 	{
-		if (!PySequence_Check(list) || PyString_Check(list) || PyUnicode_Check(list))
+		if (!PySequence_Check(list) || PyUnicode_Check(list))
 		{
 			PLy_exception_set(PyExc_TypeError, "plpy.execute takes a sequence as its second argument");
 			return NULL;
@@ -209,7 +205,7 @@ PLy_spi_execute_plan(PyObject *ob, PyObject *list, long limit)
 
 		if (!so)
 			PLy_elog(ERROR, "could not execute plan");
-		sv = PyString_AsString(so);
+		sv = PLyUnicode_AsString(so);
 		PLy_exception_set_plural(PyExc_TypeError,
 								 "Expected sequence of %d argument, got %d: %s",
 								 "Expected sequence of %d arguments, got %d: %s",
@@ -228,13 +224,30 @@ PLy_spi_execute_plan(PyObject *ob, PyObject *list, long limit)
 	PG_TRY();
 	{
 		PLyExecutionContext *exec_ctx = PLy_current_execution_context();
+		MemoryContext tmpcontext;
+		Datum	   *volatile values;
 		char	   *volatile nulls;
 		volatile int j;
 
+		/*
+		 * Converted arguments and associated cruft will be in this context,
+		 * which is local to our subtransaction.
+		 */
+		tmpcontext = AllocSetContextCreate(CurTransactionContext,
+										   "PL/Python temporary context",
+										   ALLOCSET_SMALL_SIZES);
+		MemoryContextSwitchTo(tmpcontext);
+
 		if (nargs > 0)
-			nulls = palloc(nargs * sizeof(char));
+		{
+			values = palloc_array(Datum, nargs);
+			nulls = palloc_array(char, nargs);
+		}
 		else
+		{
+			values = NULL;
 			nulls = NULL;
+		}
 
 		for (j = 0; j < nargs; j++)
 		{
@@ -242,62 +255,41 @@ PLy_spi_execute_plan(PyObject *ob, PyObject *list, long limit)
 			PyObject   *elem;
 
 			elem = PySequence_GetItem(list, j);
-			PG_TRY();
+
+			/* PySequence_GetItem() can return NULL, with an exception set */
+			if (elem == NULL)
+				PLy_elog(ERROR, "could not get element %d from sequence", j);
+
+			PG_TRY(2);
 			{
 				bool		isnull;
 
-				plan->values[j] = PLy_output_convert(arg, elem, &isnull);
+				values[j] = PLy_output_convert(arg, elem, &isnull);
 				nulls[j] = isnull ? 'n' : ' ';
 			}
-			PG_CATCH();
+			PG_FINALLY(2);
 			{
 				Py_DECREF(elem);
-				PG_RE_THROW();
 			}
-			PG_END_TRY();
-			Py_DECREF(elem);
+			PG_END_TRY(2);
 		}
 
-		rv = SPI_execute_plan(plan->plan, plan->values, nulls,
+		MemoryContextSwitchTo(oldcontext);
+
+		rv = SPI_execute_plan(plan->plan, values, nulls,
 							  exec_ctx->curr_proc->fn_readonly, limit);
 		ret = PLy_spi_execute_fetch_result(SPI_tuptable, SPI_processed, rv);
 
-		if (nargs > 0)
-			pfree(nulls);
-
+		MemoryContextDelete(tmpcontext);
 		PLy_spi_subtransaction_commit(oldcontext, oldowner);
 	}
 	PG_CATCH();
 	{
-		int			k;
-
-		/*
-		 * cleanup plan->values array
-		 */
-		for (k = 0; k < nargs; k++)
-		{
-			if (!plan->args[k].typbyval &&
-				(plan->values[k] != PointerGetDatum(NULL)))
-			{
-				pfree(DatumGetPointer(plan->values[k]));
-				plan->values[k] = PointerGetDatum(NULL);
-			}
-		}
-
+		/* Subtransaction abort will remove the tmpcontext */
 		PLy_spi_subtransaction_abort(oldcontext, oldowner);
 		return NULL;
 	}
 	PG_END_TRY();
-
-	for (i = 0; i < nargs; i++)
-	{
-		if (!plan->args[i].typbyval &&
-			(plan->values[i] != PointerGetDatum(NULL)))
-		{
-			pfree(DatumGetPointer(plan->values[i]));
-			plan->values[i] = PointerGetDatum(NULL);
-		}
-	}
 
 	if (rv < 0)
 	{
@@ -366,7 +358,7 @@ PLy_spi_execute_fetch_result(SPITupleTable *tuptable, uint64 rows, int status)
 		return NULL;
 	}
 	Py_DECREF(result->status);
-	result->status = PyInt_FromLong(status);
+	result->status = PyLong_FromLong(status);
 
 	if (status > 0 && tuptable == NULL)
 	{
@@ -419,7 +411,8 @@ PLy_spi_execute_fetch_result(SPITupleTable *tuptable, uint64 rows, int status)
 					{
 						PyObject   *row = PLy_input_from_tuple(&ininfo,
 															   tuptable->vals[i],
-															   tuptable->tupdesc);
+															   tuptable->tupdesc,
+															   true);
 
 						PyList_SetItem(result->rows, i, row);
 					}
@@ -459,6 +452,100 @@ PLy_spi_execute_fetch_result(SPITupleTable *tuptable, uint64 rows, int status)
 	}
 
 	return (PyObject *) result;
+}
+
+PyObject *
+PLy_commit(PyObject *self, PyObject *args)
+{
+	MemoryContext oldcontext = CurrentMemoryContext;
+	PLyExecutionContext *exec_ctx = PLy_current_execution_context();
+
+	PG_TRY();
+	{
+		SPI_commit();
+
+		/* was cleared at transaction end, reset pointer */
+		exec_ctx->scratch_ctx = NULL;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+		PLyExceptionEntry *entry;
+		PyObject   *exc;
+
+		/* Save error info */
+		MemoryContextSwitchTo(oldcontext);
+		edata = CopyErrorData();
+		FlushErrorState();
+
+		/* was cleared at transaction end, reset pointer */
+		exec_ctx->scratch_ctx = NULL;
+
+		/* Look up the correct exception */
+		entry = hash_search(PLy_spi_exceptions, &(edata->sqlerrcode),
+							HASH_FIND, NULL);
+
+		/*
+		 * This could be a custom error code, if that's the case fallback to
+		 * SPIError
+		 */
+		exc = entry ? entry->exc : PLy_exc_spi_error;
+		/* Make Python raise the exception */
+		PLy_spi_exception_set(exc, edata);
+		FreeErrorData(edata);
+
+		return NULL;
+	}
+	PG_END_TRY();
+
+	Py_RETURN_NONE;
+}
+
+PyObject *
+PLy_rollback(PyObject *self, PyObject *args)
+{
+	MemoryContext oldcontext = CurrentMemoryContext;
+	PLyExecutionContext *exec_ctx = PLy_current_execution_context();
+
+	PG_TRY();
+	{
+		SPI_rollback();
+
+		/* was cleared at transaction end, reset pointer */
+		exec_ctx->scratch_ctx = NULL;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+		PLyExceptionEntry *entry;
+		PyObject   *exc;
+
+		/* Save error info */
+		MemoryContextSwitchTo(oldcontext);
+		edata = CopyErrorData();
+		FlushErrorState();
+
+		/* was cleared at transaction end, reset pointer */
+		exec_ctx->scratch_ctx = NULL;
+
+		/* Look up the correct exception */
+		entry = hash_search(PLy_spi_exceptions, &(edata->sqlerrcode),
+							HASH_FIND, NULL);
+
+		/*
+		 * This could be a custom error code, if that's the case fallback to
+		 * SPIError
+		 */
+		exc = entry ? entry->exc : PLy_exc_spi_error;
+		/* Make Python raise the exception */
+		PLy_spi_exception_set(exc, edata);
+		FreeErrorData(edata);
+
+		return NULL;
+	}
+	PG_END_TRY();
+
+	Py_RETURN_NONE;
 }
 
 /*

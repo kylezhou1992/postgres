@@ -3,7 +3,7 @@
  * tsginidx.c
  *	 GIN support functions for tsvector_ops
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -14,11 +14,10 @@
 #include "postgres.h"
 
 #include "access/gin.h"
-#include "access/stratnum.h"
-#include "miscadmin.h"
 #include "tsearch/ts_type.h"
 #include "tsearch/ts_utils.h"
 #include "utils/builtins.h"
+#include "varatt.h"
 
 
 Datum
@@ -74,7 +73,7 @@ gin_extract_tsvector(PG_FUNCTION_ARGS)
 		int			i;
 		WordEntry  *we = ARRPTR(vector);
 
-		entries = (Datum *) palloc(sizeof(Datum) * vector->size);
+		entries = palloc_array(Datum, vector->size);
 
 		for (i = 0; i < vector->size; i++)
 		{
@@ -96,12 +95,14 @@ gin_extract_tsquery(PG_FUNCTION_ARGS)
 {
 	TSQuery		query = PG_GETARG_TSQUERY(0);
 	int32	   *nentries = (int32 *) PG_GETARG_POINTER(1);
-
-	/* StrategyNumber strategy = PG_GETARG_UINT16(2); */
+#ifdef NOT_USED
+	StrategyNumber strategy = PG_GETARG_UINT16(2);
+#endif
 	bool	  **ptr_partialmatch = (bool **) PG_GETARG_POINTER(3);
 	Pointer   **extra_data = (Pointer **) PG_GETARG_POINTER(4);
-
-	/* bool   **nullFlags = (bool **) PG_GETARG_POINTER(5); */
+#ifdef NOT_USED
+	bool	  **nullFlags = (bool **) PG_GETARG_POINTER(5);
+#endif
 	int32	   *searchMode = (int32 *) PG_GETARG_POINTER(6);
 	Datum	   *entries = NULL;
 
@@ -134,16 +135,16 @@ gin_extract_tsquery(PG_FUNCTION_ARGS)
 		}
 		*nentries = j;
 
-		entries = (Datum *) palloc(sizeof(Datum) * j);
-		partialmatch = *ptr_partialmatch = (bool *) palloc(sizeof(bool) * j);
+		entries = palloc_array(Datum, j);
+		partialmatch = *ptr_partialmatch = palloc_array(bool, j);
 
 		/*
 		 * Make map to convert item's number to corresponding operand's (the
 		 * same, entry's) number. Entry's number is used in check array in
 		 * consistent method. We use the same map for each entry.
 		 */
-		*extra_data = (Pointer *) palloc(sizeof(Pointer) * j);
-		map_item_operand = (int *) palloc0(sizeof(int) * query->size);
+		*extra_data = palloc_array(Pointer, j);
+		map_item_operand = palloc0_array(int, query->size);
 
 		/* Now rescan the VAL items and fill in the arrays */
 		j = 0;
@@ -175,124 +176,53 @@ typedef struct
 	QueryItem  *first_item;
 	GinTernaryValue *check;
 	int		   *map_item_operand;
-	bool	   *need_recheck;
 } GinChkVal;
 
-static GinTernaryValue
-checkcondition_gin_internal(GinChkVal *gcv, QueryOperand *val, ExecPhraseData *data)
+/*
+ * TS_execute callback for matching a tsquery operand to GIN index data
+ */
+static TSTernaryValue
+checkcondition_gin(void *checkval, QueryOperand *val, ExecPhraseData *data)
 {
+	GinChkVal  *gcv = (GinChkVal *) checkval;
 	int			j;
-
-	/*
-	 * if any val requiring a weight is used or caller needs position
-	 * information then set recheck flag
-	 */
-	if (val->weight != 0 || data != NULL)
-		*(gcv->need_recheck) = true;
+	GinTernaryValue result;
 
 	/* convert item's number to corresponding entry's (operand's) number */
 	j = gcv->map_item_operand[((QueryItem *) val) - gcv->first_item];
 
-	/* return presence of current entry in indexed value */
-	return gcv->check[j];
-}
+	/* determine presence of current entry in indexed value */
+	result = gcv->check[j];
 
-/*
- * Wrapper of check condition function for TS_execute.
- */
-static bool
-checkcondition_gin(void *checkval, QueryOperand *val, ExecPhraseData *data)
-{
-	return checkcondition_gin_internal((GinChkVal *) checkval,
-									   val,
-									   data) != GIN_FALSE;
-}
-
-/*
- * Evaluate tsquery boolean expression using ternary logic.
- */
-static GinTernaryValue
-TS_execute_ternary(GinChkVal *gcv, QueryItem *curitem, bool in_phrase)
-{
-	GinTernaryValue val1,
-				val2,
-				result;
-
-	/* since this function recurses, it could be driven to stack overflow */
-	check_stack_depth();
-
-	if (curitem->type == QI_VAL)
-		return
-			checkcondition_gin_internal(gcv,
-										(QueryOperand *) curitem,
-										NULL /* don't have position info */ );
-
-	switch (curitem->qoperator.oper)
+	/*
+	 * If any val requiring a weight is used or caller needs position
+	 * information then we must recheck, so replace TRUE with MAYBE.
+	 */
+	if (result == GIN_TRUE)
 	{
-		case OP_NOT:
-			/* In phrase search, always return MAYBE since we lack positions */
-			if (in_phrase)
-				return GIN_MAYBE;
-			result = TS_execute_ternary(gcv, curitem + 1, in_phrase);
-			if (result == GIN_MAYBE)
-				return result;
-			return !result;
-
-		case OP_PHRASE:
-
-			/*
-			 * GIN doesn't contain any information about positions, so treat
-			 * OP_PHRASE as OP_AND with recheck requirement
-			 */
-			*(gcv->need_recheck) = true;
-			/* Pass down in_phrase == true in case there's a NOT below */
-			in_phrase = true;
-
-			/* FALL THRU */
-
-		case OP_AND:
-			val1 = TS_execute_ternary(gcv, curitem + curitem->qoperator.left,
-									  in_phrase);
-			if (val1 == GIN_FALSE)
-				return GIN_FALSE;
-			val2 = TS_execute_ternary(gcv, curitem + 1, in_phrase);
-			if (val2 == GIN_FALSE)
-				return GIN_FALSE;
-			if (val1 == GIN_TRUE && val2 == GIN_TRUE)
-				return GIN_TRUE;
-			else
-				return GIN_MAYBE;
-
-		case OP_OR:
-			val1 = TS_execute_ternary(gcv, curitem + curitem->qoperator.left,
-									  in_phrase);
-			if (val1 == GIN_TRUE)
-				return GIN_TRUE;
-			val2 = TS_execute_ternary(gcv, curitem + 1, in_phrase);
-			if (val2 == GIN_TRUE)
-				return GIN_TRUE;
-			if (val1 == GIN_FALSE && val2 == GIN_FALSE)
-				return GIN_FALSE;
-			else
-				return GIN_MAYBE;
-
-		default:
-			elog(ERROR, "unrecognized operator: %d", curitem->qoperator.oper);
+		if (val->weight != 0 || data != NULL)
+			result = GIN_MAYBE;
 	}
 
-	/* not reachable, but keep compiler quiet */
-	return false;
+	/*
+	 * We rely on GinTernaryValue and TSTernaryValue using equivalent value
+	 * assignments.  We could use a switch statement to map the values if that
+	 * ever stops being true, but it seems unlikely to happen.
+	 */
+	return (TSTernaryValue) result;
 }
 
 Datum
 gin_tsquery_consistent(PG_FUNCTION_ARGS)
 {
 	bool	   *check = (bool *) PG_GETARG_POINTER(0);
-
-	/* StrategyNumber strategy = PG_GETARG_UINT16(1); */
+#ifdef NOT_USED
+	StrategyNumber strategy = PG_GETARG_UINT16(1);
+#endif
 	TSQuery		query = PG_GETARG_TSQUERY(2);
-
-	/* int32	nkeys = PG_GETARG_INT32(3); */
+#ifdef NOT_USED
+	int32		nkeys = PG_GETARG_INT32(3);
+#endif
 	Pointer    *extra_data = (Pointer *) PG_GETARG_POINTER(4);
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(5);
 	bool		res = false;
@@ -309,16 +239,25 @@ gin_tsquery_consistent(PG_FUNCTION_ARGS)
 		 * query.
 		 */
 		gcv.first_item = GETQUERY(query);
-		StaticAssertStmt(sizeof(GinTernaryValue) == sizeof(bool),
-						 "sizes of GinTernaryValue and bool are not equal");
 		gcv.check = (GinTernaryValue *) check;
 		gcv.map_item_operand = (int *) (extra_data[0]);
-		gcv.need_recheck = recheck;
 
-		res = TS_execute(GETQUERY(query),
-						 &gcv,
-						 TS_EXEC_CALC_NOT | TS_EXEC_PHRASE_NO_POS,
-						 checkcondition_gin);
+		switch (TS_execute_ternary(GETQUERY(query),
+								   &gcv,
+								   TS_EXEC_PHRASE_NO_POS,
+								   checkcondition_gin))
+		{
+			case TS_NO:
+				res = false;
+				break;
+			case TS_YES:
+				res = true;
+				break;
+			case TS_MAYBE:
+				res = true;
+				*recheck = true;
+				break;
+		}
 	}
 
 	PG_RETURN_BOOL(res);
@@ -328,17 +267,15 @@ Datum
 gin_tsquery_triconsistent(PG_FUNCTION_ARGS)
 {
 	GinTernaryValue *check = (GinTernaryValue *) PG_GETARG_POINTER(0);
-
-	/* StrategyNumber strategy = PG_GETARG_UINT16(1); */
+#ifdef NOT_USED
+	StrategyNumber strategy = PG_GETARG_UINT16(1);
+#endif
 	TSQuery		query = PG_GETARG_TSQUERY(2);
-
-	/* int32	nkeys = PG_GETARG_INT32(3); */
+#ifdef NOT_USED
+	int32		nkeys = PG_GETARG_INT32(3);
+#endif
 	Pointer    *extra_data = (Pointer *) PG_GETARG_POINTER(4);
 	GinTernaryValue res = GIN_FALSE;
-	bool		recheck;
-
-	/* Initially assume query doesn't require recheck */
-	recheck = false;
 
 	if (query->size > 0)
 	{
@@ -351,12 +288,11 @@ gin_tsquery_triconsistent(PG_FUNCTION_ARGS)
 		gcv.first_item = GETQUERY(query);
 		gcv.check = check;
 		gcv.map_item_operand = (int *) (extra_data[0]);
-		gcv.need_recheck = &recheck;
 
-		res = TS_execute_ternary(&gcv, GETQUERY(query), false);
-
-		if (res == GIN_TRUE && recheck)
-			res = GIN_MAYBE;
+		res = TS_execute_ternary(GETQUERY(query),
+								 &gcv,
+								 TS_EXEC_PHRASE_NO_POS,
+								 checkcondition_gin);
 	}
 
 	PG_RETURN_GIN_TERNARY_VALUE(res);

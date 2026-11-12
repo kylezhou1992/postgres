@@ -1,4 +1,5 @@
-/* ----------
+/*-------------------------------------------------------------------------
+ *
  * ri_triggers.c
  *
  *	Generic trigger procedures for referential integrity constraint
@@ -13,55 +14,57 @@
  *	plan --- consider improving this someday.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * src/backend/utils/adt/ri_triggers.c
  *
- * ----------
- */
-
-
-/* ----------
- * Internal TODO:
- *
- *		Add MATCH PARTIAL logic.
- * ----------
+ *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/htup_details.h"
+#include "access/skey.h"
 #include "access/sysattr.h"
+#include "access/table.h"
+#include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/index.h"
+#include "catalog/namespace.h"
+#include "catalog/objectaccess.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
-#include "catalog/pg_operator.h"
-#include "catalog/pg_type.h"
+#include "catalog/pg_index.h"
+#include "catalog/pg_namespace.h"
+#include "catalog/pg_proc.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "lib/ilist.h"
+#include "miscadmin.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_relation.h"
-#include "miscadmin.h"
-#include "storage/bufmgr.h"
+#include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
+#include "utils/hsearch.h"
+#include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/rls.h"
+#include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
-#include "utils/tqual.h"
 
-
-/* ----------
+/*
  * Local definitions
- * ----------
  */
 
 #define RI_MAX_NUMKEYS					INDEX_MAX_KEYS
@@ -79,11 +82,15 @@
 #define RI_PLAN_CHECK_LOOKUPPK_FROM_PK	2
 #define RI_PLAN_LAST_ON_PK				RI_PLAN_CHECK_LOOKUPPK_FROM_PK
 /* these queries are executed against the FK (referencing) table: */
-#define RI_PLAN_CASCADE_DEL_DODELETE	3
-#define RI_PLAN_CASCADE_UPD_DOUPDATE	4
-#define RI_PLAN_RESTRICT_CHECKREF		5
-#define RI_PLAN_SETNULL_DOUPDATE		6
-#define RI_PLAN_SETDEFAULT_DOUPDATE		7
+#define RI_PLAN_CASCADE_ONDELETE		3
+#define RI_PLAN_CASCADE_ONUPDATE		4
+#define RI_PLAN_NO_ACTION				5
+/* For RESTRICT, the same plan can be used for both ON DELETE and ON UPDATE triggers. */
+#define RI_PLAN_RESTRICT				6
+#define RI_PLAN_SETNULL_ONDELETE		7
+#define RI_PLAN_SETNULL_ONUPDATE		8
+#define RI_PLAN_SETDEFAULT_ONDELETE		9
+#define RI_PLAN_SETDEFAULT_ONUPDATE		10
 
 #define MAX_QUOTED_NAME_LEN  (NAMEDATALEN*2+3)
 #define MAX_QUOTED_REL_NAME_LEN  (MAX_QUOTED_NAME_LEN*2)
@@ -96,40 +103,80 @@
 #define RI_TRIGTYPE_UPDATE 2
 #define RI_TRIGTYPE_DELETE 3
 
+typedef struct FastPathMeta FastPathMeta;
 
-/* ----------
+/* Eligibility checks that require the referenced table and index to be open. */
+typedef enum RI_FastPathState
+{
+	RI_FASTPATH_UNKNOWN,
+	RI_FASTPATH_USABLE,
+	RI_FASTPATH_UNUSABLE
+} RI_FastPathState;
+
+/*
  * RI_ConstraintInfo
  *
- *	Information extracted from an FK pg_constraint entry.  This is cached in
- *	ri_constraint_cache.
- * ----------
+ * Information extracted from an FK pg_constraint entry.  This is cached in
+ * ri_constraint_cache.
+ *
+ * Note that pf/pp/ff_eq_oprs may hold the overlaps operator instead of equals
+ * for the PERIOD part of a temporal foreign key.
  */
 typedef struct RI_ConstraintInfo
 {
 	Oid			constraint_id;	/* OID of pg_constraint entry (hash key) */
 	bool		valid;			/* successfully initialized? */
-	uint32		oidHashValue;	/* hash value of pg_constraint OID */
+	Oid			constraint_root_id; /* OID of topmost ancestor constraint;
+									 * same as constraint_id if not inherited */
+	uint32		oidHashValue;	/* hash value of constraint_id */
+	uint32		rootHashValue;	/* hash value of constraint_root_id */
 	NameData	conname;		/* name of the FK constraint */
 	Oid			pk_relid;		/* referenced relation */
 	Oid			fk_relid;		/* referencing relation */
 	char		confupdtype;	/* foreign key's ON UPDATE action */
 	char		confdeltype;	/* foreign key's ON DELETE action */
+	int			ndelsetcols;	/* number of columns referenced in ON DELETE
+								 * SET clause */
+	int16		confdelsetcols[RI_MAX_NUMKEYS]; /* attnums of cols to set on
+												 * delete */
 	char		confmatchtype;	/* foreign key's match type */
+	bool		hasperiod;		/* if the foreign key uses PERIOD */
 	int			nkeys;			/* number of key columns */
 	int16		pk_attnums[RI_MAX_NUMKEYS]; /* attnums of referenced cols */
 	int16		fk_attnums[RI_MAX_NUMKEYS]; /* attnums of referencing cols */
 	Oid			pf_eq_oprs[RI_MAX_NUMKEYS]; /* equality operators (PK = FK) */
 	Oid			pp_eq_oprs[RI_MAX_NUMKEYS]; /* equality operators (PK = PK) */
 	Oid			ff_eq_oprs[RI_MAX_NUMKEYS]; /* equality operators (FK = FK) */
+	Oid			period_contained_by_oper;	/* anyrange <@ anyrange (or
+											 * multiranges) */
+	Oid			agged_period_contained_by_oper; /* fkattr <@ range_agg(pkattr) */
+	Oid			period_intersect_oper;	/* anyrange * anyrange (or
+										 * multiranges) */
 	dlist_node	valid_link;		/* Link in list of valid entries */
+
+	Oid			conindid;
+	bool		pk_is_partitioned;
+	RI_FastPathState fastpath_state;	/* populated lazily under lock */
+
+	FastPathMeta *fpmeta;
 } RI_ConstraintInfo;
 
+/* Fast-path metadata for RI checks on foreign key referencing tables */
+typedef struct FastPathMeta
+{
+	RegProcedure regops[RI_MAX_NUMKEYS];
+	Oid			subtypes[RI_MAX_NUMKEYS];
+	int			strats[RI_MAX_NUMKEYS];
+	AttrNumber	index_attnos[RI_MAX_NUMKEYS];	/* index column positions */
 
-/* ----------
+	/* Link in ri_fpmeta_dead_list while awaiting deferred release */
+	struct FastPathMeta *next_dead;
+} FastPathMeta;
+
+/*
  * RI_QueryKey
  *
- *	The key identifying a prepared SPI plan in our query hashtable
- * ----------
+ * The key identifying a prepared SPI plan in our query hashtable
  */
 typedef struct RI_QueryKey
 {
@@ -137,10 +184,8 @@ typedef struct RI_QueryKey
 	int32		constr_queryno; /* query type ID, see RI_PLAN_XXX above */
 } RI_QueryKey;
 
-
-/* ----------
+/*
  * RI_QueryHashEntry
- * ----------
  */
 typedef struct RI_QueryHashEntry
 {
@@ -148,12 +193,10 @@ typedef struct RI_QueryHashEntry
 	SPIPlanPtr	plan;
 } RI_QueryHashEntry;
 
-
-/* ----------
+/*
  * RI_CompareKey
  *
- *	The key identifying an entry showing how to compare two values
- * ----------
+ * The key identifying an entry showing how to compare two values
  */
 typedef struct RI_CompareKey
 {
@@ -161,10 +204,8 @@ typedef struct RI_CompareKey
 	Oid			typeid;			/* the data type to apply it to */
 } RI_CompareKey;
 
-
-/* ----------
+/*
  * RI_CompareHashEntry
- * ----------
  */
 typedef struct RI_CompareHashEntry
 {
@@ -174,108 +215,147 @@ typedef struct RI_CompareHashEntry
 	FmgrInfo	cast_func_finfo;	/* in case we must coerce input */
 } RI_CompareHashEntry;
 
-
-/* ----------
+/*
  * Local data
- * ----------
  */
 static HTAB *ri_constraint_cache = NULL;
 static HTAB *ri_query_cache = NULL;
 static HTAB *ri_compare_cache = NULL;
-static dlist_head ri_constraint_cache_valid_list;
-static int	ri_constraint_cache_valid_count = 0;
+static dclist_head ri_constraint_cache_valid_list;
 
+/*
+ * FastPathMeta objects detached from their cache entry by invalidation, but
+ * possibly still referenced by an RI check further up the stack.  Released
+ * by AtEOXact_RI(), where no such reference can exist.  See
+ * InvalidateConstraintCacheCallBack().
+ */
+static FastPathMeta *ri_fpmeta_dead_list = NULL;
 
-/* ----------
+/*
+ * Stack of the plans being executed by ri_PerformCheck() calls currently
+ * running, i.e. RI queries whose SPI_execute_snapshot() has not returned.
+ * Innermost of those appears last in the array.  A plan that
+ * ri_FetchPreparedPlan() finds invalid cannot be freed while it is on this
+ * stack.  It instead goes on ri_plan_dead_list and is freed by
+ * ri_FreeDeadPlans() once it is no longer on the stack, which is checked
+ * whenever a check finishes normally, or by AtEOXact_RI() at the latest.
+ * Both live in TopMemoryContext.
+ *
+ * ri_PerformCheck() pops its plan whether the query returns or an error
+ * is thrown, by restoring the depth it saw at push time, so the stack is
+ * exact at all times.  A plan on the stack is never freed until the stack
+ * is cut back past it, so no entry can dangle.
+ */
+static SPIPlanPtr *ri_executing_plans = NULL;
+static int	ri_executing_depth = 0;
+static int	ri_executing_maxdepth = 0;
+static List *ri_plan_dead_list = NIL;
+
+/*
  * Local function prototypes
- * ----------
  */
 static bool ri_Check_Pk_Match(Relation pk_rel, Relation fk_rel,
-				  HeapTuple old_row,
-				  const RI_ConstraintInfo *riinfo);
+							  TupleTableSlot *oldslot,
+							  const RI_ConstraintInfo *riinfo);
 static Datum ri_restrict(TriggerData *trigdata, bool is_no_action);
-static Datum ri_setnull(TriggerData *trigdata);
-static Datum ri_setdefault(TriggerData *trigdata);
+static Datum ri_set(TriggerData *trigdata, bool is_set_null, int tgkind);
 static void quoteOneName(char *buffer, const char *name);
 static void quoteRelationName(char *buffer, Relation rel);
 static void ri_GenerateQual(StringInfo buf,
-				const char *sep,
-				const char *leftop, Oid leftoptype,
-				Oid opoid,
-				const char *rightop, Oid rightoptype);
+							const char *sep,
+							const char *leftop, Oid leftoptype,
+							Oid opoid,
+							const char *rightop, Oid rightoptype);
 static void ri_GenerateQualCollation(StringInfo buf, Oid collation);
-static int ri_NullCheck(TupleDesc tupdesc, HeapTuple tup,
-			 const RI_ConstraintInfo *riinfo, bool rel_is_pk);
+static int	ri_NullCheck(TupleDesc tupDesc, TupleTableSlot *slot,
+						 const RI_ConstraintInfo *riinfo, bool rel_is_pk);
 static void ri_BuildQueryKey(RI_QueryKey *key,
-				 const RI_ConstraintInfo *riinfo,
-				 int32 constr_queryno);
-static bool ri_KeysEqual(Relation rel, HeapTuple oldtup, HeapTuple newtup,
-			 const RI_ConstraintInfo *riinfo, bool rel_is_pk);
-static bool ri_AttributesEqual(Oid eq_opr, Oid typeid,
-				   Datum oldvalue, Datum newvalue);
+							 const RI_ConstraintInfo *riinfo,
+							 int32 constr_queryno);
+static bool ri_KeysEqual(Relation rel, TupleTableSlot *oldslot, TupleTableSlot *newslot,
+						 const RI_ConstraintInfo *riinfo, bool rel_is_pk);
+static bool ri_CompareWithCast(Oid eq_opr, Oid typeid, Oid collid,
+							   Datum lhs, Datum rhs);
 
 static void ri_InitHashTables(void);
-static void InvalidateConstraintCacheCallBack(Datum arg, int cacheid, uint32 hashvalue);
+static void InvalidateConstraintCacheCallBack(Datum arg, SysCacheIdentifier cacheid,
+											  uint32 hashvalue);
 static SPIPlanPtr ri_FetchPreparedPlan(RI_QueryKey *key);
 static void ri_HashPreparedPlan(RI_QueryKey *key, SPIPlanPtr plan);
+static int	ri_PushExecutingPlan(SPIPlanPtr plan);
+static bool ri_PlanIsExecuting(SPIPlanPtr plan);
+static void ri_FreeDeadPlans(void);
 static RI_CompareHashEntry *ri_HashCompareOp(Oid eq_opr, Oid typeid);
 
 static void ri_CheckTrigger(FunctionCallInfo fcinfo, const char *funcname,
-				int tgkind);
-static const RI_ConstraintInfo *ri_FetchConstraintInfo(Trigger *trigger,
-					   Relation trig_rel, bool rel_is_pk);
-static const RI_ConstraintInfo *ri_LoadConstraintInfo(Oid constraintOid);
-static SPIPlanPtr ri_PlanCheck(const char *querystr, int nargs, Oid *argtypes,
-			 RI_QueryKey *qkey, Relation fk_rel, Relation pk_rel,
-			 bool cache_plan);
+							int tgkind);
+static RI_ConstraintInfo *ri_FetchConstraintInfo(Trigger *trigger,
+												 Relation trig_rel, bool rel_is_pk);
+static RI_ConstraintInfo *ri_LoadConstraintInfo(Oid constraintOid);
+static Oid	get_ri_constraint_root(Oid constrOid);
+static SPIPlanPtr ri_PlanCheck(const char *querystr, int nargs, const Oid *argtypes,
+							   RI_QueryKey *qkey, Relation fk_rel, Relation pk_rel);
 static bool ri_PerformCheck(const RI_ConstraintInfo *riinfo,
-				RI_QueryKey *qkey, SPIPlanPtr qplan,
-				Relation fk_rel, Relation pk_rel,
-				HeapTuple old_tuple, HeapTuple new_tuple,
-				bool detectNewRows, int expect_OK);
-static void ri_ExtractValues(Relation rel, HeapTuple tup,
-				 const RI_ConstraintInfo *riinfo, bool rel_is_pk,
-				 Datum *vals, char *nulls);
-static void ri_ReportViolation(const RI_ConstraintInfo *riinfo,
-				   Relation pk_rel, Relation fk_rel,
-				   HeapTuple violator, TupleDesc tupdesc,
-				   int queryno) pg_attribute_noreturn();
+							RI_QueryKey *qkey, SPIPlanPtr qplan,
+							Relation fk_rel, Relation pk_rel,
+							TupleTableSlot *oldslot, TupleTableSlot *newslot,
+							bool is_restrict,
+							bool detectNewRows, int expect_OK);
+static bool ri_FastPathCheck(RI_ConstraintInfo *riinfo,
+							 Relation fk_rel, TupleTableSlot *newslot);
+static bool ri_FastPathProbeOne(Relation pk_rel, Relation idx_rel,
+								IndexScanDesc scandesc, TupleTableSlot *slot,
+								Snapshot snapshot, const RI_ConstraintInfo *riinfo,
+								ScanKeyData *skey, int nkeys);
+static bool ri_LockPKTuple(Relation pk_rel, TupleTableSlot *slot, Snapshot snap,
+						   bool *concurrently_updated);
+static bool ri_fastpath_is_applicable(const RI_ConstraintInfo *riinfo);
+static bool ri_check_fastpath_index(RI_ConstraintInfo *riinfo,
+									Relation fk_rel, Relation pk_rel,
+									Relation idx_rel);
+static void ri_CheckPermissions(const RI_ConstraintInfo *riinfo,
+								Relation query_rel);
+static bool recheck_matched_pk_tuple(Relation idxrel, ScanKeyData *skeys,
+									 int nkeys, TupleTableSlot *new_slot);
+static void ri_CheckFunctionPermissions(const RI_ConstraintInfo *riinfo,
+										const FastPathMeta *fpmeta);
+static void build_index_scankeys(const RI_ConstraintInfo *riinfo,
+								 const FastPathMeta *fpmeta,
+								 Relation idx_rel, const Datum *pk_vals,
+								 ScanKey skeys);
+static void ri_populate_fastpath_metadata(RI_ConstraintInfo *riinfo,
+										  Relation idx_rel);
+static void ri_ExtractValues(Relation rel, TupleTableSlot *slot,
+							 const RI_ConstraintInfo *riinfo, bool rel_is_pk,
+							 Datum *vals, char *nulls);
+pg_noreturn static void ri_ReportViolation(const RI_ConstraintInfo *riinfo,
+										   Relation pk_rel, Relation fk_rel,
+										   TupleTableSlot *violatorslot, TupleDesc tupdesc,
+										   int queryno, bool is_restrict, bool partgone);
 
 
-/* ----------
+/*
  * RI_FKey_check -
  *
- *	Check foreign key existence (combined for INSERT and UPDATE).
- * ----------
+ * Check foreign key existence (combined for INSERT and UPDATE).
  */
 static Datum
 RI_FKey_check(TriggerData *trigdata)
 {
-	const RI_ConstraintInfo *riinfo;
+	RI_ConstraintInfo *riinfo;
 	Relation	fk_rel;
 	Relation	pk_rel;
-	HeapTuple	new_row;
-	Buffer		new_row_buf;
+	TupleTableSlot *newslot;
 	RI_QueryKey qkey;
 	SPIPlanPtr	qplan;
-	int			i;
 
-	/*
-	 * Get arguments.
-	 */
 	riinfo = ri_FetchConstraintInfo(trigdata->tg_trigger,
 									trigdata->tg_relation, false);
 
 	if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
-	{
-		new_row = trigdata->tg_newtuple;
-		new_row_buf = trigdata->tg_newtuplebuf;
-	}
+		newslot = trigdata->tg_newslot;
 	else
-	{
-		new_row = trigdata->tg_trigtuple;
-		new_row_buf = trigdata->tg_trigtuplebuf;
-	}
+		newslot = trigdata->tg_trigslot;
 
 	/*
 	 * We should not even consider checking the row if it is no longer valid,
@@ -285,29 +365,12 @@ RI_FKey_check(TriggerData *trigdata)
 	 * and lock on the buffer to call HeapTupleSatisfiesVisibility.  Caller
 	 * should be holding pin, but not lock.
 	 */
-	LockBuffer(new_row_buf, BUFFER_LOCK_SHARE);
-	if (!HeapTupleSatisfiesVisibility(new_row, SnapshotSelf, new_row_buf))
-	{
-		LockBuffer(new_row_buf, BUFFER_LOCK_UNLOCK);
+	if (!table_tuple_satisfies_snapshot(trigdata->tg_relation, newslot, SnapshotSelf))
 		return PointerGetDatum(NULL);
-	}
-	LockBuffer(new_row_buf, BUFFER_LOCK_UNLOCK);
 
-	/*
-	 * Get the relation descriptors of the FK and PK tables.
-	 *
-	 * pk_rel is opened in RowShareLock mode since that's what our eventual
-	 * SELECT FOR KEY SHARE will get on it.
-	 */
 	fk_rel = trigdata->tg_relation;
-	pk_rel = heap_open(riinfo->pk_relid, RowShareLock);
 
-	if (riinfo->confmatchtype == FKCONSTR_MATCH_PARTIAL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("MATCH PARTIAL not yet implemented")));
-
-	switch (ri_NullCheck(RelationGetDescr(fk_rel), new_row, riinfo, false))
+	switch (ri_NullCheck(RelationGetDescr(fk_rel), newslot, riinfo, false))
 	{
 		case RI_KEYS_ALL_NULL:
 
@@ -315,7 +378,6 @@ RI_FKey_check(TriggerData *trigdata)
 			 * No further check needed - an all-NULL key passes every type of
 			 * foreign key constraint.
 			 */
-			heap_close(pk_rel, RowShareLock);
 			return PointerGetDatum(NULL);
 
 		case RI_KEYS_SOME_NULL:
@@ -340,7 +402,6 @@ RI_FKey_check(TriggerData *trigdata)
 							 errdetail("MATCH FULL does not allow mixing of null and nonnull key values."),
 							 errtableconstraint(fk_rel,
 												NameStr(riinfo->conname))));
-					heap_close(pk_rel, RowShareLock);
 					return PointerGetDatum(NULL);
 
 				case FKCONSTR_MATCH_SIMPLE:
@@ -349,9 +410,9 @@ RI_FKey_check(TriggerData *trigdata)
 					 * MATCH SIMPLE - if ANY column is null, the key passes
 					 * the constraint.
 					 */
-					heap_close(pk_rel, RowShareLock);
 					return PointerGetDatum(NULL);
 
+#ifdef NOT_USED
 				case FKCONSTR_MATCH_PARTIAL:
 
 					/*
@@ -360,16 +421,8 @@ RI_FKey_check(TriggerData *trigdata)
 					 * to only include non-null columns, or by writing a
 					 * special version here)
 					 */
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("MATCH PARTIAL not yet implemented")));
-					heap_close(pk_rel, RowShareLock);
-					return PointerGetDatum(NULL);
-
-				default:
-					elog(ERROR, "unrecognized confmatchtype: %d",
-						 riinfo->confmatchtype);
 					break;
+#endif
 			}
 
 		case RI_KEYS_NONE_NULL:
@@ -381,12 +434,32 @@ RI_FKey_check(TriggerData *trigdata)
 			break;
 	}
 
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed");
+	/*
+	 * Fast path: probe the PK unique index directly, bypassing SPI.
+	 *
+	 * For non-partitioned, non-temporal FKs, we can skip the SPI machinery
+	 * (plan cache, executor setup, etc.) and do a direct index scan + tuple
+	 * lock.  This is semantically equivalent to the SPI path below but avoids
+	 * the per-row executor overhead.
+	 *
+	 * ri_FastPathCheck() reports the violation itself if no matching PK row
+	 * is found.  It returns false if the checks made after opening the
+	 * relations, on the index and on whether the FK values need a coercion to
+	 * reach the equality operator's input type, require a SPI fallback.
+	 */
+	if (ri_fastpath_is_applicable(riinfo) &&
+		ri_FastPathCheck(riinfo, fk_rel, newslot))
+		return PointerGetDatum(NULL);
+
+	SPI_connect();
 
 	/*
-	 * Fetch or prepare a saved plan for the real check
+	 * pk_rel is opened in RowShareLock mode since that's what our eventual
+	 * SELECT FOR KEY SHARE will get on it.
 	 */
+	pk_rel = table_open(riinfo->pk_relid, RowShareLock);
+
+	/* Fetch or prepare a saved plan for the real check */
 	ri_BuildQueryKey(&qkey, riinfo, RI_PLAN_CHECK_LOOKUPPK);
 
 	if ((qplan = ri_FetchPreparedPlan(&qkey)) == NULL)
@@ -397,20 +470,51 @@ RI_FKey_check(TriggerData *trigdata)
 		char		paramname[16];
 		const char *querysep;
 		Oid			queryoids[RI_MAX_NUMKEYS];
+		const char *pk_only;
 
 		/* ----------
 		 * The query string built is
-		 *	SELECT 1 FROM ONLY <pktable> x WHERE pkatt1 = $1 [AND ...]
+		 *	SELECT 1 FROM [ONLY] <pktable> x WHERE pkatt1 = $1 [AND ...]
 		 *		   FOR KEY SHARE OF x
 		 * The type id's for the $ parameters are those of the
 		 * corresponding FK attributes.
+		 *
+		 * But for temporal FKs we need to make sure
+		 * the FK's range is completely covered.
+		 * So we use this query instead:
+		 *  SELECT 1
+		 *	FROM	(
+		 *		SELECT pkperiodatt AS r
+		 *		FROM   [ONLY] pktable x
+		 *		WHERE  pkatt1 = $1 [AND ...]
+		 *		AND    pkperiodatt && $n
+		 *		FOR KEY SHARE OF x
+		 *	) x1
+		 *  HAVING $n <@ range_agg(x1.r)
+		 * Note if FOR KEY SHARE ever allows GROUP BY and HAVING
+		 * we can make this a bit simpler.
 		 * ----------
 		 */
 		initStringInfo(&querybuf);
+		pk_only = pk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
+			"" : "ONLY ";
 		quoteRelationName(pkrelname, pk_rel);
-		appendStringInfo(&querybuf, "SELECT 1 FROM ONLY %s x", pkrelname);
+		if (riinfo->hasperiod)
+		{
+			quoteOneName(attname,
+						 RIAttName(pk_rel, riinfo->pk_attnums[riinfo->nkeys - 1]));
+
+			appendStringInfo(&querybuf,
+							 "SELECT 1 FROM (SELECT %s AS r FROM %s%s x",
+							 attname, pk_only, pkrelname);
+		}
+		else
+		{
+			appendStringInfo(&querybuf, "SELECT 1 FROM %s%s x",
+							 pk_only, pkrelname);
+		}
 		querysep = "WHERE";
-		for (i = 0; i < riinfo->nkeys; i++)
+		for (int i = 0; i < riinfo->nkeys; i++)
 		{
 			Oid			pk_type = RIAttType(pk_rel, riinfo->pk_attnums[i]);
 			Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[i]);
@@ -426,98 +530,102 @@ RI_FKey_check(TriggerData *trigdata)
 			queryoids[i] = fk_type;
 		}
 		appendStringInfoString(&querybuf, " FOR KEY SHARE OF x");
+		if (riinfo->hasperiod)
+		{
+			Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[riinfo->nkeys - 1]);
+
+			appendStringInfoString(&querybuf, ") x1 HAVING ");
+			sprintf(paramname, "$%d", riinfo->nkeys);
+			ri_GenerateQual(&querybuf, "",
+							paramname, fk_type,
+							riinfo->agged_period_contained_by_oper,
+							"pg_catalog.range_agg", ANYMULTIRANGEOID);
+			appendStringInfoString(&querybuf, "(x1.r)");
+		}
 
 		/* Prepare and save the plan */
 		qplan = ri_PlanCheck(querybuf.data, riinfo->nkeys, queryoids,
-							 &qkey, fk_rel, pk_rel, true);
+							 &qkey, fk_rel, pk_rel);
 	}
 
 	/*
 	 * Now check that foreign key exists in PK table
+	 *
+	 * XXX detectNewRows must be true when a partitioned table is on the
+	 * referenced side.  The reason is that our snapshot must be fresh in
+	 * order for the hack in find_inheritance_children() to work.
 	 */
 	ri_PerformCheck(riinfo, &qkey, qplan,
 					fk_rel, pk_rel,
-					NULL, new_row,
+					NULL, newslot,
 					false,
+					pk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE,
 					SPI_OK_SELECT);
 
 	if (SPI_finish() != SPI_OK_FINISH)
 		elog(ERROR, "SPI_finish failed");
 
-	heap_close(pk_rel, RowShareLock);
+	table_close(pk_rel, RowShareLock);
 
 	return PointerGetDatum(NULL);
 }
 
 
-/* ----------
+/*
  * RI_FKey_check_ins -
  *
- *	Check foreign key existence at insert event on FK table.
- * ----------
+ * Check foreign key existence at insert event on FK table.
  */
 Datum
 RI_FKey_check_ins(PG_FUNCTION_ARGS)
 {
-	/*
-	 * Check that this is a valid trigger call on the right time and event.
-	 */
+	/* Check that this is a valid trigger call on the right time and event. */
 	ri_CheckTrigger(fcinfo, "RI_FKey_check_ins", RI_TRIGTYPE_INSERT);
 
-	/*
-	 * Share code with UPDATE case.
-	 */
+	/* Share code with UPDATE case. */
 	return RI_FKey_check((TriggerData *) fcinfo->context);
 }
 
 
-/* ----------
+/*
  * RI_FKey_check_upd -
  *
- *	Check foreign key existence at update event on FK table.
- * ----------
+ * Check foreign key existence at update event on FK table.
  */
 Datum
 RI_FKey_check_upd(PG_FUNCTION_ARGS)
 {
-	/*
-	 * Check that this is a valid trigger call on the right time and event.
-	 */
+	/* Check that this is a valid trigger call on the right time and event. */
 	ri_CheckTrigger(fcinfo, "RI_FKey_check_upd", RI_TRIGTYPE_UPDATE);
 
-	/*
-	 * Share code with INSERT case.
-	 */
+	/* Share code with INSERT case. */
 	return RI_FKey_check((TriggerData *) fcinfo->context);
 }
 
 
-/* ----------
+/*
  * ri_Check_Pk_Match
  *
  * Check to see if another PK row has been created that provides the same
- * key values as the "old_row" that's been modified or deleted in our trigger
+ * key values as the "oldslot" that's been modified or deleted in our trigger
  * event.  Returns true if a match is found in the PK table.
  *
- * We assume the caller checked that the old_row contains no NULL key values,
+ * We assume the caller checked that the oldslot contains no NULL key values,
  * since otherwise a match is impossible.
- * ----------
  */
 static bool
 ri_Check_Pk_Match(Relation pk_rel, Relation fk_rel,
-				  HeapTuple old_row,
+				  TupleTableSlot *oldslot,
 				  const RI_ConstraintInfo *riinfo)
 {
 	SPIPlanPtr	qplan;
 	RI_QueryKey qkey;
-	int			i;
 	bool		result;
 
 	/* Only called for non-null rows */
-	Assert(ri_NullCheck(RelationGetDescr(pk_rel), old_row, riinfo, true) == RI_KEYS_NONE_NULL);
+	Assert(ri_NullCheck(RelationGetDescr(pk_rel), oldslot, riinfo, true) == RI_KEYS_NONE_NULL);
 
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed");
+	SPI_connect();
 
 	/*
 	 * Fetch or prepare a saved plan for checking PK table with values coming
@@ -532,21 +640,51 @@ ri_Check_Pk_Match(Relation pk_rel, Relation fk_rel,
 		char		attname[MAX_QUOTED_NAME_LEN];
 		char		paramname[16];
 		const char *querysep;
+		const char *pk_only;
 		Oid			queryoids[RI_MAX_NUMKEYS];
 
 		/* ----------
 		 * The query string built is
-		 *	SELECT 1 FROM ONLY <pktable> x WHERE pkatt1 = $1 [AND ...]
+		 *	SELECT 1 FROM [ONLY] <pktable> x WHERE pkatt1 = $1 [AND ...]
 		 *		   FOR KEY SHARE OF x
 		 * The type id's for the $ parameters are those of the
 		 * PK attributes themselves.
+		 *
+		 * But for temporal FKs we need to make sure
+		 * the old PK's range is completely covered.
+		 * So we use this query instead:
+		 *  SELECT 1
+		 *  FROM    (
+		 *	  SELECT pkperiodatt AS r
+		 *	  FROM   [ONLY] pktable x
+		 *	  WHERE  pkatt1 = $1 [AND ...]
+		 *	  AND    pkperiodatt && $n
+		 *	  FOR KEY SHARE OF x
+		 *  ) x1
+		 *  HAVING $n <@ range_agg(x1.r)
+		 * Note if FOR KEY SHARE ever allows GROUP BY and HAVING
+		 * we can make this a bit simpler.
 		 * ----------
 		 */
 		initStringInfo(&querybuf);
+		pk_only = pk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
+			"" : "ONLY ";
 		quoteRelationName(pkrelname, pk_rel);
-		appendStringInfo(&querybuf, "SELECT 1 FROM ONLY %s x", pkrelname);
+		if (riinfo->hasperiod)
+		{
+			quoteOneName(attname, RIAttName(pk_rel, riinfo->pk_attnums[riinfo->nkeys - 1]));
+
+			appendStringInfo(&querybuf,
+							 "SELECT 1 FROM (SELECT %s AS r FROM %s%s x",
+							 attname, pk_only, pkrelname);
+		}
+		else
+		{
+			appendStringInfo(&querybuf, "SELECT 1 FROM %s%s x",
+							 pk_only, pkrelname);
+		}
 		querysep = "WHERE";
-		for (i = 0; i < riinfo->nkeys; i++)
+		for (int i = 0; i < riinfo->nkeys; i++)
 		{
 			Oid			pk_type = RIAttType(pk_rel, riinfo->pk_attnums[i]);
 
@@ -561,10 +699,22 @@ ri_Check_Pk_Match(Relation pk_rel, Relation fk_rel,
 			queryoids[i] = pk_type;
 		}
 		appendStringInfoString(&querybuf, " FOR KEY SHARE OF x");
+		if (riinfo->hasperiod)
+		{
+			Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[riinfo->nkeys - 1]);
+
+			appendStringInfoString(&querybuf, ") x1 HAVING ");
+			sprintf(paramname, "$%d", riinfo->nkeys);
+			ri_GenerateQual(&querybuf, "",
+							paramname, fk_type,
+							riinfo->agged_period_contained_by_oper,
+							"pg_catalog.range_agg", ANYMULTIRANGEOID);
+			appendStringInfoString(&querybuf, "(x1.r)");
+		}
 
 		/* Prepare and save the plan */
 		qplan = ri_PlanCheck(querybuf.data, riinfo->nkeys, queryoids,
-							 &qkey, fk_rel, pk_rel, true);
+							 &qkey, fk_rel, pk_rel);
 	}
 
 	/*
@@ -572,7 +722,8 @@ ri_Check_Pk_Match(Relation pk_rel, Relation fk_rel,
 	 */
 	result = ri_PerformCheck(riinfo, &qkey, qplan,
 							 fk_rel, pk_rel,
-							 old_row, NULL,
+							 oldslot, NULL,
+							 false,
 							 true,	/* treat like update */
 							 SPI_OK_SELECT);
 
@@ -583,106 +734,85 @@ ri_Check_Pk_Match(Relation pk_rel, Relation fk_rel,
 }
 
 
-/* ----------
+/*
  * RI_FKey_noaction_del -
  *
- *	Give an error and roll back the current transaction if the
- *	delete has resulted in a violation of the given referential
- *	integrity constraint.
- * ----------
+ * Give an error and roll back the current transaction if the
+ * delete has resulted in a violation of the given referential
+ * integrity constraint.
  */
 Datum
 RI_FKey_noaction_del(PG_FUNCTION_ARGS)
 {
-	/*
-	 * Check that this is a valid trigger call on the right time and event.
-	 */
+	/* Check that this is a valid trigger call on the right time and event. */
 	ri_CheckTrigger(fcinfo, "RI_FKey_noaction_del", RI_TRIGTYPE_DELETE);
 
-	/*
-	 * Share code with RESTRICT/UPDATE cases.
-	 */
+	/* Share code with RESTRICT/UPDATE cases. */
 	return ri_restrict((TriggerData *) fcinfo->context, true);
 }
 
-/* ----------
+/*
  * RI_FKey_restrict_del -
  *
- *	Restrict delete from PK table to rows unreferenced by foreign key.
+ * Restrict delete from PK table to rows unreferenced by foreign key.
  *
- *	The SQL standard intends that this referential action occur exactly when
- *	the delete is performed, rather than after.  This appears to be
- *	the only difference between "NO ACTION" and "RESTRICT".  In Postgres
- *	we still implement this as an AFTER trigger, but it's non-deferrable.
- * ----------
+ * The SQL standard intends that this referential action occur exactly when
+ * the delete is performed, rather than after.  This appears to be
+ * the only difference between "NO ACTION" and "RESTRICT".  In Postgres
+ * we still implement this as an AFTER trigger, but it's non-deferrable.
  */
 Datum
 RI_FKey_restrict_del(PG_FUNCTION_ARGS)
 {
-	/*
-	 * Check that this is a valid trigger call on the right time and event.
-	 */
+	/* Check that this is a valid trigger call on the right time and event. */
 	ri_CheckTrigger(fcinfo, "RI_FKey_restrict_del", RI_TRIGTYPE_DELETE);
 
-	/*
-	 * Share code with NO ACTION/UPDATE cases.
-	 */
+	/* Share code with NO ACTION/UPDATE cases. */
 	return ri_restrict((TriggerData *) fcinfo->context, false);
 }
 
-/* ----------
+/*
  * RI_FKey_noaction_upd -
  *
- *	Give an error and roll back the current transaction if the
- *	update has resulted in a violation of the given referential
- *	integrity constraint.
- * ----------
+ * Give an error and roll back the current transaction if the
+ * update has resulted in a violation of the given referential
+ * integrity constraint.
  */
 Datum
 RI_FKey_noaction_upd(PG_FUNCTION_ARGS)
 {
-	/*
-	 * Check that this is a valid trigger call on the right time and event.
-	 */
+	/* Check that this is a valid trigger call on the right time and event. */
 	ri_CheckTrigger(fcinfo, "RI_FKey_noaction_upd", RI_TRIGTYPE_UPDATE);
 
-	/*
-	 * Share code with RESTRICT/DELETE cases.
-	 */
+	/* Share code with RESTRICT/DELETE cases. */
 	return ri_restrict((TriggerData *) fcinfo->context, true);
 }
 
-/* ----------
+/*
  * RI_FKey_restrict_upd -
  *
- *	Restrict update of PK to rows unreferenced by foreign key.
+ * Restrict update of PK to rows unreferenced by foreign key.
  *
- *	The SQL standard intends that this referential action occur exactly when
- *	the update is performed, rather than after.  This appears to be
- *	the only difference between "NO ACTION" and "RESTRICT".  In Postgres
- *	we still implement this as an AFTER trigger, but it's non-deferrable.
- * ----------
+ * The SQL standard intends that this referential action occur exactly when
+ * the update is performed, rather than after.  This appears to be
+ * the only difference between "NO ACTION" and "RESTRICT".  In Postgres
+ * we still implement this as an AFTER trigger, but it's non-deferrable.
  */
 Datum
 RI_FKey_restrict_upd(PG_FUNCTION_ARGS)
 {
-	/*
-	 * Check that this is a valid trigger call on the right time and event.
-	 */
+	/* Check that this is a valid trigger call on the right time and event. */
 	ri_CheckTrigger(fcinfo, "RI_FKey_restrict_upd", RI_TRIGTYPE_UPDATE);
 
-	/*
-	 * Share code with NO ACTION/DELETE cases.
-	 */
+	/* Share code with NO ACTION/DELETE cases. */
 	return ri_restrict((TriggerData *) fcinfo->context, false);
 }
 
-/* ----------
+/*
  * ri_restrict -
  *
- *	Common code for ON DELETE RESTRICT, ON DELETE NO ACTION,
- *	ON UPDATE RESTRICT, and ON UPDATE NO ACTION.
- * ----------
+ * Common code for ON DELETE RESTRICT, ON DELETE NO ACTION,
+ * ON UPDATE RESTRICT, and ON UPDATE NO ACTION.
  */
 static Datum
 ri_restrict(TriggerData *trigdata, bool is_no_action)
@@ -690,13 +820,10 @@ ri_restrict(TriggerData *trigdata, bool is_no_action)
 	const RI_ConstraintInfo *riinfo;
 	Relation	fk_rel;
 	Relation	pk_rel;
-	HeapTuple	old_row;
+	TupleTableSlot *oldslot;
 	RI_QueryKey qkey;
 	SPIPlanPtr	qplan;
 
-	/*
-	 * Get arguments.
-	 */
 	riinfo = ri_FetchConstraintInfo(trigdata->tg_trigger,
 									trigdata->tg_relation, true);
 
@@ -706,169 +833,189 @@ ri_restrict(TriggerData *trigdata, bool is_no_action)
 	 * fk_rel is opened in RowShareLock mode since that's what our eventual
 	 * SELECT FOR KEY SHARE will get on it.
 	 */
-	fk_rel = heap_open(riinfo->fk_relid, RowShareLock);
+	fk_rel = table_open(riinfo->fk_relid, RowShareLock);
 	pk_rel = trigdata->tg_relation;
-	old_row = trigdata->tg_trigtuple;
+	oldslot = trigdata->tg_trigslot;
 
-	switch (riinfo->confmatchtype)
+	/*
+	 * If another PK row now exists providing the old key values, we should
+	 * not do anything.  However, this check should only be made in the NO
+	 * ACTION case; in RESTRICT cases we don't wish to allow another row to be
+	 * substituted.
+	 *
+	 * If the foreign key has PERIOD, we incorporate looking for replacement
+	 * rows in the main SQL query below, so we needn't do it here.
+	 */
+	if (is_no_action && !riinfo->hasperiod &&
+		ri_Check_Pk_Match(pk_rel, fk_rel, oldslot, riinfo))
 	{
-			/* ----------
-			 * SQL:2008 15.17 <Execution of referential actions>
-			 *	General rules 9) a) iv):
-			 *		MATCH SIMPLE/FULL
-			 *			... ON DELETE RESTRICT
-			 *	General rules 10) a) iv):
-			 *		MATCH SIMPLE/FULL
-			 *			... ON UPDATE RESTRICT
-			 * ----------
-			 */
-		case FKCONSTR_MATCH_SIMPLE:
-		case FKCONSTR_MATCH_FULL:
-			switch (ri_NullCheck(RelationGetDescr(pk_rel), old_row, riinfo, true))
-			{
-				case RI_KEYS_ALL_NULL:
-				case RI_KEYS_SOME_NULL:
-
-					/*
-					 * No check needed - there cannot be any reference to old
-					 * key if it contains a NULL
-					 */
-					heap_close(fk_rel, RowShareLock);
-					return PointerGetDatum(NULL);
-
-				case RI_KEYS_NONE_NULL:
-
-					/*
-					 * Have a full qualified key - continue below
-					 */
-					break;
-			}
-
-			/*
-			 * In UPDATE, no need to do anything if old and new keys are equal
-			 */
-			if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
-			{
-				HeapTuple	new_row = trigdata->tg_newtuple;
-
-				if (ri_KeysEqual(pk_rel, old_row, new_row, riinfo, true))
-				{
-					heap_close(fk_rel, RowShareLock);
-					return PointerGetDatum(NULL);
-				}
-			}
-
-			/*
-			 * If another PK row now exists providing the old key values, we
-			 * should not do anything.  However, this check should only be
-			 * made in the NO ACTION case; in RESTRICT cases we don't wish to
-			 * allow another row to be substituted.
-			 */
-			if (is_no_action &&
-				ri_Check_Pk_Match(pk_rel, fk_rel, old_row, riinfo))
-			{
-				heap_close(fk_rel, RowShareLock);
-				return PointerGetDatum(NULL);
-			}
-
-			if (SPI_connect() != SPI_OK_CONNECT)
-				elog(ERROR, "SPI_connect failed");
-
-			/*
-			 * Fetch or prepare a saved plan for the restrict lookup (it's the
-			 * same query for delete and update cases)
-			 */
-			ri_BuildQueryKey(&qkey, riinfo, RI_PLAN_RESTRICT_CHECKREF);
-
-			if ((qplan = ri_FetchPreparedPlan(&qkey)) == NULL)
-			{
-				StringInfoData querybuf;
-				char		fkrelname[MAX_QUOTED_REL_NAME_LEN];
-				char		attname[MAX_QUOTED_NAME_LEN];
-				char		paramname[16];
-				const char *querysep;
-				Oid			queryoids[RI_MAX_NUMKEYS];
-				const char *fk_only;
-				int			i;
-
-				/* ----------
-				 * The query string built is
-				 *	SELECT 1 FROM [ONLY] <fktable> x WHERE $1 = fkatt1 [AND ...]
-				 *		   FOR KEY SHARE OF x
-				 * The type id's for the $ parameters are those of the
-				 * corresponding PK attributes.
-				 * ----------
-				 */
-				initStringInfo(&querybuf);
-				fk_only = fk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
-					"" : "ONLY ";
-				quoteRelationName(fkrelname, fk_rel);
-				appendStringInfo(&querybuf, "SELECT 1 FROM %s%s x",
-								 fk_only, fkrelname);
-				querysep = "WHERE";
-				for (i = 0; i < riinfo->nkeys; i++)
-				{
-					Oid			pk_type = RIAttType(pk_rel, riinfo->pk_attnums[i]);
-					Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[i]);
-
-					quoteOneName(attname,
-								 RIAttName(fk_rel, riinfo->fk_attnums[i]));
-					sprintf(paramname, "$%d", i + 1);
-					ri_GenerateQual(&querybuf, querysep,
-									paramname, pk_type,
-									riinfo->pf_eq_oprs[i],
-									attname, fk_type);
-					querysep = "AND";
-					queryoids[i] = pk_type;
-				}
-				appendStringInfoString(&querybuf, " FOR KEY SHARE OF x");
-
-				/* Prepare and save the plan */
-				qplan = ri_PlanCheck(querybuf.data, riinfo->nkeys, queryoids,
-									 &qkey, fk_rel, pk_rel, true);
-			}
-
-			/*
-			 * We have a plan now. Run it to check for existing references.
-			 */
-			ri_PerformCheck(riinfo, &qkey, qplan,
-							fk_rel, pk_rel,
-							old_row, NULL,
-							true,	/* must detect new rows */
-							SPI_OK_SELECT);
-
-			if (SPI_finish() != SPI_OK_FINISH)
-				elog(ERROR, "SPI_finish failed");
-
-			heap_close(fk_rel, RowShareLock);
-
-			return PointerGetDatum(NULL);
-
-			/*
-			 * Handle MATCH PARTIAL restrict delete or update.
-			 */
-		case FKCONSTR_MATCH_PARTIAL:
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("MATCH PARTIAL not yet implemented")));
-			return PointerGetDatum(NULL);
-
-		default:
-			elog(ERROR, "unrecognized confmatchtype: %d",
-				 riinfo->confmatchtype);
-			break;
+		table_close(fk_rel, RowShareLock);
+		return PointerGetDatum(NULL);
 	}
 
-	/* Never reached */
+	SPI_connect();
+
+	/*
+	 * Fetch or prepare a saved plan for the restrict lookup (it's the same
+	 * query for delete and update cases)
+	 */
+	ri_BuildQueryKey(&qkey, riinfo, is_no_action ? RI_PLAN_NO_ACTION : RI_PLAN_RESTRICT);
+
+	if ((qplan = ri_FetchPreparedPlan(&qkey)) == NULL)
+	{
+		StringInfoData querybuf;
+		char		pkrelname[MAX_QUOTED_REL_NAME_LEN];
+		char		fkrelname[MAX_QUOTED_REL_NAME_LEN];
+		char		attname[MAX_QUOTED_NAME_LEN];
+		char		periodattname[MAX_QUOTED_NAME_LEN];
+		char		paramname[16];
+		const char *querysep;
+		Oid			queryoids[RI_MAX_NUMKEYS];
+		const char *fk_only;
+
+		/* ----------
+		 * The query string built is
+		 *	SELECT 1 FROM [ONLY] <fktable> x WHERE $1 = fkatt1 [AND ...]
+		 *		   FOR KEY SHARE OF x
+		 * The type id's for the $ parameters are those of the
+		 * corresponding PK attributes.
+		 * ----------
+		 */
+		initStringInfo(&querybuf);
+		fk_only = fk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
+			"" : "ONLY ";
+		quoteRelationName(fkrelname, fk_rel);
+		appendStringInfo(&querybuf, "SELECT 1 FROM %s%s x",
+						 fk_only, fkrelname);
+		querysep = "WHERE";
+		for (int i = 0; i < riinfo->nkeys; i++)
+		{
+			Oid			pk_type = RIAttType(pk_rel, riinfo->pk_attnums[i]);
+			Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[i]);
+
+			quoteOneName(attname,
+						 RIAttName(fk_rel, riinfo->fk_attnums[i]));
+			sprintf(paramname, "$%d", i + 1);
+			ri_GenerateQual(&querybuf, querysep,
+							paramname, pk_type,
+							riinfo->pf_eq_oprs[i],
+							attname, fk_type);
+			querysep = "AND";
+			queryoids[i] = pk_type;
+		}
+
+		/*----------
+		 * For temporal foreign keys, a reference could still be valid if the
+		 * referenced range didn't change too much.  Also if a referencing
+		 * range extends past the current PK row, we don't want to check that
+		 * part: some other PK row should fulfill it.  We only want to check
+		 * the part matching the PK record we've changed.  Therefore to find
+		 * invalid records we do this:
+		 *
+		 * SELECT 1 FROM [ONLY] <fktable> x WHERE $1 = x.fkatt1 [AND ...]
+		 * -- begin temporal
+		 * AND $n && x.fkperiod
+		 * AND NOT coalesce((x.fkperiod * $n) <@
+		 *  (SELECT range_agg(r)
+		 *   FROM (SELECT y.pkperiod r
+		 *         FROM [ONLY] <pktable> y
+		 *         WHERE $1 = y.pkatt1 [AND ...] AND $n && y.pkperiod
+		 *         FOR KEY SHARE OF y) y2), false)
+		 * -- end temporal
+		 * FOR KEY SHARE OF x
+		 *
+		 * We need the coalesce in case the first subquery returns no rows.
+		 * We need the second subquery because FOR KEY SHARE doesn't support
+		 * aggregate queries.
+		 */
+		if (riinfo->hasperiod && is_no_action)
+		{
+			Oid			pk_period_type = RIAttType(pk_rel, riinfo->pk_attnums[riinfo->nkeys - 1]);
+			Oid			fk_period_type = RIAttType(fk_rel, riinfo->fk_attnums[riinfo->nkeys - 1]);
+			StringInfoData intersectbuf;
+			StringInfoData replacementsbuf;
+			char	   *pk_only = pk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
+				"" : "ONLY ";
+
+			quoteOneName(attname, RIAttName(fk_rel, riinfo->fk_attnums[riinfo->nkeys - 1]));
+			sprintf(paramname, "$%d", riinfo->nkeys);
+
+			appendStringInfoString(&querybuf, " AND NOT coalesce(");
+
+			/* Intersect the fk with the old pk range */
+			initStringInfo(&intersectbuf);
+			appendStringInfoChar(&intersectbuf, '(');
+			ri_GenerateQual(&intersectbuf, "",
+							attname, fk_period_type,
+							riinfo->period_intersect_oper,
+							paramname, pk_period_type);
+			appendStringInfoChar(&intersectbuf, ')');
+
+			/* Find the remaining history */
+			initStringInfo(&replacementsbuf);
+			appendStringInfoString(&replacementsbuf, "(SELECT pg_catalog.range_agg(r) FROM ");
+
+			quoteOneName(periodattname, RIAttName(pk_rel, riinfo->pk_attnums[riinfo->nkeys - 1]));
+			quoteRelationName(pkrelname, pk_rel);
+			appendStringInfo(&replacementsbuf, "(SELECT y.%s r FROM %s%s y",
+							 periodattname, pk_only, pkrelname);
+
+			/* Restrict pk rows to what matches */
+			querysep = "WHERE";
+			for (int i = 0; i < riinfo->nkeys; i++)
+			{
+				Oid			pk_type = RIAttType(pk_rel, riinfo->pk_attnums[i]);
+
+				quoteOneName(attname,
+							 RIAttName(pk_rel, riinfo->pk_attnums[i]));
+				sprintf(paramname, "$%d", i + 1);
+				ri_GenerateQual(&replacementsbuf, querysep,
+								paramname, pk_type,
+								riinfo->pp_eq_oprs[i],
+								attname, pk_type);
+				querysep = "AND";
+				queryoids[i] = pk_type;
+			}
+			appendStringInfoString(&replacementsbuf, " FOR KEY SHARE OF y) y2)");
+
+			ri_GenerateQual(&querybuf, "",
+							intersectbuf.data, fk_period_type,
+							riinfo->agged_period_contained_by_oper,
+							replacementsbuf.data, ANYMULTIRANGEOID);
+			/* end of coalesce: */
+			appendStringInfoString(&querybuf, ", false)");
+		}
+
+		appendStringInfoString(&querybuf, " FOR KEY SHARE OF x");
+
+		/* Prepare and save the plan */
+		qplan = ri_PlanCheck(querybuf.data, riinfo->nkeys, queryoids,
+							 &qkey, fk_rel, pk_rel);
+	}
+
+	/*
+	 * We have a plan now. Run it to check for existing references.
+	 */
+	ri_PerformCheck(riinfo, &qkey, qplan,
+					fk_rel, pk_rel,
+					oldslot, NULL,
+					!is_no_action,
+					true,		/* must detect new rows */
+					SPI_OK_SELECT);
+
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "SPI_finish failed");
+
+	table_close(fk_rel, RowShareLock);
+
 	return PointerGetDatum(NULL);
 }
 
 
-/* ----------
+/*
  * RI_FKey_cascade_del -
  *
- *	Cascaded delete foreign key references at delete event on PK table.
- * ----------
+ * Cascaded delete foreign key references at delete event on PK table.
  */
 Datum
 RI_FKey_cascade_del(PG_FUNCTION_ARGS)
@@ -877,19 +1024,13 @@ RI_FKey_cascade_del(PG_FUNCTION_ARGS)
 	const RI_ConstraintInfo *riinfo;
 	Relation	fk_rel;
 	Relation	pk_rel;
-	HeapTuple	old_row;
+	TupleTableSlot *oldslot;
 	RI_QueryKey qkey;
 	SPIPlanPtr	qplan;
-	int			i;
 
-	/*
-	 * Check that this is a valid trigger call on the right time and event.
-	 */
+	/* Check that this is a valid trigger call on the right time and event. */
 	ri_CheckTrigger(fcinfo, "RI_FKey_cascade_del", RI_TRIGTYPE_DELETE);
 
-	/*
-	 * Get arguments.
-	 */
 	riinfo = ri_FetchConstraintInfo(trigdata->tg_trigger,
 									trigdata->tg_relation, true);
 
@@ -899,136 +1040,84 @@ RI_FKey_cascade_del(PG_FUNCTION_ARGS)
 	 * fk_rel is opened in RowExclusiveLock mode since that's what our
 	 * eventual DELETE will get on it.
 	 */
-	fk_rel = heap_open(riinfo->fk_relid, RowExclusiveLock);
+	fk_rel = table_open(riinfo->fk_relid, RowExclusiveLock);
 	pk_rel = trigdata->tg_relation;
-	old_row = trigdata->tg_trigtuple;
+	oldslot = trigdata->tg_trigslot;
 
-	switch (riinfo->confmatchtype)
+	SPI_connect();
+
+	/* Fetch or prepare a saved plan for the cascaded delete */
+	ri_BuildQueryKey(&qkey, riinfo, RI_PLAN_CASCADE_ONDELETE);
+
+	if ((qplan = ri_FetchPreparedPlan(&qkey)) == NULL)
 	{
-			/* ----------
-			 * SQL:2008 15.17 <Execution of referential actions>
-			 *	General rules 9) a) i):
-			 *		MATCH SIMPLE/FULL
-			 *			... ON DELETE CASCADE
-			 * ----------
-			 */
-		case FKCONSTR_MATCH_SIMPLE:
-		case FKCONSTR_MATCH_FULL:
-			switch (ri_NullCheck(RelationGetDescr(pk_rel), old_row, riinfo, true))
-			{
-				case RI_KEYS_ALL_NULL:
-				case RI_KEYS_SOME_NULL:
+		StringInfoData querybuf;
+		char		fkrelname[MAX_QUOTED_REL_NAME_LEN];
+		char		attname[MAX_QUOTED_NAME_LEN];
+		char		paramname[16];
+		const char *querysep;
+		Oid			queryoids[RI_MAX_NUMKEYS];
+		const char *fk_only;
 
-					/*
-					 * No check needed - there cannot be any reference to old
-					 * key if it contains a NULL
-					 */
-					heap_close(fk_rel, RowExclusiveLock);
-					return PointerGetDatum(NULL);
+		/* ----------
+		 * The query string built is
+		 *	DELETE FROM [ONLY] <fktable> WHERE $1 = fkatt1 [AND ...]
+		 * The type id's for the $ parameters are those of the
+		 * corresponding PK attributes.
+		 * ----------
+		 */
+		initStringInfo(&querybuf);
+		fk_only = fk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
+			"" : "ONLY ";
+		quoteRelationName(fkrelname, fk_rel);
+		appendStringInfo(&querybuf, "DELETE FROM %s%s",
+						 fk_only, fkrelname);
+		querysep = "WHERE";
+		for (int i = 0; i < riinfo->nkeys; i++)
+		{
+			Oid			pk_type = RIAttType(pk_rel, riinfo->pk_attnums[i]);
+			Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[i]);
 
-				case RI_KEYS_NONE_NULL:
+			quoteOneName(attname,
+						 RIAttName(fk_rel, riinfo->fk_attnums[i]));
+			sprintf(paramname, "$%d", i + 1);
+			ri_GenerateQual(&querybuf, querysep,
+							paramname, pk_type,
+							riinfo->pf_eq_oprs[i],
+							attname, fk_type);
+			querysep = "AND";
+			queryoids[i] = pk_type;
+		}
 
-					/*
-					 * Have a full qualified key - continue below
-					 */
-					break;
-			}
-
-			if (SPI_connect() != SPI_OK_CONNECT)
-				elog(ERROR, "SPI_connect failed");
-
-			/*
-			 * Fetch or prepare a saved plan for the cascaded delete
-			 */
-			ri_BuildQueryKey(&qkey, riinfo, RI_PLAN_CASCADE_DEL_DODELETE);
-
-			if ((qplan = ri_FetchPreparedPlan(&qkey)) == NULL)
-			{
-				StringInfoData querybuf;
-				char		fkrelname[MAX_QUOTED_REL_NAME_LEN];
-				char		attname[MAX_QUOTED_NAME_LEN];
-				char		paramname[16];
-				const char *querysep;
-				Oid			queryoids[RI_MAX_NUMKEYS];
-				const char *fk_only;
-
-				/* ----------
-				 * The query string built is
-				 *	DELETE FROM [ONLY] <fktable> WHERE $1 = fkatt1 [AND ...]
-				 * The type id's for the $ parameters are those of the
-				 * corresponding PK attributes.
-				 * ----------
-				 */
-				initStringInfo(&querybuf);
-				fk_only = fk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
-					"" : "ONLY ";
-				quoteRelationName(fkrelname, fk_rel);
-				appendStringInfo(&querybuf, "DELETE FROM %s%s",
-								 fk_only, fkrelname);
-				querysep = "WHERE";
-				for (i = 0; i < riinfo->nkeys; i++)
-				{
-					Oid			pk_type = RIAttType(pk_rel, riinfo->pk_attnums[i]);
-					Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[i]);
-
-					quoteOneName(attname,
-								 RIAttName(fk_rel, riinfo->fk_attnums[i]));
-					sprintf(paramname, "$%d", i + 1);
-					ri_GenerateQual(&querybuf, querysep,
-									paramname, pk_type,
-									riinfo->pf_eq_oprs[i],
-									attname, fk_type);
-					querysep = "AND";
-					queryoids[i] = pk_type;
-				}
-
-				/* Prepare and save the plan */
-				qplan = ri_PlanCheck(querybuf.data, riinfo->nkeys, queryoids,
-									 &qkey, fk_rel, pk_rel, true);
-			}
-
-			/*
-			 * We have a plan now. Build up the arguments from the key values
-			 * in the deleted PK tuple and delete the referencing rows
-			 */
-			ri_PerformCheck(riinfo, &qkey, qplan,
-							fk_rel, pk_rel,
-							old_row, NULL,
-							true,	/* must detect new rows */
-							SPI_OK_DELETE);
-
-			if (SPI_finish() != SPI_OK_FINISH)
-				elog(ERROR, "SPI_finish failed");
-
-			heap_close(fk_rel, RowExclusiveLock);
-
-			return PointerGetDatum(NULL);
-
-			/*
-			 * Handle MATCH PARTIAL cascaded delete.
-			 */
-		case FKCONSTR_MATCH_PARTIAL:
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("MATCH PARTIAL not yet implemented")));
-			return PointerGetDatum(NULL);
-
-		default:
-			elog(ERROR, "unrecognized confmatchtype: %d",
-				 riinfo->confmatchtype);
-			break;
+		/* Prepare and save the plan */
+		qplan = ri_PlanCheck(querybuf.data, riinfo->nkeys, queryoids,
+							 &qkey, fk_rel, pk_rel);
 	}
 
-	/* Never reached */
+	/*
+	 * We have a plan now. Build up the arguments from the key values in the
+	 * deleted PK tuple and delete the referencing rows
+	 */
+	ri_PerformCheck(riinfo, &qkey, qplan,
+					fk_rel, pk_rel,
+					oldslot, NULL,
+					false,
+					true,		/* must detect new rows */
+					SPI_OK_DELETE);
+
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "SPI_finish failed");
+
+	table_close(fk_rel, RowExclusiveLock);
+
 	return PointerGetDatum(NULL);
 }
 
 
-/* ----------
+/*
  * RI_FKey_cascade_upd -
  *
- *	Cascaded update foreign key references at update event on PK table.
- * ----------
+ * Cascaded update foreign key references at update event on PK table.
  */
 Datum
 RI_FKey_cascade_upd(PG_FUNCTION_ARGS)
@@ -1037,21 +1126,14 @@ RI_FKey_cascade_upd(PG_FUNCTION_ARGS)
 	const RI_ConstraintInfo *riinfo;
 	Relation	fk_rel;
 	Relation	pk_rel;
-	HeapTuple	new_row;
-	HeapTuple	old_row;
+	TupleTableSlot *newslot;
+	TupleTableSlot *oldslot;
 	RI_QueryKey qkey;
 	SPIPlanPtr	qplan;
-	int			i;
-	int			j;
 
-	/*
-	 * Check that this is a valid trigger call on the right time and event.
-	 */
+	/* Check that this is a valid trigger call on the right time and event. */
 	ri_CheckTrigger(fcinfo, "RI_FKey_cascade_upd", RI_TRIGTYPE_UPDATE);
 
-	/*
-	 * Get arguments.
-	 */
 	riinfo = ri_FetchConstraintInfo(trigdata->tg_trigger,
 									trigdata->tg_relation, true);
 
@@ -1062,433 +1144,170 @@ RI_FKey_cascade_upd(PG_FUNCTION_ARGS)
 	 * fk_rel is opened in RowExclusiveLock mode since that's what our
 	 * eventual UPDATE will get on it.
 	 */
-	fk_rel = heap_open(riinfo->fk_relid, RowExclusiveLock);
+	fk_rel = table_open(riinfo->fk_relid, RowExclusiveLock);
 	pk_rel = trigdata->tg_relation;
-	new_row = trigdata->tg_newtuple;
-	old_row = trigdata->tg_trigtuple;
+	newslot = trigdata->tg_newslot;
+	oldslot = trigdata->tg_trigslot;
 
-	switch (riinfo->confmatchtype)
+	SPI_connect();
+
+	/* Fetch or prepare a saved plan for the cascaded update */
+	ri_BuildQueryKey(&qkey, riinfo, RI_PLAN_CASCADE_ONUPDATE);
+
+	if ((qplan = ri_FetchPreparedPlan(&qkey)) == NULL)
 	{
-			/* ----------
-			 * SQL:2008 15.17 <Execution of referential actions>
-			 *	General rules 10) a) i):
-			 *		MATCH SIMPLE/FULL
-			 *			... ON UPDATE CASCADE
-			 * ----------
-			 */
-		case FKCONSTR_MATCH_SIMPLE:
-		case FKCONSTR_MATCH_FULL:
-			switch (ri_NullCheck(RelationGetDescr(pk_rel), old_row, riinfo, true))
-			{
-				case RI_KEYS_ALL_NULL:
-				case RI_KEYS_SOME_NULL:
+		StringInfoData querybuf;
+		StringInfoData qualbuf;
+		char		fkrelname[MAX_QUOTED_REL_NAME_LEN];
+		char		attname[MAX_QUOTED_NAME_LEN];
+		char		paramname[16];
+		const char *querysep;
+		const char *qualsep;
+		Oid			queryoids[RI_MAX_NUMKEYS * 2];
+		const char *fk_only;
 
-					/*
-					 * No check needed - there cannot be any reference to old
-					 * key if it contains a NULL
-					 */
-					heap_close(fk_rel, RowExclusiveLock);
-					return PointerGetDatum(NULL);
+		/* ----------
+		 * The query string built is
+		 *	UPDATE [ONLY] <fktable> SET fkatt1 = $1 [, ...]
+		 *			WHERE $n = fkatt1 [AND ...]
+		 * The type id's for the $ parameters are those of the
+		 * corresponding PK attributes.  Note that we are assuming
+		 * there is an assignment cast from the PK to the FK type;
+		 * else the parser will fail.
+		 * ----------
+		 */
+		initStringInfo(&querybuf);
+		initStringInfo(&qualbuf);
+		fk_only = fk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
+			"" : "ONLY ";
+		quoteRelationName(fkrelname, fk_rel);
+		appendStringInfo(&querybuf, "UPDATE %s%s SET",
+						 fk_only, fkrelname);
+		querysep = "";
+		qualsep = "WHERE";
+		for (int i = 0, j = riinfo->nkeys; i < riinfo->nkeys; i++, j++)
+		{
+			Oid			pk_type = RIAttType(pk_rel, riinfo->pk_attnums[i]);
+			Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[i]);
 
-				case RI_KEYS_NONE_NULL:
+			quoteOneName(attname,
+						 RIAttName(fk_rel, riinfo->fk_attnums[i]));
+			appendStringInfo(&querybuf,
+							 "%s %s = $%d",
+							 querysep, attname, i + 1);
+			sprintf(paramname, "$%d", j + 1);
+			ri_GenerateQual(&qualbuf, qualsep,
+							paramname, pk_type,
+							riinfo->pf_eq_oprs[i],
+							attname, fk_type);
+			querysep = ",";
+			qualsep = "AND";
+			queryoids[i] = pk_type;
+			queryoids[j] = pk_type;
+		}
+		appendBinaryStringInfo(&querybuf, qualbuf.data, qualbuf.len);
 
-					/*
-					 * Have a full qualified key - continue below
-					 */
-					break;
-			}
-
-			/*
-			 * No need to do anything if old and new keys are equal
-			 */
-			if (ri_KeysEqual(pk_rel, old_row, new_row, riinfo, true))
-			{
-				heap_close(fk_rel, RowExclusiveLock);
-				return PointerGetDatum(NULL);
-			}
-
-			if (SPI_connect() != SPI_OK_CONNECT)
-				elog(ERROR, "SPI_connect failed");
-
-			/*
-			 * Fetch or prepare a saved plan for the cascaded update
-			 */
-			ri_BuildQueryKey(&qkey, riinfo, RI_PLAN_CASCADE_UPD_DOUPDATE);
-
-			if ((qplan = ri_FetchPreparedPlan(&qkey)) == NULL)
-			{
-				StringInfoData querybuf;
-				StringInfoData qualbuf;
-				char		fkrelname[MAX_QUOTED_REL_NAME_LEN];
-				char		attname[MAX_QUOTED_NAME_LEN];
-				char		paramname[16];
-				const char *querysep;
-				const char *qualsep;
-				Oid			queryoids[RI_MAX_NUMKEYS * 2];
-				const char *fk_only;
-
-				/* ----------
-				 * The query string built is
-				 *	UPDATE [ONLY] <fktable> SET fkatt1 = $1 [, ...]
-				 *			WHERE $n = fkatt1 [AND ...]
-				 * The type id's for the $ parameters are those of the
-				 * corresponding PK attributes.  Note that we are assuming
-				 * there is an assignment cast from the PK to the FK type;
-				 * else the parser will fail.
-				 * ----------
-				 */
-				initStringInfo(&querybuf);
-				initStringInfo(&qualbuf);
-				fk_only = fk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
-					"" : "ONLY ";
-				quoteRelationName(fkrelname, fk_rel);
-				appendStringInfo(&querybuf, "UPDATE %s%s SET",
-								 fk_only, fkrelname);
-				querysep = "";
-				qualsep = "WHERE";
-				for (i = 0, j = riinfo->nkeys; i < riinfo->nkeys; i++, j++)
-				{
-					Oid			pk_type = RIAttType(pk_rel, riinfo->pk_attnums[i]);
-					Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[i]);
-
-					quoteOneName(attname,
-								 RIAttName(fk_rel, riinfo->fk_attnums[i]));
-					appendStringInfo(&querybuf,
-									 "%s %s = $%d",
-									 querysep, attname, i + 1);
-					sprintf(paramname, "$%d", j + 1);
-					ri_GenerateQual(&qualbuf, qualsep,
-									paramname, pk_type,
-									riinfo->pf_eq_oprs[i],
-									attname, fk_type);
-					querysep = ",";
-					qualsep = "AND";
-					queryoids[i] = pk_type;
-					queryoids[j] = pk_type;
-				}
-				appendStringInfoString(&querybuf, qualbuf.data);
-
-				/* Prepare and save the plan */
-				qplan = ri_PlanCheck(querybuf.data, riinfo->nkeys * 2, queryoids,
-									 &qkey, fk_rel, pk_rel, true);
-			}
-
-			/*
-			 * We have a plan now. Run it to update the existing references.
-			 */
-			ri_PerformCheck(riinfo, &qkey, qplan,
-							fk_rel, pk_rel,
-							old_row, new_row,
-							true,	/* must detect new rows */
-							SPI_OK_UPDATE);
-
-			if (SPI_finish() != SPI_OK_FINISH)
-				elog(ERROR, "SPI_finish failed");
-
-			heap_close(fk_rel, RowExclusiveLock);
-
-			return PointerGetDatum(NULL);
-
-			/*
-			 * Handle MATCH PARTIAL cascade update.
-			 */
-		case FKCONSTR_MATCH_PARTIAL:
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("MATCH PARTIAL not yet implemented")));
-			return PointerGetDatum(NULL);
-
-		default:
-			elog(ERROR, "unrecognized confmatchtype: %d",
-				 riinfo->confmatchtype);
-			break;
+		/* Prepare and save the plan */
+		qplan = ri_PlanCheck(querybuf.data, riinfo->nkeys * 2, queryoids,
+							 &qkey, fk_rel, pk_rel);
 	}
 
-	/* Never reached */
+	/*
+	 * We have a plan now. Run it to update the existing references.
+	 */
+	ri_PerformCheck(riinfo, &qkey, qplan,
+					fk_rel, pk_rel,
+					oldslot, newslot,
+					false,
+					true,		/* must detect new rows */
+					SPI_OK_UPDATE);
+
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "SPI_finish failed");
+
+	table_close(fk_rel, RowExclusiveLock);
+
 	return PointerGetDatum(NULL);
 }
 
 
-/* ----------
+/*
  * RI_FKey_setnull_del -
  *
- *	Set foreign key references to NULL values at delete event on PK table.
- * ----------
+ * Set foreign key references to NULL values at delete event on PK table.
  */
 Datum
 RI_FKey_setnull_del(PG_FUNCTION_ARGS)
 {
-	/*
-	 * Check that this is a valid trigger call on the right time and event.
-	 */
+	/* Check that this is a valid trigger call on the right time and event. */
 	ri_CheckTrigger(fcinfo, "RI_FKey_setnull_del", RI_TRIGTYPE_DELETE);
 
-	/*
-	 * Share code with UPDATE case
-	 */
-	return ri_setnull((TriggerData *) fcinfo->context);
+	/* Share code with UPDATE case */
+	return ri_set((TriggerData *) fcinfo->context, true, RI_TRIGTYPE_DELETE);
 }
 
-/* ----------
+/*
  * RI_FKey_setnull_upd -
  *
- *	Set foreign key references to NULL at update event on PK table.
- * ----------
+ * Set foreign key references to NULL at update event on PK table.
  */
 Datum
 RI_FKey_setnull_upd(PG_FUNCTION_ARGS)
 {
-	/*
-	 * Check that this is a valid trigger call on the right time and event.
-	 */
+	/* Check that this is a valid trigger call on the right time and event. */
 	ri_CheckTrigger(fcinfo, "RI_FKey_setnull_upd", RI_TRIGTYPE_UPDATE);
 
-	/*
-	 * Share code with DELETE case
-	 */
-	return ri_setnull((TriggerData *) fcinfo->context);
+	/* Share code with DELETE case */
+	return ri_set((TriggerData *) fcinfo->context, true, RI_TRIGTYPE_UPDATE);
 }
 
-/* ----------
- * ri_setnull -
- *
- *	Common code for ON DELETE SET NULL and ON UPDATE SET NULL
- * ----------
- */
-static Datum
-ri_setnull(TriggerData *trigdata)
-{
-	const RI_ConstraintInfo *riinfo;
-	Relation	fk_rel;
-	Relation	pk_rel;
-	HeapTuple	old_row;
-	RI_QueryKey qkey;
-	SPIPlanPtr	qplan;
-	int			i;
-
-	/*
-	 * Get arguments.
-	 */
-	riinfo = ri_FetchConstraintInfo(trigdata->tg_trigger,
-									trigdata->tg_relation, true);
-
-	/*
-	 * Get the relation descriptors of the FK and PK tables and the old tuple.
-	 *
-	 * fk_rel is opened in RowExclusiveLock mode since that's what our
-	 * eventual UPDATE will get on it.
-	 */
-	fk_rel = heap_open(riinfo->fk_relid, RowExclusiveLock);
-	pk_rel = trigdata->tg_relation;
-	old_row = trigdata->tg_trigtuple;
-
-	switch (riinfo->confmatchtype)
-	{
-			/* ----------
-			 * SQL:2008 15.17 <Execution of referential actions>
-			 *	General rules 9) a) ii):
-			 *		MATCH SIMPLE/FULL
-			 *			... ON DELETE SET NULL
-			 *	General rules 10) a) ii):
-			 *		MATCH SIMPLE/FULL
-			 *			... ON UPDATE SET NULL
-			 * ----------
-			 */
-		case FKCONSTR_MATCH_SIMPLE:
-		case FKCONSTR_MATCH_FULL:
-			switch (ri_NullCheck(RelationGetDescr(pk_rel), old_row, riinfo, true))
-			{
-				case RI_KEYS_ALL_NULL:
-				case RI_KEYS_SOME_NULL:
-
-					/*
-					 * No check needed - there cannot be any reference to old
-					 * key if it contains a NULL
-					 */
-					heap_close(fk_rel, RowExclusiveLock);
-					return PointerGetDatum(NULL);
-
-				case RI_KEYS_NONE_NULL:
-
-					/*
-					 * Have a full qualified key - continue below
-					 */
-					break;
-			}
-
-			/*
-			 * In UPDATE, no need to do anything if old and new keys are equal
-			 */
-			if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
-			{
-				HeapTuple	new_row = trigdata->tg_newtuple;
-
-				if (ri_KeysEqual(pk_rel, old_row, new_row, riinfo, true))
-				{
-					heap_close(fk_rel, RowExclusiveLock);
-					return PointerGetDatum(NULL);
-				}
-			}
-
-			if (SPI_connect() != SPI_OK_CONNECT)
-				elog(ERROR, "SPI_connect failed");
-
-			/*
-			 * Fetch or prepare a saved plan for the set null operation (it's
-			 * the same query for delete and update cases)
-			 */
-			ri_BuildQueryKey(&qkey, riinfo, RI_PLAN_SETNULL_DOUPDATE);
-
-			if ((qplan = ri_FetchPreparedPlan(&qkey)) == NULL)
-			{
-				StringInfoData querybuf;
-				StringInfoData qualbuf;
-				char		fkrelname[MAX_QUOTED_REL_NAME_LEN];
-				char		attname[MAX_QUOTED_NAME_LEN];
-				char		paramname[16];
-				const char *querysep;
-				const char *qualsep;
-				const char *fk_only;
-				Oid			queryoids[RI_MAX_NUMKEYS];
-
-				/* ----------
-				 * The query string built is
-				 *	UPDATE [ONLY] <fktable> SET fkatt1 = NULL [, ...]
-				 *			WHERE $1 = fkatt1 [AND ...]
-				 * The type id's for the $ parameters are those of the
-				 * corresponding PK attributes.
-				 * ----------
-				 */
-				initStringInfo(&querybuf);
-				initStringInfo(&qualbuf);
-				fk_only = fk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
-					"" : "ONLY ";
-				quoteRelationName(fkrelname, fk_rel);
-				appendStringInfo(&querybuf, "UPDATE %s%s SET",
-								 fk_only, fkrelname);
-				querysep = "";
-				qualsep = "WHERE";
-				for (i = 0; i < riinfo->nkeys; i++)
-				{
-					Oid			pk_type = RIAttType(pk_rel, riinfo->pk_attnums[i]);
-					Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[i]);
-
-					quoteOneName(attname,
-								 RIAttName(fk_rel, riinfo->fk_attnums[i]));
-					appendStringInfo(&querybuf,
-									 "%s %s = NULL",
-									 querysep, attname);
-					sprintf(paramname, "$%d", i + 1);
-					ri_GenerateQual(&qualbuf, qualsep,
-									paramname, pk_type,
-									riinfo->pf_eq_oprs[i],
-									attname, fk_type);
-					querysep = ",";
-					qualsep = "AND";
-					queryoids[i] = pk_type;
-				}
-				appendStringInfoString(&querybuf, qualbuf.data);
-
-				/* Prepare and save the plan */
-				qplan = ri_PlanCheck(querybuf.data, riinfo->nkeys, queryoids,
-									 &qkey, fk_rel, pk_rel, true);
-			}
-
-			/*
-			 * We have a plan now. Run it to update the existing references.
-			 */
-			ri_PerformCheck(riinfo, &qkey, qplan,
-							fk_rel, pk_rel,
-							old_row, NULL,
-							true,	/* must detect new rows */
-							SPI_OK_UPDATE);
-
-			if (SPI_finish() != SPI_OK_FINISH)
-				elog(ERROR, "SPI_finish failed");
-
-			heap_close(fk_rel, RowExclusiveLock);
-
-			return PointerGetDatum(NULL);
-
-			/*
-			 * Handle MATCH PARTIAL set null delete or update.
-			 */
-		case FKCONSTR_MATCH_PARTIAL:
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("MATCH PARTIAL not yet implemented")));
-			return PointerGetDatum(NULL);
-
-		default:
-			elog(ERROR, "unrecognized confmatchtype: %d",
-				 riinfo->confmatchtype);
-			break;
-	}
-
-	/* Never reached */
-	return PointerGetDatum(NULL);
-}
-
-
-/* ----------
+/*
  * RI_FKey_setdefault_del -
  *
- *	Set foreign key references to defaults at delete event on PK table.
- * ----------
+ * Set foreign key references to defaults at delete event on PK table.
  */
 Datum
 RI_FKey_setdefault_del(PG_FUNCTION_ARGS)
 {
-	/*
-	 * Check that this is a valid trigger call on the right time and event.
-	 */
+	/* Check that this is a valid trigger call on the right time and event. */
 	ri_CheckTrigger(fcinfo, "RI_FKey_setdefault_del", RI_TRIGTYPE_DELETE);
 
-	/*
-	 * Share code with UPDATE case
-	 */
-	return ri_setdefault((TriggerData *) fcinfo->context);
+	/* Share code with UPDATE case */
+	return ri_set((TriggerData *) fcinfo->context, false, RI_TRIGTYPE_DELETE);
 }
 
-/* ----------
+/*
  * RI_FKey_setdefault_upd -
  *
- *	Set foreign key references to defaults at update event on PK table.
- * ----------
+ * Set foreign key references to defaults at update event on PK table.
  */
 Datum
 RI_FKey_setdefault_upd(PG_FUNCTION_ARGS)
 {
-	/*
-	 * Check that this is a valid trigger call on the right time and event.
-	 */
+	/* Check that this is a valid trigger call on the right time and event. */
 	ri_CheckTrigger(fcinfo, "RI_FKey_setdefault_upd", RI_TRIGTYPE_UPDATE);
 
-	/*
-	 * Share code with DELETE case
-	 */
-	return ri_setdefault((TriggerData *) fcinfo->context);
+	/* Share code with DELETE case */
+	return ri_set((TriggerData *) fcinfo->context, false, RI_TRIGTYPE_UPDATE);
 }
 
-/* ----------
- * ri_setdefault -
+/*
+ * ri_set -
  *
- *	Common code for ON DELETE SET DEFAULT and ON UPDATE SET DEFAULT
- * ----------
+ * Common code for ON DELETE SET NULL, ON DELETE SET DEFAULT, ON UPDATE SET
+ * NULL, and ON UPDATE SET DEFAULT.
  */
 static Datum
-ri_setdefault(TriggerData *trigdata)
+ri_set(TriggerData *trigdata, bool is_set_null, int tgkind)
 {
 	const RI_ConstraintInfo *riinfo;
 	Relation	fk_rel;
 	Relation	pk_rel;
-	HeapTuple	old_row;
+	TupleTableSlot *oldslot;
 	RI_QueryKey qkey;
 	SPIPlanPtr	qplan;
+	int32		queryno;
 
-	/*
-	 * Get arguments.
-	 */
 	riinfo = ri_FetchConstraintInfo(trigdata->tg_trigger,
 									trigdata->tg_relation, true);
 
@@ -1498,352 +1317,309 @@ ri_setdefault(TriggerData *trigdata)
 	 * fk_rel is opened in RowExclusiveLock mode since that's what our
 	 * eventual UPDATE will get on it.
 	 */
-	fk_rel = heap_open(riinfo->fk_relid, RowExclusiveLock);
+	fk_rel = table_open(riinfo->fk_relid, RowExclusiveLock);
 	pk_rel = trigdata->tg_relation;
-	old_row = trigdata->tg_trigtuple;
+	oldslot = trigdata->tg_trigslot;
 
-	switch (riinfo->confmatchtype)
+	SPI_connect();
+
+	/*
+	 * Fetch or prepare a saved plan for the trigger.
+	 */
+	switch (tgkind)
 	{
-			/* ----------
-			 * SQL:2008 15.17 <Execution of referential actions>
-			 *	General rules 9) a) iii):
-			 *		MATCH SIMPLE/FULL
-			 *			... ON DELETE SET DEFAULT
-			 *	General rules 10) a) iii):
-			 *		MATCH SIMPLE/FULL
-			 *			... ON UPDATE SET DEFAULT
-			 * ----------
-			 */
-		case FKCONSTR_MATCH_SIMPLE:
-		case FKCONSTR_MATCH_FULL:
-			switch (ri_NullCheck(RelationGetDescr(pk_rel), old_row, riinfo, true))
-			{
-				case RI_KEYS_ALL_NULL:
-				case RI_KEYS_SOME_NULL:
-
-					/*
-					 * No check needed - there cannot be any reference to old
-					 * key if it contains a NULL
-					 */
-					heap_close(fk_rel, RowExclusiveLock);
-					return PointerGetDatum(NULL);
-
-				case RI_KEYS_NONE_NULL:
-
-					/*
-					 * Have a full qualified key - continue below
-					 */
-					break;
-			}
-
-			/*
-			 * In UPDATE, no need to do anything if old and new keys are equal
-			 */
-			if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
-			{
-				HeapTuple	new_row = trigdata->tg_newtuple;
-
-				if (ri_KeysEqual(pk_rel, old_row, new_row, riinfo, true))
-				{
-					heap_close(fk_rel, RowExclusiveLock);
-					return PointerGetDatum(NULL);
-				}
-			}
-
-			if (SPI_connect() != SPI_OK_CONNECT)
-				elog(ERROR, "SPI_connect failed");
-
-			/*
-			 * Fetch or prepare a saved plan for the set default operation
-			 * (it's the same query for delete and update cases)
-			 */
-			ri_BuildQueryKey(&qkey, riinfo, RI_PLAN_SETDEFAULT_DOUPDATE);
-
-			if ((qplan = ri_FetchPreparedPlan(&qkey)) == NULL)
-			{
-				StringInfoData querybuf;
-				StringInfoData qualbuf;
-				char		fkrelname[MAX_QUOTED_REL_NAME_LEN];
-				char		attname[MAX_QUOTED_NAME_LEN];
-				char		paramname[16];
-				const char *querysep;
-				const char *qualsep;
-				Oid			queryoids[RI_MAX_NUMKEYS];
-				const char *fk_only;
-				int			i;
-
-				/* ----------
-				 * The query string built is
-				 *	UPDATE [ONLY] <fktable> SET fkatt1 = DEFAULT [, ...]
-				 *			WHERE $1 = fkatt1 [AND ...]
-				 * The type id's for the $ parameters are those of the
-				 * corresponding PK attributes.
-				 * ----------
-				 */
-				initStringInfo(&querybuf);
-				initStringInfo(&qualbuf);
-				quoteRelationName(fkrelname, fk_rel);
-				fk_only = fk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
-					"" : "ONLY ";
-				appendStringInfo(&querybuf, "UPDATE %s%s SET",
-								 fk_only, fkrelname);
-				querysep = "";
-				qualsep = "WHERE";
-				for (i = 0; i < riinfo->nkeys; i++)
-				{
-					Oid			pk_type = RIAttType(pk_rel, riinfo->pk_attnums[i]);
-					Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[i]);
-
-					quoteOneName(attname,
-								 RIAttName(fk_rel, riinfo->fk_attnums[i]));
-					appendStringInfo(&querybuf,
-									 "%s %s = DEFAULT",
-									 querysep, attname);
-					sprintf(paramname, "$%d", i + 1);
-					ri_GenerateQual(&qualbuf, qualsep,
-									paramname, pk_type,
-									riinfo->pf_eq_oprs[i],
-									attname, fk_type);
-					querysep = ",";
-					qualsep = "AND";
-					queryoids[i] = pk_type;
-				}
-				appendStringInfoString(&querybuf, qualbuf.data);
-
-				/* Prepare and save the plan */
-				qplan = ri_PlanCheck(querybuf.data, riinfo->nkeys, queryoids,
-									 &qkey, fk_rel, pk_rel, true);
-			}
-
-			/*
-			 * We have a plan now. Run it to update the existing references.
-			 */
-			ri_PerformCheck(riinfo, &qkey, qplan,
-							fk_rel, pk_rel,
-							old_row, NULL,
-							true,	/* must detect new rows */
-							SPI_OK_UPDATE);
-
-			if (SPI_finish() != SPI_OK_FINISH)
-				elog(ERROR, "SPI_finish failed");
-
-			heap_close(fk_rel, RowExclusiveLock);
-
-			/*
-			 * If we just deleted or updated the PK row whose key was equal to
-			 * the FK columns' default values, and a referencing row exists in
-			 * the FK table, we would have updated that row to the same values
-			 * it already had --- and RI_FKey_fk_upd_check_required would
-			 * hence believe no check is necessary.  So we need to do another
-			 * lookup now and in case a reference still exists, abort the
-			 * operation.  That is already implemented in the NO ACTION
-			 * trigger, so just run it.  (This recheck is only needed in the
-			 * SET DEFAULT case, since CASCADE would remove such rows in case
-			 * of a DELETE operation or would change the FK key values in case
-			 * of an UPDATE, while SET NULL is certain to result in rows that
-			 * satisfy the FK constraint.)
-			 */
-			return ri_restrict(trigdata, true);
-
-			/*
-			 * Handle MATCH PARTIAL set default delete or update.
-			 */
-		case FKCONSTR_MATCH_PARTIAL:
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("MATCH PARTIAL not yet implemented")));
-			return PointerGetDatum(NULL);
-
-		default:
-			elog(ERROR, "unrecognized confmatchtype: %d",
-				 riinfo->confmatchtype);
+		case RI_TRIGTYPE_UPDATE:
+			queryno = is_set_null
+				? RI_PLAN_SETNULL_ONUPDATE
+				: RI_PLAN_SETDEFAULT_ONUPDATE;
 			break;
+		case RI_TRIGTYPE_DELETE:
+			queryno = is_set_null
+				? RI_PLAN_SETNULL_ONDELETE
+				: RI_PLAN_SETDEFAULT_ONDELETE;
+			break;
+		default:
+			elog(ERROR, "invalid tgkind passed to ri_set");
 	}
 
-	/* Never reached */
-	return PointerGetDatum(NULL);
+	ri_BuildQueryKey(&qkey, riinfo, queryno);
+
+	if ((qplan = ri_FetchPreparedPlan(&qkey)) == NULL)
+	{
+		StringInfoData querybuf;
+		char		fkrelname[MAX_QUOTED_REL_NAME_LEN];
+		char		attname[MAX_QUOTED_NAME_LEN];
+		char		paramname[16];
+		const char *querysep;
+		const char *qualsep;
+		Oid			queryoids[RI_MAX_NUMKEYS];
+		const char *fk_only;
+		int			num_cols_to_set;
+		const int16 *set_cols;
+
+		switch (tgkind)
+		{
+			case RI_TRIGTYPE_UPDATE:
+				num_cols_to_set = riinfo->nkeys;
+				set_cols = riinfo->fk_attnums;
+				break;
+			case RI_TRIGTYPE_DELETE:
+
+				/*
+				 * If confdelsetcols are present, then we only update the
+				 * columns specified in that array, otherwise we update all
+				 * the referencing columns.
+				 */
+				if (riinfo->ndelsetcols != 0)
+				{
+					num_cols_to_set = riinfo->ndelsetcols;
+					set_cols = riinfo->confdelsetcols;
+				}
+				else
+				{
+					num_cols_to_set = riinfo->nkeys;
+					set_cols = riinfo->fk_attnums;
+				}
+				break;
+			default:
+				elog(ERROR, "invalid tgkind passed to ri_set");
+		}
+
+		/* ----------
+		 * The query string built is
+		 *	UPDATE [ONLY] <fktable> SET fkatt1 = {NULL|DEFAULT} [, ...]
+		 *			WHERE $1 = fkatt1 [AND ...]
+		 * The type id's for the $ parameters are those of the
+		 * corresponding PK attributes.
+		 * ----------
+		 */
+		initStringInfo(&querybuf);
+		fk_only = fk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
+			"" : "ONLY ";
+		quoteRelationName(fkrelname, fk_rel);
+		appendStringInfo(&querybuf, "UPDATE %s%s SET",
+						 fk_only, fkrelname);
+
+		/*
+		 * Add assignment clauses
+		 */
+		querysep = "";
+		for (int i = 0; i < num_cols_to_set; i++)
+		{
+			quoteOneName(attname, RIAttName(fk_rel, set_cols[i]));
+			appendStringInfo(&querybuf,
+							 "%s %s = %s",
+							 querysep, attname,
+							 is_set_null ? "NULL" : "DEFAULT");
+			querysep = ",";
+		}
+
+		/*
+		 * Add WHERE clause
+		 */
+		qualsep = "WHERE";
+		for (int i = 0; i < riinfo->nkeys; i++)
+		{
+			Oid			pk_type = RIAttType(pk_rel, riinfo->pk_attnums[i]);
+			Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[i]);
+
+			quoteOneName(attname,
+						 RIAttName(fk_rel, riinfo->fk_attnums[i]));
+
+			sprintf(paramname, "$%d", i + 1);
+			ri_GenerateQual(&querybuf, qualsep,
+							paramname, pk_type,
+							riinfo->pf_eq_oprs[i],
+							attname, fk_type);
+			qualsep = "AND";
+			queryoids[i] = pk_type;
+		}
+
+		/* Prepare and save the plan */
+		qplan = ri_PlanCheck(querybuf.data, riinfo->nkeys, queryoids,
+							 &qkey, fk_rel, pk_rel);
+	}
+
+	/*
+	 * We have a plan now. Run it to update the existing references.
+	 */
+	ri_PerformCheck(riinfo, &qkey, qplan,
+					fk_rel, pk_rel,
+					oldslot, NULL,
+					false,
+					true,		/* must detect new rows */
+					SPI_OK_UPDATE);
+
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "SPI_finish failed");
+
+	table_close(fk_rel, RowExclusiveLock);
+
+	if (is_set_null)
+		return PointerGetDatum(NULL);
+	else
+	{
+		/*
+		 * If we just deleted or updated the PK row whose key was equal to the
+		 * FK columns' default values, and a referencing row exists in the FK
+		 * table, we would have updated that row to the same values it already
+		 * had --- and RI_FKey_fk_upd_check_required would hence believe no
+		 * check is necessary.  So we need to do another lookup now and in
+		 * case a reference still exists, abort the operation.  That is
+		 * already implemented in the NO ACTION trigger, so just run it. (This
+		 * recheck is only needed in the SET DEFAULT case, since CASCADE would
+		 * remove such rows in case of a DELETE operation or would change the
+		 * FK key values in case of an UPDATE, while SET NULL is certain to
+		 * result in rows that satisfy the FK constraint.)
+		 */
+		return ri_restrict(trigdata, true);
+	}
 }
 
 
-/* ----------
+/*
  * RI_FKey_pk_upd_check_required -
  *
- *	Check if we really need to fire the RI trigger for an update to a PK
- *	relation.  This is called by the AFTER trigger queue manager to see if
- *	it can skip queuing an instance of an RI trigger.  Returns true if the
- *	trigger must be fired, false if we can prove the constraint will still
- *	be satisfied.
- * ----------
+ * Check if we really need to fire the RI trigger for an update or delete to a PK
+ * relation.  This is called by the AFTER trigger queue manager to see if
+ * it can skip queuing an instance of an RI trigger.  Returns true if the
+ * trigger must be fired, false if we can prove the constraint will still
+ * be satisfied.
+ *
+ * newslot will be NULL if this is called for a delete.
  */
 bool
 RI_FKey_pk_upd_check_required(Trigger *trigger, Relation pk_rel,
-							  HeapTuple old_row, HeapTuple new_row)
+							  TupleTableSlot *oldslot, TupleTableSlot *newslot)
 {
 	const RI_ConstraintInfo *riinfo;
 
-	/*
-	 * Get arguments.
-	 */
 	riinfo = ri_FetchConstraintInfo(trigger, pk_rel, true);
 
-	switch (riinfo->confmatchtype)
-	{
-		case FKCONSTR_MATCH_SIMPLE:
-		case FKCONSTR_MATCH_FULL:
+	/*
+	 * If any old key value is NULL, the row could not have been referenced by
+	 * an FK row, so no check is needed.
+	 */
+	if (ri_NullCheck(RelationGetDescr(pk_rel), oldslot, riinfo, true) != RI_KEYS_NONE_NULL)
+		return false;
 
-			/*
-			 * If any old key value is NULL, the row could not have been
-			 * referenced by an FK row, so no check is needed.
-			 */
-			if (ri_NullCheck(RelationGetDescr(pk_rel), old_row, riinfo, true) != RI_KEYS_NONE_NULL)
-				return false;
+	/* If all old and new key values are equal, no check is needed */
+	if (newslot && ri_KeysEqual(pk_rel, oldslot, newslot, riinfo, true))
+		return false;
 
-			/* If all old and new key values are equal, no check is needed */
-			if (ri_KeysEqual(pk_rel, old_row, new_row, riinfo, true))
-				return false;
-
-			/* Else we need to fire the trigger. */
-			return true;
-
-			/* Handle MATCH PARTIAL check. */
-		case FKCONSTR_MATCH_PARTIAL:
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("MATCH PARTIAL not yet implemented")));
-			break;
-
-		default:
-			elog(ERROR, "unrecognized confmatchtype: %d",
-				 riinfo->confmatchtype);
-			break;
-	}
-
-	/* Never reached */
-	return false;
+	/* Else we need to fire the trigger. */
+	return true;
 }
 
-/* ----------
+/*
  * RI_FKey_fk_upd_check_required -
  *
- *	Check if we really need to fire the RI trigger for an update to an FK
- *	relation.  This is called by the AFTER trigger queue manager to see if
- *	it can skip queuing an instance of an RI trigger.  Returns true if the
- *	trigger must be fired, false if we can prove the constraint will still
- *	be satisfied.
- * ----------
+ * Check if we really need to fire the RI trigger for an update to an FK
+ * relation.  This is called by the AFTER trigger queue manager to see if
+ * it can skip queuing an instance of an RI trigger.  Returns true if the
+ * trigger must be fired, false if we can prove the constraint will still
+ * be satisfied.
  */
 bool
 RI_FKey_fk_upd_check_required(Trigger *trigger, Relation fk_rel,
-							  HeapTuple old_row, HeapTuple new_row)
+							  TupleTableSlot *oldslot, TupleTableSlot *newslot)
 {
 	const RI_ConstraintInfo *riinfo;
+	int			ri_nullcheck;
 
 	/*
-	 * Get arguments.
+	 * AfterTriggerSaveEvent() handles things such that this function is never
+	 * called for partitioned tables.
 	 */
+	Assert(fk_rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE);
+
 	riinfo = ri_FetchConstraintInfo(trigger, fk_rel, false);
 
-	switch (riinfo->confmatchtype)
+	ri_nullcheck = ri_NullCheck(RelationGetDescr(fk_rel), newslot, riinfo, false);
+
+	/*
+	 * If all new key values are NULL, the row satisfies the constraint, so no
+	 * check is needed.
+	 */
+	if (ri_nullcheck == RI_KEYS_ALL_NULL)
+		return false;
+
+	/*
+	 * If some new key values are NULL, the behavior depends on the match
+	 * type.
+	 */
+	else if (ri_nullcheck == RI_KEYS_SOME_NULL)
 	{
-		case FKCONSTR_MATCH_SIMPLE:
+		switch (riinfo->confmatchtype)
+		{
+			case FKCONSTR_MATCH_SIMPLE:
 
-			/*
-			 * If any new key value is NULL, the row must satisfy the
-			 * constraint, so no check is needed.
-			 */
-			if (ri_NullCheck(RelationGetDescr(fk_rel), new_row, riinfo, false) != RI_KEYS_NONE_NULL)
+				/*
+				 * If any new key value is NULL, the row must satisfy the
+				 * constraint, so no check is needed.
+				 */
 				return false;
 
-			/*
-			 * If the original row was inserted by our own transaction, we
-			 * must fire the trigger whether or not the keys are equal.  This
-			 * is because our UPDATE will invalidate the INSERT so that the
-			 * INSERT RI trigger will not do anything; so we had better do the
-			 * UPDATE check.  (We could skip this if we knew the INSERT
-			 * trigger already fired, but there is no easy way to know that.)
-			 */
-			if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmin(old_row->t_data)))
+			case FKCONSTR_MATCH_PARTIAL:
+
+				/*
+				 * Don't know, must run full check.
+				 */
+				break;
+
+			case FKCONSTR_MATCH_FULL:
+
+				/*
+				 * If some new key values are NULL, the row fails the
+				 * constraint.  We must not throw error here, because the row
+				 * might get invalidated before the constraint is to be
+				 * checked, but we should queue the event to apply the check
+				 * later.
+				 */
 				return true;
-
-			/* If all old and new key values are equal, no check is needed */
-			if (ri_KeysEqual(fk_rel, old_row, new_row, riinfo, false))
-				return false;
-
-			/* Else we need to fire the trigger. */
-			return true;
-
-		case FKCONSTR_MATCH_FULL:
-
-			/*
-			 * If all new key values are NULL, the row must satisfy the
-			 * constraint, so no check is needed.  On the other hand, if only
-			 * some of them are NULL, the row must fail the constraint.  We
-			 * must not throw error here, because the row might get
-			 * invalidated before the constraint is to be checked, but we
-			 * should queue the event to apply the check later.
-			 */
-			switch (ri_NullCheck(RelationGetDescr(fk_rel), new_row, riinfo, false))
-			{
-				case RI_KEYS_ALL_NULL:
-					return false;
-				case RI_KEYS_SOME_NULL:
-					return true;
-				case RI_KEYS_NONE_NULL:
-					break;		/* continue with the check */
-			}
-
-			/*
-			 * If the original row was inserted by our own transaction, we
-			 * must fire the trigger whether or not the keys are equal.  This
-			 * is because our UPDATE will invalidate the INSERT so that the
-			 * INSERT RI trigger will not do anything; so we had better do the
-			 * UPDATE check.  (We could skip this if we knew the INSERT
-			 * trigger already fired, but there is no easy way to know that.)
-			 */
-			if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetXmin(old_row->t_data)))
-				return true;
-
-			/* If all old and new key values are equal, no check is needed */
-			if (ri_KeysEqual(fk_rel, old_row, new_row, riinfo, false))
-				return false;
-
-			/* Else we need to fire the trigger. */
-			return true;
-
-			/* Handle MATCH PARTIAL check. */
-		case FKCONSTR_MATCH_PARTIAL:
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("MATCH PARTIAL not yet implemented")));
-			break;
-
-		default:
-			elog(ERROR, "unrecognized confmatchtype: %d",
-				 riinfo->confmatchtype);
-			break;
+		}
 	}
 
-	/* Never reached */
-	return false;
+	/*
+	 * Continues here for no new key values are NULL, or we couldn't decide
+	 * yet.
+	 */
+
+	/*
+	 * If the original row was inserted by our own transaction, we must fire
+	 * the trigger whether or not the keys are equal.  This is because our
+	 * UPDATE will invalidate the INSERT so that the INSERT RI trigger will
+	 * not do anything; so we had better do the UPDATE check.  (We could skip
+	 * this if we knew the INSERT trigger already fired, but there is no easy
+	 * way to know that.)
+	 */
+	if (slot_is_current_xact_tuple(oldslot))
+		return true;
+
+	/* If all old and new key values are equal, no check is needed */
+	if (ri_KeysEqual(fk_rel, oldslot, newslot, riinfo, false))
+		return false;
+
+	/* Else we need to fire the trigger. */
+	return true;
 }
 
-/* ----------
+/*
  * RI_Initial_Check -
  *
- *	Check an entire table for non-matching values using a single query.
- *	This is not a trigger procedure, but is called during ALTER TABLE
- *	ADD FOREIGN KEY to validate the initial table contents.
+ * Check an entire table for non-matching values using a single query.
+ * This is not a trigger procedure, but is called during ALTER TABLE
+ * ADD FOREIGN KEY to validate the initial table contents.
  *
- *	We expect that the caller has made provision to prevent any problems
- *	caused by concurrent actions. This could be either by locking rel and
- *	pkrel at ShareRowExclusiveLock or higher, or by otherwise ensuring
- *	that triggers implementing the checks are already active.
- *	Hence, we do not need to lock individual rows for the check.
+ * We expect that the caller has made provision to prevent any problems
+ * caused by concurrent actions. This could be either by locking rel and
+ * pkrel at ShareRowExclusiveLock or higher, or by otherwise ensuring
+ * that triggers implementing the checks are already active.
+ * Hence, we do not need to lock individual rows for the check.
  *
- *	If the check fails because the current user doesn't have permissions
- *	to read both tables, return false to let our caller know that they will
- *	need to do something else to check the constraint.
- * ----------
+ * If the check fails because the current user doesn't have permissions
+ * to read both tables, return false to let our caller know that they will
+ * need to do something else to check the constraint.
  */
 bool
 RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
@@ -1854,17 +1630,19 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 	char		fkrelname[MAX_QUOTED_REL_NAME_LEN];
 	char		pkattname[MAX_QUOTED_NAME_LEN + 3];
 	char		fkattname[MAX_QUOTED_NAME_LEN + 3];
-	RangeTblEntry *pkrte;
-	RangeTblEntry *fkrte;
+	RangeTblEntry *rte;
+	RTEPermissionInfo *pk_perminfo;
+	RTEPermissionInfo *fk_perminfo;
+	List	   *rtes = NIL;
+	List	   *perminfos = NIL;
 	const char *sep;
 	const char *fk_only;
-	int			i;
+	const char *pk_only;
 	int			save_nestlevel;
 	char		workmembuf[32];
 	int			spi_result;
 	SPIPlanPtr	qplan;
 
-	/* Fetch constraint info. */
 	riinfo = ri_FetchConstraintInfo(trigger, fk_rel, false);
 
 	/*
@@ -1874,32 +1652,42 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 	 *
 	 * XXX are there any other show-stopper conditions to check?
 	 */
-	pkrte = makeNode(RangeTblEntry);
-	pkrte->rtekind = RTE_RELATION;
-	pkrte->relid = RelationGetRelid(pk_rel);
-	pkrte->relkind = pk_rel->rd_rel->relkind;
-	pkrte->rellockmode = AccessShareLock;
-	pkrte->requiredPerms = ACL_SELECT;
+	pk_perminfo = makeNode(RTEPermissionInfo);
+	pk_perminfo->relid = RelationGetRelid(pk_rel);
+	pk_perminfo->requiredPerms = ACL_SELECT;
+	perminfos = lappend(perminfos, pk_perminfo);
+	rte = makeNode(RangeTblEntry);
+	rte->rtekind = RTE_RELATION;
+	rte->relid = RelationGetRelid(pk_rel);
+	rte->relkind = pk_rel->rd_rel->relkind;
+	rte->rellockmode = AccessShareLock;
+	rte->perminfoindex = list_length(perminfos);
+	rtes = lappend(rtes, rte);
 
-	fkrte = makeNode(RangeTblEntry);
-	fkrte->rtekind = RTE_RELATION;
-	fkrte->relid = RelationGetRelid(fk_rel);
-	fkrte->relkind = fk_rel->rd_rel->relkind;
-	fkrte->rellockmode = AccessShareLock;
-	fkrte->requiredPerms = ACL_SELECT;
+	fk_perminfo = makeNode(RTEPermissionInfo);
+	fk_perminfo->relid = RelationGetRelid(fk_rel);
+	fk_perminfo->requiredPerms = ACL_SELECT;
+	perminfos = lappend(perminfos, fk_perminfo);
+	rte = makeNode(RangeTblEntry);
+	rte->rtekind = RTE_RELATION;
+	rte->relid = RelationGetRelid(fk_rel);
+	rte->relkind = fk_rel->rd_rel->relkind;
+	rte->rellockmode = AccessShareLock;
+	rte->perminfoindex = list_length(perminfos);
+	rtes = lappend(rtes, rte);
 
-	for (i = 0; i < riinfo->nkeys; i++)
+	for (int i = 0; i < riinfo->nkeys; i++)
 	{
 		int			attno;
 
 		attno = riinfo->pk_attnums[i] - FirstLowInvalidHeapAttributeNumber;
-		pkrte->selectedCols = bms_add_member(pkrte->selectedCols, attno);
+		pk_perminfo->selectedCols = bms_add_member(pk_perminfo->selectedCols, attno);
 
 		attno = riinfo->fk_attnums[i] - FirstLowInvalidHeapAttributeNumber;
-		fkrte->selectedCols = bms_add_member(fkrte->selectedCols, attno);
+		fk_perminfo->selectedCols = bms_add_member(fk_perminfo->selectedCols, attno);
 	}
 
-	if (!ExecCheckRTPerms(list_make2(fkrte, pkrte), false))
+	if (!ExecCheckPermissions(rtes, perminfos, false))
 		return false;
 
 	/*
@@ -1909,15 +1697,17 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 	 */
 	if (!has_bypassrls_privilege(GetUserId()) &&
 		((pk_rel->rd_rel->relrowsecurity &&
-		  !pg_class_ownercheck(pkrte->relid, GetUserId())) ||
+		  !object_ownercheck(RelationRelationId, RelationGetRelid(pk_rel),
+							 GetUserId())) ||
 		 (fk_rel->rd_rel->relrowsecurity &&
-		  !pg_class_ownercheck(fkrte->relid, GetUserId()))))
+		  !object_ownercheck(RelationRelationId, RelationGetRelid(fk_rel),
+							 GetUserId()))))
 		return false;
 
 	/*----------
 	 * The query string built is:
 	 *	SELECT fk.keycols FROM [ONLY] relname fk
-	 *	 LEFT OUTER JOIN ONLY pkrelname pk
+	 *	 LEFT OUTER JOIN [ONLY] pkrelname pk
 	 *	 ON (pk.pkkeycol1=fk.keycol1 [AND ...])
 	 *	 WHERE pk.pkkeycol1 IS NULL AND
 	 * For MATCH SIMPLE:
@@ -1932,7 +1722,7 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 	initStringInfo(&querybuf);
 	appendStringInfoString(&querybuf, "SELECT ");
 	sep = "";
-	for (i = 0; i < riinfo->nkeys; i++)
+	for (int i = 0; i < riinfo->nkeys; i++)
 	{
 		quoteOneName(fkattname,
 					 RIAttName(fk_rel, riinfo->fk_attnums[i]));
@@ -1944,14 +1734,16 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 	quoteRelationName(fkrelname, fk_rel);
 	fk_only = fk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
 		"" : "ONLY ";
+	pk_only = pk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
+		"" : "ONLY ";
 	appendStringInfo(&querybuf,
-					 " FROM %s%s fk LEFT OUTER JOIN ONLY %s pk ON",
-					 fk_only, fkrelname, pkrelname);
+					 " FROM %s%s fk LEFT OUTER JOIN %s%s pk ON",
+					 fk_only, fkrelname, pk_only, pkrelname);
 
 	strcpy(pkattname, "pk.");
 	strcpy(fkattname, "fk.");
 	sep = "(";
-	for (i = 0; i < riinfo->nkeys; i++)
+	for (int i = 0; i < riinfo->nkeys; i++)
 	{
 		Oid			pk_type = RIAttType(pk_rel, riinfo->pk_attnums[i]);
 		Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[i]);
@@ -1979,7 +1771,7 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 	appendStringInfo(&querybuf, ") WHERE pk.%s IS NULL AND (", pkattname);
 
 	sep = "";
-	for (i = 0; i < riinfo->nkeys; i++)
+	for (int i = 0; i < riinfo->nkeys; i++)
 	{
 		quoteOneName(fkattname, RIAttName(fk_rel, riinfo->fk_attnums[i]));
 		appendStringInfo(&querybuf,
@@ -1993,15 +1785,6 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 			case FKCONSTR_MATCH_FULL:
 				sep = " OR ";
 				break;
-			case FKCONSTR_MATCH_PARTIAL:
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("MATCH PARTIAL not yet implemented")));
-				break;
-			default:
-				elog(ERROR, "unrecognized confmatchtype: %d",
-					 riinfo->confmatchtype);
-				break;
 		}
 	}
 	appendStringInfoChar(&querybuf, ')');
@@ -2012,7 +1795,9 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 	 * enough to not use a multiple of work_mem, and one typically would not
 	 * have many large foreign-key validations happening concurrently.  So
 	 * this seems to meet the criteria for being considered a "maintenance"
-	 * operation, and accordingly we use maintenance_work_mem.
+	 * operation, and accordingly we use maintenance_work_mem.  However, we
+	 * must also set hash_mem_multiplier to 1, since it is surely not okay to
+	 * let that get applied to the maintenance_work_mem value.
 	 *
 	 * We use the equivalent of a function SET option to allow the setting to
 	 * persist for exactly the duration of the check query.  guc.c also takes
@@ -2024,9 +1809,11 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 	(void) set_config_option("work_mem", workmembuf,
 							 PGC_USERSET, PGC_S_SESSION,
 							 GUC_ACTION_SAVE, true, 0, false);
+	(void) set_config_option("hash_mem_multiplier", "1",
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
 
-	if (SPI_connect() != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed");
+	SPI_connect();
 
 	/*
 	 * Generate the plan.  We don't need to cache it, and there are no
@@ -2058,9 +1845,16 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 	/* Did we find a tuple violating the constraint? */
 	if (SPI_processed > 0)
 	{
+		TupleTableSlot *slot;
 		HeapTuple	tuple = SPI_tuptable->vals[0];
 		TupleDesc	tupdesc = SPI_tuptable->tupdesc;
 		RI_ConstraintInfo fake_riinfo;
+
+		slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsVirtual);
+
+		heap_deform_tuple(tuple, tupdesc,
+						  slot->tts_values, slot->tts_isnull);
+		ExecStoreVirtualTuple(slot);
 
 		/*
 		 * The columns to look at in the result tuple are 1..N, not whatever
@@ -2072,7 +1866,7 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 		 * or fk_rel's tupdesc.
 		 */
 		memcpy(&fake_riinfo, riinfo, sizeof(RI_ConstraintInfo));
-		for (i = 0; i < fake_riinfo.nkeys; i++)
+		for (int i = 0; i < fake_riinfo.nkeys; i++)
 			fake_riinfo.fk_attnums[i] = i + 1;
 
 		/*
@@ -2081,7 +1875,7 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 		 * disallows partially-null FK rows.
 		 */
 		if (fake_riinfo.confmatchtype == FKCONSTR_MATCH_FULL &&
-			ri_NullCheck(tupdesc, tuple, &fake_riinfo, false) != RI_KEYS_NONE_NULL)
+			ri_NullCheck(tupdesc, slot, &fake_riinfo, false) != RI_KEYS_NONE_NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
 					 errmsg("insert or update on table \"%s\" violates foreign key constraint \"%s\"",
@@ -2098,19 +1892,233 @@ RI_Initial_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
 		 */
 		ri_ReportViolation(&fake_riinfo,
 						   pk_rel, fk_rel,
-						   tuple, tupdesc,
-						   RI_PLAN_CHECK_LOOKUPPK);
+						   slot, tupdesc,
+						   RI_PLAN_CHECK_LOOKUPPK, false, false);
+
+		ExecDropSingleTupleTableSlot(slot);
 	}
 
 	if (SPI_finish() != SPI_OK_FINISH)
 		elog(ERROR, "SPI_finish failed");
 
 	/*
-	 * Restore work_mem.
+	 * Restore work_mem and hash_mem_multiplier.
 	 */
 	AtEOXact_GUC(true, save_nestlevel);
 
 	return true;
+}
+
+/*
+ * RI_PartitionRemove_Check -
+ *
+ * Verify no referencing values exist, when a partition is detached on
+ * the referenced side of a foreign key constraint.
+ */
+void
+RI_PartitionRemove_Check(Trigger *trigger, Relation fk_rel, Relation pk_rel)
+{
+	const RI_ConstraintInfo *riinfo;
+	StringInfoData querybuf;
+	char	   *constraintDef;
+	char		pkrelname[MAX_QUOTED_REL_NAME_LEN];
+	char		fkrelname[MAX_QUOTED_REL_NAME_LEN];
+	char		pkattname[MAX_QUOTED_NAME_LEN + 3];
+	char		fkattname[MAX_QUOTED_NAME_LEN + 3];
+	const char *sep;
+	const char *fk_only;
+	int			save_nestlevel;
+	char		workmembuf[32];
+	int			spi_result;
+	SPIPlanPtr	qplan;
+	int			i;
+
+	riinfo = ri_FetchConstraintInfo(trigger, fk_rel, false);
+
+	/*
+	 * We don't check permissions before displaying the error message, on the
+	 * assumption that the user detaching the partition must have enough
+	 * privileges to examine the table contents anyhow.
+	 */
+
+	/*----------
+	 * The query string built is:
+	 *  SELECT fk.keycols FROM [ONLY] relname fk
+	 *    JOIN pkrelname pk
+	 *    ON (pk.pkkeycol1=fk.keycol1 [AND ...])
+	 *    WHERE (<partition constraint>) AND
+	 * For MATCH SIMPLE:
+	 *   (fk.keycol1 IS NOT NULL [AND ...])
+	 * For MATCH FULL:
+	 *   (fk.keycol1 IS NOT NULL [OR ...])
+	 *
+	 * We attach COLLATE clauses to the operators when comparing columns
+	 * that have different collations.
+	 *----------
+	 */
+	initStringInfo(&querybuf);
+	appendStringInfoString(&querybuf, "SELECT ");
+	sep = "";
+	for (i = 0; i < riinfo->nkeys; i++)
+	{
+		quoteOneName(fkattname,
+					 RIAttName(fk_rel, riinfo->fk_attnums[i]));
+		appendStringInfo(&querybuf, "%sfk.%s", sep, fkattname);
+		sep = ", ";
+	}
+
+	quoteRelationName(pkrelname, pk_rel);
+	quoteRelationName(fkrelname, fk_rel);
+	fk_only = fk_rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ?
+		"" : "ONLY ";
+	appendStringInfo(&querybuf,
+					 " FROM %s%s fk JOIN %s pk ON",
+					 fk_only, fkrelname, pkrelname);
+	strcpy(pkattname, "pk.");
+	strcpy(fkattname, "fk.");
+	sep = "(";
+	for (i = 0; i < riinfo->nkeys; i++)
+	{
+		Oid			pk_type = RIAttType(pk_rel, riinfo->pk_attnums[i]);
+		Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[i]);
+		Oid			pk_coll = RIAttCollation(pk_rel, riinfo->pk_attnums[i]);
+		Oid			fk_coll = RIAttCollation(fk_rel, riinfo->fk_attnums[i]);
+
+		quoteOneName(pkattname + 3,
+					 RIAttName(pk_rel, riinfo->pk_attnums[i]));
+		quoteOneName(fkattname + 3,
+					 RIAttName(fk_rel, riinfo->fk_attnums[i]));
+		ri_GenerateQual(&querybuf, sep,
+						pkattname, pk_type,
+						riinfo->pf_eq_oprs[i],
+						fkattname, fk_type);
+		if (pk_coll != fk_coll)
+			ri_GenerateQualCollation(&querybuf, pk_coll);
+		sep = "AND";
+	}
+
+	/*
+	 * Start the WHERE clause with the partition constraint (except if this is
+	 * the default partition and there's no other partition, because the
+	 * partition constraint is the empty string in that case.)
+	 */
+	constraintDef = pg_get_partconstrdef_string(RelationGetRelid(pk_rel), "pk");
+	if (constraintDef && constraintDef[0] != '\0')
+		appendStringInfo(&querybuf, ") WHERE %s AND (",
+						 constraintDef);
+	else
+		appendStringInfoString(&querybuf, ") WHERE (");
+
+	sep = "";
+	for (i = 0; i < riinfo->nkeys; i++)
+	{
+		quoteOneName(fkattname, RIAttName(fk_rel, riinfo->fk_attnums[i]));
+		appendStringInfo(&querybuf,
+						 "%sfk.%s IS NOT NULL",
+						 sep, fkattname);
+		switch (riinfo->confmatchtype)
+		{
+			case FKCONSTR_MATCH_SIMPLE:
+				sep = " AND ";
+				break;
+			case FKCONSTR_MATCH_FULL:
+				sep = " OR ";
+				break;
+		}
+	}
+	appendStringInfoChar(&querybuf, ')');
+
+	/*
+	 * Temporarily increase work_mem so that the check query can be executed
+	 * more efficiently.  It seems okay to do this because the query is simple
+	 * enough to not use a multiple of work_mem, and one typically would not
+	 * have many large foreign-key validations happening concurrently.  So
+	 * this seems to meet the criteria for being considered a "maintenance"
+	 * operation, and accordingly we use maintenance_work_mem.  However, we
+	 * must also set hash_mem_multiplier to 1, since it is surely not okay to
+	 * let that get applied to the maintenance_work_mem value.
+	 *
+	 * We use the equivalent of a function SET option to allow the setting to
+	 * persist for exactly the duration of the check query.  guc.c also takes
+	 * care of undoing the setting on error.
+	 */
+	save_nestlevel = NewGUCNestLevel();
+
+	snprintf(workmembuf, sizeof(workmembuf), "%d", maintenance_work_mem);
+	(void) set_config_option("work_mem", workmembuf,
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+	(void) set_config_option("hash_mem_multiplier", "1",
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+
+	SPI_connect();
+
+	/*
+	 * Generate the plan.  We don't need to cache it, and there are no
+	 * arguments to the plan.
+	 */
+	qplan = SPI_prepare(querybuf.data, 0, NULL);
+
+	if (qplan == NULL)
+		elog(ERROR, "SPI_prepare returned %s for %s",
+			 SPI_result_code_string(SPI_result), querybuf.data);
+
+	/*
+	 * Run the plan.  For safety we force a current snapshot to be used. (In
+	 * transaction-snapshot mode, this arguably violates transaction isolation
+	 * rules, but we really haven't got much choice.) We don't need to
+	 * register the snapshot, because SPI_execute_snapshot will see to it. We
+	 * need at most one tuple returned, so pass limit = 1.
+	 */
+	spi_result = SPI_execute_snapshot(qplan,
+									  NULL, NULL,
+									  GetLatestSnapshot(),
+									  InvalidSnapshot,
+									  true, false, 1);
+
+	/* Check result */
+	if (spi_result != SPI_OK_SELECT)
+		elog(ERROR, "SPI_execute_snapshot returned %s", SPI_result_code_string(spi_result));
+
+	/* Did we find a tuple that would violate the constraint? */
+	if (SPI_processed > 0)
+	{
+		TupleTableSlot *slot;
+		HeapTuple	tuple = SPI_tuptable->vals[0];
+		TupleDesc	tupdesc = SPI_tuptable->tupdesc;
+		RI_ConstraintInfo fake_riinfo;
+
+		slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsVirtual);
+
+		heap_deform_tuple(tuple, tupdesc,
+						  slot->tts_values, slot->tts_isnull);
+		ExecStoreVirtualTuple(slot);
+
+		/*
+		 * The columns to look at in the result tuple are 1..N, not whatever
+		 * they are in the fk_rel.  Hack up riinfo so that ri_ReportViolation
+		 * will behave properly.
+		 *
+		 * In addition to this, we have to pass the correct tupdesc to
+		 * ri_ReportViolation, overriding its normal habit of using the pk_rel
+		 * or fk_rel's tupdesc.
+		 */
+		memcpy(&fake_riinfo, riinfo, sizeof(RI_ConstraintInfo));
+		for (i = 0; i < fake_riinfo.nkeys; i++)
+			fake_riinfo.pk_attnums[i] = i + 1;
+
+		ri_ReportViolation(&fake_riinfo, pk_rel, fk_rel,
+						   slot, tupdesc, 0, false, true);
+	}
+
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(ERROR, "SPI_finish failed");
+
+	/*
+	 * Restore work_mem and hash_mem_multiplier.
+	 */
+	AtEOXact_GUC(true, save_nestlevel);
 }
 
 
@@ -2177,19 +2185,17 @@ ri_GenerateQual(StringInfo buf,
 /*
  * ri_GenerateQualCollation --- add a COLLATE spec to a WHERE clause
  *
- * At present, we intentionally do not use this function for RI queries that
- * compare a variable to a $n parameter.  Since parameter symbols always have
- * default collation, the effect will be to use the variable's collation.
- * Now that is only strictly correct when testing the referenced column, since
- * the SQL standard specifies that RI comparisons should use the referenced
- * column's collation.  However, so long as all collations have the same
- * notion of equality (which they do, because texteq reduces to bitwise
- * equality), there's no visible semantic impact from using the referencing
- * column's collation when testing it, and this is a good thing to do because
- * it lets us use a normal index on the referencing column.  However, we do
- * have to use this function when directly comparing the referencing and
- * referenced columns, if they are of different collations; else the parser
- * will fail to resolve the collation to use.
+ * We only have to use this function when directly comparing the referencing
+ * and referenced columns, if they are of different collations; else the
+ * parser will fail to resolve the collation to use.  We don't need to use
+ * this function for RI queries that compare a variable to a $n parameter.
+ * Since parameter symbols always have default collation, the effect will be
+ * to use the variable's collation.
+ *
+ * Note that we require that the collations of the referencing and the
+ * referenced column have the same notion of equality: Either they have to
+ * both be deterministic or else they both have to be the same.  (See also
+ * ATAddForeignKeyConstraint().)
  */
 static void
 ri_GenerateQualCollation(StringInfo buf, Oid collation)
@@ -2227,7 +2233,7 @@ ri_GenerateQualCollation(StringInfo buf, Oid collation)
  *	Construct a hashtable key for a prepared SPI plan of an FK constraint.
  *
  *		key: output argument, *key is filled in based on the other arguments
- *		riinfo: info from pg_constraint entry
+ *		riinfo: info derived from pg_constraint entry
  *		constr_queryno: an internal number identifying the query type
  *			(see RI_PLAN_XXX constants at head of file)
  * ----------
@@ -2237,10 +2243,27 @@ ri_BuildQueryKey(RI_QueryKey *key, const RI_ConstraintInfo *riinfo,
 				 int32 constr_queryno)
 {
 	/*
+	 * Inherited constraints with a common ancestor can share ri_query_cache
+	 * entries for all query types except RI_PLAN_CHECK_LOOKUPPK_FROM_PK.
+	 * Except in that case, the query processes the other table involved in
+	 * the FK constraint (i.e., not the table on which the trigger has been
+	 * fired), and so it will be the same for all members of the inheritance
+	 * tree.  So we may use the root constraint's OID in the hash key, rather
+	 * than the constraint's own OID.  This avoids creating duplicate SPI
+	 * plans, saving lots of work and memory when there are many partitions
+	 * with similar FK constraints.
+	 *
+	 * (Note that we must still have a separate RI_ConstraintInfo for each
+	 * constraint, because partitions can have different column orders,
+	 * resulting in different pk_attnums[] or fk_attnums[] array contents.)
+	 *
 	 * We assume struct RI_QueryKey contains no padding bytes, else we'd need
 	 * to use memset to clear them.
 	 */
-	key->constr_id = riinfo->constraint_id;
+	if (constr_queryno != RI_PLAN_CHECK_LOOKUPPK_FROM_PK)
+		key->constr_id = riinfo->constraint_root_id;
+	else
+		key->constr_id = riinfo->constraint_id;
 	key->constr_queryno = constr_queryno;
 }
 
@@ -2293,11 +2316,11 @@ ri_CheckTrigger(FunctionCallInfo fcinfo, const char *funcname, int tgkind)
 /*
  * Fetch the RI_ConstraintInfo struct for the trigger's FK constraint.
  */
-static const RI_ConstraintInfo *
+static RI_ConstraintInfo *
 ri_FetchConstraintInfo(Trigger *trigger, Relation trig_rel, bool rel_is_pk)
 {
 	Oid			constraintOid = trigger->tgconstraint;
-	const RI_ConstraintInfo *riinfo;
+	RI_ConstraintInfo *riinfo;
 
 	/*
 	 * Check that the FK constraint's OID is available; it might not be if
@@ -2322,6 +2345,24 @@ ri_FetchConstraintInfo(Trigger *trigger, Relation trig_rel, bool rel_is_pk)
 			elog(ERROR, "wrong pg_constraint entry for trigger \"%s\" on table \"%s\"",
 				 trigger->tgname, RelationGetRelationName(trig_rel));
 	}
+	else
+	{
+		if (riinfo->fk_relid != RelationGetRelid(trig_rel) ||
+			riinfo->pk_relid != trigger->tgconstrrelid)
+			elog(ERROR, "wrong pg_constraint entry for trigger \"%s\" on table \"%s\"",
+				 trigger->tgname, RelationGetRelationName(trig_rel));
+	}
+
+	if (riinfo->confmatchtype != FKCONSTR_MATCH_FULL &&
+		riinfo->confmatchtype != FKCONSTR_MATCH_PARTIAL &&
+		riinfo->confmatchtype != FKCONSTR_MATCH_SIMPLE)
+		elog(ERROR, "unrecognized confmatchtype: %d",
+			 riinfo->confmatchtype);
+
+	if (riinfo->confmatchtype == FKCONSTR_MATCH_PARTIAL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("MATCH PARTIAL not yet implemented")));
 
 	return riinfo;
 }
@@ -2329,17 +2370,13 @@ ri_FetchConstraintInfo(Trigger *trigger, Relation trig_rel, bool rel_is_pk)
 /*
  * Fetch or create the RI_ConstraintInfo struct for an FK constraint.
  */
-static const RI_ConstraintInfo *
+static RI_ConstraintInfo *
 ri_LoadConstraintInfo(Oid constraintOid)
 {
 	RI_ConstraintInfo *riinfo;
 	bool		found;
 	HeapTuple	tup;
 	Form_pg_constraint conForm;
-	Datum		adatum;
-	bool		isNull;
-	ArrayType  *arr;
-	int			numkeys;
 
 	/*
 	 * On the first call initialize the hashtable
@@ -2351,7 +2388,7 @@ ri_LoadConstraintInfo(Oid constraintOid)
 	 * Find or create a hash entry.  If we find a valid one, just return it.
 	 */
 	riinfo = (RI_ConstraintInfo *) hash_search(ri_constraint_cache,
-											   (void *) &constraintOid,
+											   &constraintOid,
 											   HASH_ENTER, &found);
 	if (!found)
 		riinfo->valid = false;
@@ -2372,110 +2409,95 @@ ri_LoadConstraintInfo(Oid constraintOid)
 
 	/* And extract data */
 	Assert(riinfo->constraint_id == constraintOid);
+	if (OidIsValid(conForm->conparentid))
+		riinfo->constraint_root_id =
+			get_ri_constraint_root(conForm->conparentid);
+	else
+		riinfo->constraint_root_id = constraintOid;
 	riinfo->oidHashValue = GetSysCacheHashValue1(CONSTROID,
 												 ObjectIdGetDatum(constraintOid));
+	riinfo->rootHashValue = GetSysCacheHashValue1(CONSTROID,
+												  ObjectIdGetDatum(riinfo->constraint_root_id));
 	memcpy(&riinfo->conname, &conForm->conname, sizeof(NameData));
 	riinfo->pk_relid = conForm->confrelid;
 	riinfo->fk_relid = conForm->conrelid;
 	riinfo->confupdtype = conForm->confupdtype;
 	riinfo->confdeltype = conForm->confdeltype;
 	riinfo->confmatchtype = conForm->confmatchtype;
+	riinfo->hasperiod = conForm->conperiod;
+
+	DeconstructFkConstraintRow(tup,
+							   &riinfo->nkeys,
+							   riinfo->fk_attnums,
+							   riinfo->pk_attnums,
+							   riinfo->pf_eq_oprs,
+							   riinfo->pp_eq_oprs,
+							   riinfo->ff_eq_oprs,
+							   &riinfo->ndelsetcols,
+							   riinfo->confdelsetcols);
 
 	/*
-	 * We expect the arrays to be 1-D arrays of the right types; verify that.
-	 * We don't need to use deconstruct_array() since the array data is just
-	 * going to look like a C array of values.
+	 * For temporal FKs, get the operators and functions we need. We ask the
+	 * opclass of the PK element for these. This all gets cached (as does the
+	 * generated plan), so there's no performance issue.
 	 */
-	adatum = SysCacheGetAttr(CONSTROID, tup,
-							 Anum_pg_constraint_conkey, &isNull);
-	if (isNull)
-		elog(ERROR, "null conkey for constraint %u", constraintOid);
-	arr = DatumGetArrayTypeP(adatum);	/* ensure not toasted */
-	if (ARR_NDIM(arr) != 1 ||
-		ARR_HASNULL(arr) ||
-		ARR_ELEMTYPE(arr) != INT2OID)
-		elog(ERROR, "conkey is not a 1-D smallint array");
-	numkeys = ARR_DIMS(arr)[0];
-	if (numkeys <= 0 || numkeys > RI_MAX_NUMKEYS)
-		elog(ERROR, "foreign key constraint cannot have %d columns", numkeys);
-	riinfo->nkeys = numkeys;
-	memcpy(riinfo->fk_attnums, ARR_DATA_PTR(arr), numkeys * sizeof(int16));
-	if ((Pointer) arr != DatumGetPointer(adatum))
-		pfree(arr);				/* free de-toasted copy, if any */
+	if (riinfo->hasperiod)
+	{
+		Oid			opclass = get_index_column_opclass(conForm->conindid, riinfo->nkeys);
 
-	adatum = SysCacheGetAttr(CONSTROID, tup,
-							 Anum_pg_constraint_confkey, &isNull);
-	if (isNull)
-		elog(ERROR, "null confkey for constraint %u", constraintOid);
-	arr = DatumGetArrayTypeP(adatum);	/* ensure not toasted */
-	if (ARR_NDIM(arr) != 1 ||
-		ARR_DIMS(arr)[0] != numkeys ||
-		ARR_HASNULL(arr) ||
-		ARR_ELEMTYPE(arr) != INT2OID)
-		elog(ERROR, "confkey is not a 1-D smallint array");
-	memcpy(riinfo->pk_attnums, ARR_DATA_PTR(arr), numkeys * sizeof(int16));
-	if ((Pointer) arr != DatumGetPointer(adatum))
-		pfree(arr);				/* free de-toasted copy, if any */
+		FindFKPeriodOpers(opclass,
+						  &riinfo->period_contained_by_oper,
+						  &riinfo->agged_period_contained_by_oper,
+						  &riinfo->period_intersect_oper);
+	}
 
-	adatum = SysCacheGetAttr(CONSTROID, tup,
-							 Anum_pg_constraint_conpfeqop, &isNull);
-	if (isNull)
-		elog(ERROR, "null conpfeqop for constraint %u", constraintOid);
-	arr = DatumGetArrayTypeP(adatum);	/* ensure not toasted */
-	/* see TryReuseForeignKey if you change the test below */
-	if (ARR_NDIM(arr) != 1 ||
-		ARR_DIMS(arr)[0] != numkeys ||
-		ARR_HASNULL(arr) ||
-		ARR_ELEMTYPE(arr) != OIDOID)
-		elog(ERROR, "conpfeqop is not a 1-D Oid array");
-	memcpy(riinfo->pf_eq_oprs, ARR_DATA_PTR(arr), numkeys * sizeof(Oid));
-	if ((Pointer) arr != DatumGetPointer(adatum))
-		pfree(arr);				/* free de-toasted copy, if any */
-
-	adatum = SysCacheGetAttr(CONSTROID, tup,
-							 Anum_pg_constraint_conppeqop, &isNull);
-	if (isNull)
-		elog(ERROR, "null conppeqop for constraint %u", constraintOid);
-	arr = DatumGetArrayTypeP(adatum);	/* ensure not toasted */
-	if (ARR_NDIM(arr) != 1 ||
-		ARR_DIMS(arr)[0] != numkeys ||
-		ARR_HASNULL(arr) ||
-		ARR_ELEMTYPE(arr) != OIDOID)
-		elog(ERROR, "conppeqop is not a 1-D Oid array");
-	memcpy(riinfo->pp_eq_oprs, ARR_DATA_PTR(arr), numkeys * sizeof(Oid));
-	if ((Pointer) arr != DatumGetPointer(adatum))
-		pfree(arr);				/* free de-toasted copy, if any */
-
-	adatum = SysCacheGetAttr(CONSTROID, tup,
-							 Anum_pg_constraint_conffeqop, &isNull);
-	if (isNull)
-		elog(ERROR, "null conffeqop for constraint %u", constraintOid);
-	arr = DatumGetArrayTypeP(adatum);	/* ensure not toasted */
-	if (ARR_NDIM(arr) != 1 ||
-		ARR_DIMS(arr)[0] != numkeys ||
-		ARR_HASNULL(arr) ||
-		ARR_ELEMTYPE(arr) != OIDOID)
-		elog(ERROR, "conffeqop is not a 1-D Oid array");
-	memcpy(riinfo->ff_eq_oprs, ARR_DATA_PTR(arr), numkeys * sizeof(Oid));
-	if ((Pointer) arr != DatumGetPointer(adatum))
-		pfree(arr);				/* free de-toasted copy, if any */
+	/* Metadata used by fast path. */
+	riinfo->conindid = conForm->conindid;
+	riinfo->pk_is_partitioned =
+		(get_rel_relkind(riinfo->pk_relid) == RELKIND_PARTITIONED_TABLE);
+	riinfo->fastpath_state = RI_FASTPATH_UNKNOWN;
 
 	ReleaseSysCache(tup);
 
 	/*
 	 * For efficient processing of invalidation messages below, we keep a
-	 * doubly-linked list, and a count, of all currently valid entries.
+	 * doubly-linked count list of all currently valid entries.
 	 */
-	dlist_push_tail(&ri_constraint_cache_valid_list, &riinfo->valid_link);
-	ri_constraint_cache_valid_count++;
+	dclist_push_tail(&ri_constraint_cache_valid_list, &riinfo->valid_link);
 
 	riinfo->valid = true;
+
+	riinfo->fpmeta = NULL;
 
 	return riinfo;
 }
 
 /*
- * Callback for pg_constraint inval events
+ * get_ri_constraint_root
+ *		Returns the OID of the constraint's root parent
+ */
+static Oid
+get_ri_constraint_root(Oid constrOid)
+{
+	for (;;)
+	{
+		HeapTuple	tuple;
+		Oid			constrParentOid;
+
+		tuple = SearchSysCache1(CONSTROID, ObjectIdGetDatum(constrOid));
+		if (!HeapTupleIsValid(tuple))
+			elog(ERROR, "cache lookup failed for constraint %u", constrOid);
+		constrParentOid = ((Form_pg_constraint) GETSTRUCT(tuple))->conparentid;
+		ReleaseSysCache(tuple);
+		if (!OidIsValid(constrParentOid))
+			break;				/* we reached the root constraint */
+		constrOid = constrParentOid;
+	}
+	return constrOid;
+}
+
+/*
+ * Callback for pg_constraint, pg_amop and pg_cast inval events
  *
  * While most syscache callbacks just flush all their entries, pg_constraint
  * gets enough update traffic that it's probably worth being smarter.
@@ -2487,13 +2509,37 @@ ri_LoadConstraintInfo(Oid constraintOid)
  * from the cache, but only mark them invalid, which is harmless to active
  * uses.  (Any query using an entry should hold a lock sufficient to keep that
  * data from changing under it --- but we may get cache flushes anyway.)
+ *
+ * The fast-path metadata hanging off an entry is subject to the same rule.
+ * We unlink it so that the next check rebuilds it, but the object itself is
+ * only queued here and is actually released by AtEOXact_RI().
  */
 static void
-InvalidateConstraintCacheCallBack(Datum arg, int cacheid, uint32 hashvalue)
+InvalidateConstraintCacheCallBack(Datum arg, SysCacheIdentifier cacheid,
+								  uint32 hashvalue)
 {
 	dlist_mutable_iter iter;
 
 	Assert(ri_constraint_cache != NULL);
+
+	/*
+	 * pg_amop changes can affect any constraint's fast-path metadata, and
+	 * this pg_amop hashvalue can't be matched against the pg_constraint-keyed
+	 * cache entries, so flush them all via the match-everything path below as
+	 * the large-list reset below does.  Being selective would mean mapping
+	 * the change back to the affected constraints, not worth it for DDL this
+	 * rare.
+	 */
+	if (cacheid == AMOPOPID)
+		hashvalue = 0;
+
+	/*
+	 * Likewise for pg_cast: whether a constraint's FK values are
+	 * binary-coercible to the operator's input type, which decides fast-path
+	 * eligibility, can depend on a binary cast, which may be replaced.
+	 */
+	if (cacheid == CASTSOURCETARGET)
+		hashvalue = 0;
 
 	/*
 	 * If the list of currently valid entries gets excessively large, we mark
@@ -2501,20 +2547,44 @@ InvalidateConstraintCacheCallBack(Datum arg, int cacheid, uint32 hashvalue)
 	 * O(N^2) behavior in situations where a session touches many foreign keys
 	 * and also does many ALTER TABLEs, such as a restore from pg_dump.
 	 */
-	if (ri_constraint_cache_valid_count > 1000)
+	if (dclist_count(&ri_constraint_cache_valid_list) > 1000)
 		hashvalue = 0;			/* pretend it's a cache reset */
 
-	dlist_foreach_modify(iter, &ri_constraint_cache_valid_list)
+	dclist_foreach_modify(iter, &ri_constraint_cache_valid_list)
 	{
-		RI_ConstraintInfo *riinfo = dlist_container(RI_ConstraintInfo,
-													valid_link, iter.cur);
+		RI_ConstraintInfo *riinfo = dclist_container(RI_ConstraintInfo,
+													 valid_link, iter.cur);
 
-		if (hashvalue == 0 || riinfo->oidHashValue == hashvalue)
+		/*
+		 * We must invalidate not only entries directly matching the given
+		 * hash value, but also child entries, in case the invalidation
+		 * affects a root constraint.
+		 */
+		if (hashvalue == 0 ||
+			riinfo->oidHashValue == hashvalue ||
+			riinfo->rootHashValue == hashvalue)
 		{
 			riinfo->valid = false;
+
+			/*
+			 * Detach any fast-path metadata so that the next check
+			 * repopulates it, but do not free it here.  ri_FastPathCheck()
+			 * copies riinfo->fpmeta into a local and then does catalog
+			 * lookups, index scans, tuple locking, and calls equality
+			 * functions, all of which can accept invalidation messages and
+			 * reach this callback.  Freeing now would leave it reading freed
+			 * memory.  Queue it instead; AtEOXact_RI() releases it once no RI
+			 * check can be running.
+			 */
+			if (riinfo->fpmeta)
+			{
+				riinfo->fpmeta->next_dead = ri_fpmeta_dead_list;
+				ri_fpmeta_dead_list = riinfo->fpmeta;
+				riinfo->fpmeta = NULL;
+			}
+
 			/* Remove invalidated entries from the list, too */
-			dlist_delete(iter.cur);
-			ri_constraint_cache_valid_count--;
+			dclist_delete_from(&ri_constraint_cache_valid_list, iter.cur);
 		}
 	}
 }
@@ -2522,14 +2592,10 @@ InvalidateConstraintCacheCallBack(Datum arg, int cacheid, uint32 hashvalue)
 
 /*
  * Prepare execution plan for a query to enforce an RI restriction
- *
- * If cache_plan is true, the plan is saved into our plan hashtable
- * so that we don't need to plan it again.
  */
 static SPIPlanPtr
-ri_PlanCheck(const char *querystr, int nargs, Oid *argtypes,
-			 RI_QueryKey *qkey, Relation fk_rel, Relation pk_rel,
-			 bool cache_plan)
+ri_PlanCheck(const char *querystr, int nargs, const Oid *argtypes,
+			 RI_QueryKey *qkey, Relation fk_rel, Relation pk_rel)
 {
 	SPIPlanPtr	qplan;
 	Relation	query_rel;
@@ -2560,12 +2626,9 @@ ri_PlanCheck(const char *querystr, int nargs, Oid *argtypes,
 	/* Restore UID and security context */
 	SetUserIdAndSecContext(save_userid, save_sec_context);
 
-	/* Save the plan if requested */
-	if (cache_plan)
-	{
-		SPI_keepplan(qplan);
-		ri_HashPreparedPlan(qkey, qplan);
-	}
+	/* Save the plan */
+	SPI_keepplan(qplan);
+	ri_HashPreparedPlan(qkey, qplan);
 
 	return qplan;
 }
@@ -2577,7 +2640,8 @@ static bool
 ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 				RI_QueryKey *qkey, SPIPlanPtr qplan,
 				Relation fk_rel, Relation pk_rel,
-				HeapTuple old_tuple, HeapTuple new_tuple,
+				TupleTableSlot *oldslot, TupleTableSlot *newslot,
+				bool is_restrict,
 				bool detectNewRows, int expect_OK)
 {
 	Relation	query_rel,
@@ -2587,6 +2651,7 @@ ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 	Snapshot	crosscheck_snapshot;
 	int			limit;
 	int			spi_result;
+	int			exec_depth;
 	Oid			save_userid;
 	int			save_sec_context;
 	Datum		vals[RI_MAX_NUMKEYS * 2];
@@ -2620,17 +2685,17 @@ ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 	}
 
 	/* Extract the parameters to be passed into the query */
-	if (new_tuple)
+	if (newslot)
 	{
-		ri_ExtractValues(source_rel, new_tuple, riinfo, source_is_pk,
+		ri_ExtractValues(source_rel, newslot, riinfo, source_is_pk,
 						 vals, nulls);
-		if (old_tuple)
-			ri_ExtractValues(source_rel, old_tuple, riinfo, source_is_pk,
+		if (oldslot)
+			ri_ExtractValues(source_rel, oldslot, riinfo, source_is_pk,
 							 vals + riinfo->nkeys, nulls + riinfo->nkeys);
 	}
 	else
 	{
-		ri_ExtractValues(source_rel, old_tuple, riinfo, source_is_pk,
+		ri_ExtractValues(source_rel, oldslot, riinfo, source_is_pk,
 						 vals, nulls);
 	}
 
@@ -2672,14 +2737,47 @@ ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 						   save_sec_context | SECURITY_LOCAL_USERID_CHANGE |
 						   SECURITY_NOFORCE_RLS);
 
-	/* Finally we can run the query. */
-	spi_result = SPI_execute_snapshot(qplan,
-									  vals, nulls,
-									  test_snapshot, crosscheck_snapshot,
-									  false, false, limit);
+	/*
+	 * Finally we can run the query.
+	 *
+	 * Set fire_triggers to false to ensure that AFTER triggers are queued in
+	 * the outer query's after-trigger context and fire after all RI updates
+	 * on the same row are complete, rather than immediately.
+	 *
+	 * The plan is on the stack of executing plans while the query runs, so
+	 * that a nested check finding it invalid does not free it; see
+	 * ri_FetchPreparedPlan().  Pop it even if the query throws an error, so
+	 * that, whatever catches the error, the stack holds only the plans still
+	 * executing.  We don't free anything in the finally block, so if the
+	 * query throws an error, whatever was queued while it ran stays queued.
+	 * The next check that finishes normally frees it, once no check is
+	 * executing it, or at the latest AtEOXact_RI() does.
+	 */
+	exec_depth = ri_PushExecutingPlan(qplan);
+	PG_TRY();
+	{
+		spi_result = SPI_execute_snapshot(qplan,
+										  vals, nulls,
+										  test_snapshot, crosscheck_snapshot,
+										  false, false, limit);
+	}
+	PG_FINALLY();
+	{
+		/* Pop qplan, whether the query returned normally or threw an error. */
+		ri_executing_depth = exec_depth;
+	}
+	PG_END_TRY();
 
 	/* Restore UID and security context */
 	SetUserIdAndSecContext(save_userid, save_sec_context);
+
+	/*
+	 * Free the queued plans that no check is executing any more, which may
+	 * include qplan itself now that it is popped.  Checks further up the
+	 * stack may still be executing others, which stay queued.
+	 */
+	if (ri_plan_dead_list != NIL)
+		ri_FreeDeadPlans();
 
 	/* Check result */
 	if (spi_result < 0)
@@ -2700,24 +2798,638 @@ ri_PerformCheck(const RI_ConstraintInfo *riinfo,
 		(SPI_processed == 0) == (qkey->constr_queryno == RI_PLAN_CHECK_LOOKUPPK))
 		ri_ReportViolation(riinfo,
 						   pk_rel, fk_rel,
-						   new_tuple ? new_tuple : old_tuple,
+						   newslot ? newslot : oldslot,
 						   NULL,
-						   qkey->constr_queryno);
+						   qkey->constr_queryno, is_restrict, false);
 
 	return SPI_processed != 0;
+}
+
+/*
+ * ri_FastPathCheck
+ *		Perform per row FK existence check via direct index probe,
+ *		bypassing SPI.
+ *
+ * Return false if the index is unsuitable, so the caller can use SPI.
+ * Otherwise, report any violation via ri_ReportViolation(), or return true
+ * after a successful check.
+ */
+static bool
+ri_FastPathCheck(RI_ConstraintInfo *riinfo,
+				 Relation fk_rel, TupleTableSlot *newslot)
+{
+	Relation	pk_rel;
+	Relation	idx_rel;
+	IndexScanDesc scandesc;
+	TupleTableSlot *slot;
+	Datum		pk_vals[INDEX_MAX_KEYS];
+	char		pk_nulls[INDEX_MAX_KEYS];
+	ScanKeyData skey[INDEX_MAX_KEYS];
+	bool		found = false;
+	Oid			saved_userid;
+	int			saved_sec_context;
+	Snapshot	snapshot;
+	FastPathMeta *fpmeta;
+
+	INJECTION_POINT("ri-before-pk-lock", NULL);
+
+	pk_rel = table_open(riinfo->pk_relid, RowShareLock);
+
+	/*
+	 * The row lock taken below is refused in a read-only transaction unless
+	 * the referenced table is temporary, as ExecCheckXactReadOnly() refuses
+	 * the SPI path's SELECT ... FOR KEY SHARE.
+	 */
+	if (XactReadOnly && !isTempNamespace(RelationGetNamespace(pk_rel)))
+		PreventCommandIfReadOnly("SELECT FOR KEY SHARE");
+
+	/*
+	 * Advance the command counter so the check sees the effects of prior
+	 * triggers in this statement, as SPI does when executing the query issued
+	 * by ri_PerformCheck().  Do this after locking the referenced relation
+	 * and before reloading the constraint information, so local invalidations
+	 * are processed under the lock.
+	 */
+	CommandCounterIncrement();
+
+	/* Re-read the constraint under that lock. */
+	riinfo = ri_LoadConstraintInfo(riinfo->constraint_id);
+
+	idx_rel = index_open(riinfo->conindid, AccessShareLock);
+
+	if (!ri_check_fastpath_index(riinfo, fk_rel, pk_rel, idx_rel))
+	{
+		index_close(idx_rel, NoLock);
+		table_close(pk_rel, NoLock);
+		return false;
+	}
+
+	/*
+	 * Only now take the snapshot the scan will use.  Acquiring it before
+	 * table_open() would let an unbounded amount of time pass while we wait
+	 * for the lock, during which another transaction can commit the very row
+	 * we are about to look for.  The scan would not see it and the check
+	 * would report a violation for a key that exists.
+	 *
+	 * The SPI path does not have this problem: for this check it passes
+	 * InvalidSnapshot, so SPI takes the snapshot after the
+	 * referenced-relation lock has been acquired.
+	 *
+	 * Make this snapshot active too, as SPI does.  STABLE equality functions
+	 * use the active snapshot, so leaving the outer query's snapshot active
+	 * could hide changes made by earlier triggers even though the index scan
+	 * can see them.
+	 */
+	snapshot = RegisterSnapshot(GetTransactionSnapshot());
+	PushActiveSnapshot(snapshot);
+
+	slot = table_slot_create(pk_rel, NULL);
+
+	GetUserIdAndSecContext(&saved_userid, &saved_sec_context);
+	SetUserIdAndSecContext(RelationGetForm(pk_rel)->relowner,
+						   saved_sec_context |
+						   SECURITY_LOCAL_USERID_CHANGE |
+						   SECURITY_NOFORCE_RLS);
+	ri_CheckPermissions(riinfo, pk_rel);
+
+	/*
+	 * Begin the scan under the switched user id, so that any access method
+	 * code invoked by index_beginscan() runs as the PK relation's owner.  For
+	 * btree this has no functional consequence, but it keeps the ordering
+	 * correct for out-of-tree access methods.
+	 */
+	scandesc = index_beginscan(pk_rel, idx_rel, false,
+							   snapshot, NULL,
+							   riinfo->nkeys, 0,
+							   SO_NONE);
+
+	if (riinfo->fpmeta == NULL)
+	{
+		/* Reload to ensure it's valid. */
+		riinfo = ri_LoadConstraintInfo(riinfo->constraint_id);
+		ri_populate_fastpath_metadata(riinfo, idx_rel);
+	}
+
+	/*
+	 * Use our own pointer to the metadata from here on.  The permission
+	 * checks below look up catalog entries and so can process invalidation
+	 * messages, which detach riinfo->fpmeta (see
+	 * InvalidateConstraintCacheCallBack()); the detached object stays valid
+	 * until AtEOXact_RI().
+	 */
+	fpmeta = riinfo->fpmeta;
+	Assert(fpmeta);
+	ri_CheckFunctionPermissions(riinfo, fpmeta);
+	ri_ExtractValues(fk_rel, newslot, riinfo, false, pk_vals, pk_nulls);
+	build_index_scankeys(riinfo, fpmeta, idx_rel, pk_vals, skey);
+	found = ri_FastPathProbeOne(pk_rel, idx_rel, scandesc, slot,
+								snapshot, riinfo, skey, riinfo->nkeys);
+	SetUserIdAndSecContext(saved_userid, saved_sec_context);
+	index_endscan(scandesc);
+	ExecDropSingleTupleTableSlot(slot);
+	UnregisterSnapshot(snapshot);
+	PopActiveSnapshot();
+
+	if (!found)
+		ri_ReportViolation(riinfo, pk_rel, fk_rel,
+						   newslot, NULL,
+						   RI_PLAN_CHECK_LOOKUPPK, false, false);
+
+	index_close(idx_rel, NoLock);
+	table_close(pk_rel, NoLock);
+	return true;
+}
+
+/*
+ * ri_FastPathProbeOne
+ *		Probe the PK index for one set of scan keys, lock the matching
+ *		tuple
+ *
+ * Returns true if a matching PK row was found, locked, and (if
+ * applicable) visible to the transaction snapshot.
+ */
+static bool
+ri_FastPathProbeOne(Relation pk_rel, Relation idx_rel,
+					IndexScanDesc scandesc, TupleTableSlot *slot,
+					Snapshot snapshot, const RI_ConstraintInfo *riinfo,
+					ScanKeyData *skey, int nkeys)
+{
+	bool		found = false;
+
+	index_rescan(scandesc, skey, nkeys, NULL, 0);
+
+	if (table_index_getnext_slot(scandesc, ForwardScanDirection, slot))
+	{
+		bool		concurrently_updated;
+
+		if (ri_LockPKTuple(pk_rel, slot, snapshot,
+						   &concurrently_updated))
+		{
+			if (concurrently_updated)
+				found = recheck_matched_pk_tuple(idx_rel, skey, nkeys, slot);
+			else
+				found = true;
+		}
+	}
+
+	return found;
+}
+
+/*
+ * ri_LockPKTuple
+ *		Lock a PK tuple found by the fast-path index scan.
+ *
+ * Calls table_tuple_lock() directly with handling specific to RI checks.
+ * Returns true if the tuple was successfully locked.
+ *
+ * Sets *concurrently_updated to true if the locked tuple was reached
+ * by following an update chain (tmfd.traversed), indicating the caller
+ * should recheck the key.
+ */
+static bool
+ri_LockPKTuple(Relation pk_rel, TupleTableSlot *slot, Snapshot snap,
+			   bool *concurrently_updated)
+{
+	TM_FailureData tmfd;
+	TM_Result	result;
+	int			lockflags = TUPLE_LOCK_FLAG_LOCK_UPDATE_IN_PROGRESS;
+
+	*concurrently_updated = false;
+
+	if (!IsolationUsesXactSnapshot())
+		lockflags |= TUPLE_LOCK_FLAG_FIND_LAST_VERSION;
+
+	/*
+	 * Lock as of the command ID the scan's snapshot was taken with, as
+	 * ExecLockRows() uses the es_output_cid fixed when its query started.
+	 * User code run during the scan, such as an equality function, may have
+	 * advanced the current command ID since; with that, a row it updated
+	 * would look updated by an earlier command (TM_Invisible) rather than by
+	 * this one (TM_SelfModified).
+	 */
+	result = table_tuple_lock(pk_rel, &slot->tts_tid, snap,
+							  slot, snap->curcid,
+							  LockTupleKeyShare, LockWaitBlock,
+							  lockflags, &tmfd);
+
+	switch (result)
+	{
+		case TM_Ok:
+			if (tmfd.traversed)
+				*concurrently_updated = true;
+			return true;
+
+		case TM_Deleted:
+			if (IsolationUsesXactSnapshot())
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("could not serialize access due to concurrent delete")));
+			return false;
+
+		case TM_Updated:
+			if (IsolationUsesXactSnapshot())
+				ereport(ERROR,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("could not serialize access due to concurrent update")));
+
+			/*
+			 * In READ COMMITTED, FIND_LAST_VERSION should have chased the
+			 * chain rather than returning TM_Updated.  As in ExecLockRows(),
+			 * treat this as an unexpected result.
+			 */
+			elog(ERROR, "unexpected table_tuple_lock status: %u", result);
+			break;
+
+		case TM_SelfModified:
+
+			/*
+			 * As in ExecLockRows(), ignore a tuple updated or deleted by the
+			 * current command or a later command in this transaction.
+			 */
+			return false;
+
+		case TM_Invisible:
+			elog(ERROR, "attempted to lock invisible tuple");
+			break;
+
+		default:
+			elog(ERROR, "unrecognized table_tuple_lock status: %u", result);
+			break;
+	}
+
+	return false;				/* keep compiler quiet */
+}
+
+/*
+ * Apply the cheap checks that depend only on riinfo; this runs for every
+ * row.  Checks that need the referenced index or catalog lookups are made
+ * once by ri_check_fastpath_index(), which caches the result in
+ * fastpath_state; an unknown state still needs it before using the fast
+ * path.
+ */
+static bool
+ri_fastpath_is_applicable(const RI_ConstraintInfo *riinfo)
+{
+	/*
+	 * Partitioned referenced tables are skipped for simplicity, since they
+	 * require routing the probe through the correct partition using
+	 * PartitionDirectory.
+	 */
+	if (riinfo->pk_is_partitioned)
+		return false;
+
+	/*
+	 * Temporal foreign keys use range overlap and containment semantics (&&,
+	 * <@, range_agg()) that inherently involve aggregation and multiple-row
+	 * reasoning, so they stay on the SPI path.
+	 */
+	if (riinfo->hasperiod)
+		return false;
+
+	return riinfo->fastpath_state != RI_FASTPATH_UNUSABLE;
+}
+
+/*
+ * Check eligibility that depends on the index or on the FK column types
+ * lazily, like fast-path scan metadata.  Cache both success and failure until
+ * the constraint information is reloaded.
+ *
+ * The caller has locked the referenced table, reloaded conindid, and opened
+ * the index.  Looking up index properties in ri_LoadConstraintInfo() would
+ * race with REINDEX CONCURRENTLY dropping an index read before that lock.
+ * The index-property checks use the held relation descriptors, and the check
+ * of the FK column types uses fk_rel.
+ */
+static bool
+ri_check_fastpath_index(RI_ConstraintInfo *riinfo, Relation fk_rel,
+						Relation pk_rel, Relation idx_rel)
+{
+	/* Opening the index can have processed further invalidations. */
+	if (!riinfo->valid)
+		riinfo = ri_LoadConstraintInfo(riinfo->constraint_id);
+
+	if (riinfo->fastpath_state != RI_FASTPATH_UNKNOWN)
+		return riinfo->fastpath_state == RI_FASTPATH_USABLE;
+
+	/*
+	 * The fast path probes the referenced index directly.  A foreign key's
+	 * referenced index need not be a primary key; transformFkeyCheckAttrs()
+	 * accepts any unique index, so an out-of-tree amcanunique access method
+	 * could reach here.  Restrict the fast path to btree; other access
+	 * methods fall back to SPI.
+	 */
+	if (idx_rel->rd_rel->relam != BTREE_AM_OID)
+	{
+		riinfo->fastpath_state = RI_FASTPATH_UNUSABLE;
+		return false;
+	}
+
+	/*
+	 * Leave comparisons with a different index and referenced-column
+	 * collation to SPI.  Map index keys to table attributes because the FK
+	 * columns need not be listed in index order.  Ignore INCLUDE columns.
+	 */
+	for (int i = 0; i < idx_rel->rd_index->indnkeyatts; i++)
+	{
+		AttrNumber	attnum = idx_rel->rd_index->indkey.values[i];
+
+		if (idx_rel->rd_indcollation[i] != RIAttCollation(pk_rel, attnum))
+		{
+			riinfo->fastpath_state = RI_FASTPATH_UNUSABLE;
+			return false;
+		}
+	}
+
+	/*
+	 * The equality operator stored in pg_constraint must still be an equality
+	 * member of the index opfamily.  When it is not, the direct fast-path
+	 * probe errors, so mark the fast path unusable and fall back to SPI,
+	 * which uses the same operator in a query where the planner simply
+	 * declines the index.
+	 */
+	for (int i = 0; i < riinfo->nkeys; i++)
+	{
+		int			idx_col;
+
+		for (idx_col = 0; idx_col < idx_rel->rd_index->indnkeyatts; idx_col++)
+		{
+			if (idx_rel->rd_index->indkey.values[idx_col] ==
+				riinfo->pk_attnums[i])
+				break;
+		}
+		Assert(idx_col < idx_rel->rd_index->indnkeyatts);
+
+		if (get_op_opfamily_strategy(riinfo->pf_eq_oprs[i],
+									 idx_rel->rd_opfamily[idx_col]) != BTEqualStrategyNumber)
+		{
+			riinfo->fastpath_state = RI_FASTPATH_UNUSABLE;
+			return false;
+		}
+	}
+
+	/*
+	 * The fast path passes FK values to the equality operator as they are, so
+	 * it needs the FK type to be binary-coercible to the operator's right
+	 * input type.  That covers cross-type operators, which take the FK type
+	 * directly, domains, and binary-compatible types.  Any other coercion is
+	 * left to SPI, which applies it as part of the query.
+	 */
+	for (int i = 0; i < riinfo->nkeys; i++)
+	{
+		Oid			fk_type = RIAttType(fk_rel, riinfo->fk_attnums[i]);
+		Oid			lefttype;
+		Oid			righttype;
+
+		op_input_types(riinfo->pf_eq_oprs[i], &lefttype, &righttype);
+		if (!IsBinaryCoercible(fk_type, righttype))
+		{
+			riinfo->fastpath_state = RI_FASTPATH_UNUSABLE;
+			return false;
+		}
+	}
+
+	riinfo->fastpath_state = RI_FASTPATH_USABLE;
+	return true;
+}
+
+/*
+ * ri_CheckPermissions
+ *		Check permissions for the SELECT ... FOR KEY SHARE used by the SPI
+ *		path, as the referenced table's owner.
+ *
+ * Go through ExecCheckPermissions() with a manufactured range table so that
+ * ExecutorCheckPerms_hook gets control, as it does for the query the SPI
+ * path executes.
+ */
+static void
+ri_CheckPermissions(const RI_ConstraintInfo *riinfo, Relation query_rel)
+{
+	AclResult	aclresult;
+	AclMode		requiredPerms = ACL_SELECT | ACL_SELECT_FOR_UPDATE;
+	RangeTblEntry *rte;
+	RTEPermissionInfo *perminfo;
+
+	/* USAGE on schema. */
+	aclresult = object_aclcheck(NamespaceRelationId,
+								RelationGetNamespace(query_rel),
+								GetUserId(), ACL_USAGE);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, OBJECT_SCHEMA,
+					   get_namespace_name(RelationGetNamespace(query_rel)));
+
+	/*
+	 * SELECT is needed only on the referenced key columns.  FOR KEY SHARE
+	 * also needs UPDATE privilege, which may be granted on any column; leave
+	 * updatedCols empty as the SPI query does.
+	 */
+	perminfo = makeNode(RTEPermissionInfo);
+	perminfo->relid = RelationGetRelid(query_rel);
+	perminfo->requiredPerms = requiredPerms;
+	for (int i = 0; i < riinfo->nkeys; i++)
+	{
+		int			attno = riinfo->pk_attnums[i] - FirstLowInvalidHeapAttributeNumber;
+
+		perminfo->selectedCols = bms_add_member(perminfo->selectedCols, attno);
+	}
+
+	rte = makeNode(RangeTblEntry);
+	rte->rtekind = RTE_RELATION;
+	rte->relid = RelationGetRelid(query_rel);
+	rte->relkind = query_rel->rd_rel->relkind;
+	rte->rellockmode = RowShareLock;
+	rte->perminfoindex = 1;
+
+	(void) ExecCheckPermissions(list_make1(rte), list_make1(perminfo), true);
+}
+
+/*
+ * recheck_matched_pk_tuple
+ *		After following an update chain (tmfd.traversed), verify that
+ *		the locked PK tuple still matches the original search keys.
+ *
+ * A non-key update (e.g. changing a non-PK column) creates a new tuple version
+ * that we've now locked, but the key is unchanged -- that's fine.  A key
+ * update means the value we were looking for is gone, so we should treat it as
+ * not found.
+ */
+static bool
+recheck_matched_pk_tuple(Relation idxrel, ScanKeyData *skeys, int nkeys,
+						 TupleTableSlot *new_slot)
+{
+	/*
+	 * TODO: BuildIndexInfo does a syscache lookup + palloc on every call.
+	 * This only fires on the concurrent-update path (tmfd.traversed), which
+	 * should be rare, so the cost is acceptable for now.  If profiling shows
+	 * otherwise, cache the IndexInfo in FastPathMeta.
+	 */
+	IndexInfo  *indexInfo = BuildIndexInfo(idxrel);
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+	bool		matched = true;
+
+	/* PK indexes never have these. */
+	Assert(indexInfo->ii_Expressions == NIL &&
+		   indexInfo->ii_ExclusionOps == NULL);
+
+	/* Form the index values and isnull flags given the table tuple. */
+	Assert(nkeys == indexInfo->ii_NumIndexKeyAttrs);
+	FormIndexDatum(indexInfo, new_slot, NULL, values, isnull);
+	for (int i = 0; i < nkeys; i++)
+	{
+		ScanKeyData *skey = &skeys[i];
+
+		/*
+		 * A foreign key may reference a nullable unique column, so the
+		 * version we chased the update chain to may have a NULL in a key
+		 * column.  A NULL never equals the value we searched for, so treat it
+		 * as no match, as the SPI path's requalification would.
+		 */
+		if (isnull[i] ||
+			!DatumGetBool(FunctionCall2Coll(&skey->sk_func,
+											skey->sk_collation,
+											values[i],
+											skey->sk_argument)))
+		{
+			matched = false;
+			break;
+		}
+	}
+
+	return matched;
+}
+
+/*
+ * ri_CheckFunctionPermissions
+ *		Check EXECUTE privilege on the functions the fast path invokes on the
+ *		FK values, as the referenced table's owner.
+ *
+ * This parallels the checks ExecInitFunc() performs when the SPI path
+ * initializes its generated query, where the equality operator's function
+ * appears in the WHERE clause.  The fast path is not used when the FK values
+ * need coercion (see ri_check_fastpath_index()), so that is the only function
+ * to check.  Call with the user id already switched to the referenced table's
+ * owner.
+ */
+static void
+ri_CheckFunctionPermissions(const RI_ConstraintInfo *riinfo,
+							const FastPathMeta *fpmeta)
+{
+	for (int i = 0; i < riinfo->nkeys; i++)
+	{
+		Oid			funcid = fpmeta->regops[i];
+		AclResult	aclresult;
+
+		aclresult = object_aclcheck(ProcedureRelationId, funcid,
+									GetUserId(), ACL_EXECUTE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, OBJECT_FUNCTION,
+						   get_func_name(funcid));
+		InvokeFunctionExecuteHook(funcid);
+	}
+}
+
+/*
+ * build_index_scankeys
+ *		Build ScanKeys for a direct index probe of the PK's unique index.
+ *
+ * Uses operator procedures and strategy numbers cached by
+ * ri_populate_fastpath_metadata() rather than looking them up on each
+ * invocation.  The FK values are used as they are: the fast path is only
+ * used when they need no coercion to the operator's input type.
+ */
+static void
+build_index_scankeys(const RI_ConstraintInfo *riinfo,
+					 const FastPathMeta *fpmeta,
+					 Relation idx_rel, const Datum *pk_vals,
+					 ScanKey skeys)
+{
+	Assert(fpmeta);
+
+	/*
+	 * Set up ScanKeys for the index scan. This is essentially how
+	 * ExecIndexBuildScanKeys() sets them up.  Use the cached index_attnos and
+	 * the corresponding collation since FK columns may be in a different
+	 * order than PK index columns.  Place each scan key at the array position
+	 * corresponding to its index column, since btree requires keys to be
+	 * ordered by attribute number.
+	 */
+	for (int i = 0; i < riinfo->nkeys; i++)
+	{
+		AttrNumber	pkattrno = fpmeta->index_attnos[i];
+		int			skey_pos = pkattrno - 1;	/* 0-based array position */
+
+		ScanKeyEntryInitialize(&skeys[skey_pos], 0, pkattrno,
+							   fpmeta->strats[i], fpmeta->subtypes[i],
+							   idx_rel->rd_indcollation[skey_pos], fpmeta->regops[i],
+							   pk_vals[i]);
+	}
+}
+
+/*
+ * ri_populate_fastpath_metadata
+ *		Cache per-key metadata needed by build_index_scankeys().
+ *
+ * Looks up the operator procedure OID and index strategy/subtype for each
+ * key column.  Called lazily on first use and persists for the lifetime of
+ * the RI_ConstraintInfo entry.
+ */
+static void
+ri_populate_fastpath_metadata(RI_ConstraintInfo *riinfo, Relation idx_rel)
+{
+	FastPathMeta *fpmeta;
+	MemoryContext oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+
+	Assert(riinfo != NULL && riinfo->valid);
+	Assert(riinfo->fpmeta == NULL);
+
+	fpmeta = palloc_object(FastPathMeta);
+	fpmeta->next_dead = NULL;
+
+	for (int i = 0; i < riinfo->nkeys; i++)
+	{
+		Oid			eq_opr = riinfo->pf_eq_oprs[i];
+		Oid			lefttype;
+		int			idx_col;
+
+		/*
+		 * Find the index column position for this constraint key.  The FK
+		 * constraint may reference columns in a different order than they
+		 * appear in the PK index, so we must map pk_attnums[i] to the
+		 * corresponding index column position.
+		 */
+		for (idx_col = 0; idx_col < riinfo->nkeys; idx_col++)
+		{
+			if (idx_rel->rd_index->indkey.values[idx_col] == riinfo->pk_attnums[i])
+				break;
+		}
+		Assert(idx_col < riinfo->nkeys);
+
+		/* 1-based attribute number */
+		fpmeta->index_attnos[i] = idx_col + 1;
+
+		fpmeta->regops[i] = get_opcode(eq_opr);
+
+		get_op_opfamily_properties(eq_opr,
+								   idx_rel->rd_opfamily[idx_col],
+								   false,
+								   &fpmeta->strats[i],
+								   &lefttype,
+								   &fpmeta->subtypes[i]);
+	}
+
+	riinfo->fpmeta = fpmeta;
+	MemoryContextSwitchTo(oldcxt);
 }
 
 /*
  * Extract fields from a tuple into Datum/nulls arrays
  */
 static void
-ri_ExtractValues(Relation rel, HeapTuple tup,
+ri_ExtractValues(Relation rel, TupleTableSlot *slot,
 				 const RI_ConstraintInfo *riinfo, bool rel_is_pk,
 				 Datum *vals, char *nulls)
 {
-	TupleDesc	tupdesc = rel->rd_att;
 	const int16 *attnums;
-	int			i;
 	bool		isnull;
 
 	if (rel_is_pk)
@@ -2725,10 +3437,9 @@ ri_ExtractValues(Relation rel, HeapTuple tup,
 	else
 		attnums = riinfo->fk_attnums;
 
-	for (i = 0; i < riinfo->nkeys; i++)
+	for (int i = 0; i < riinfo->nkeys; i++)
 	{
-		vals[i] = heap_getattr(tup, attnums[i], tupdesc,
-							   &isnull);
+		vals[i] = slot_getattr(slot, attnums[i], &isnull);
 		nulls[i] = isnull ? 'n' : ' ';
 	}
 }
@@ -2745,14 +3456,13 @@ ri_ExtractValues(Relation rel, HeapTuple tup,
 static void
 ri_ReportViolation(const RI_ConstraintInfo *riinfo,
 				   Relation pk_rel, Relation fk_rel,
-				   HeapTuple violator, TupleDesc tupdesc,
-				   int queryno)
+				   TupleTableSlot *violatorslot, TupleDesc tupdesc,
+				   int queryno, bool is_restrict, bool partgone)
 {
 	StringInfoData key_names;
 	StringInfoData key_values;
 	bool		onfk;
 	const int16 *attnums;
-	int			idx;
 	Oid			rel_oid;
 	AclResult	aclresult;
 	bool		has_perm = true;
@@ -2786,15 +3496,19 @@ ri_ReportViolation(const RI_ConstraintInfo *riinfo,
 	 *
 	 * Check table-level permissions next and, failing that, column-level
 	 * privileges.
+	 *
+	 * When a partition at the referenced side is being detached/dropped, we
+	 * needn't check, since the user must be the table owner anyway.
 	 */
-
-	if (check_enable_rls(rel_oid, InvalidOid, true) != RLS_ENABLED)
+	if (partgone)
+		has_perm = true;
+	else if (check_enable_rls(rel_oid, InvalidOid, true) != RLS_ENABLED)
 	{
 		aclresult = pg_class_aclcheck(rel_oid, GetUserId(), ACL_SELECT);
 		if (aclresult != ACLCHECK_OK)
 		{
 			/* Try for column-level permissions */
-			for (idx = 0; idx < riinfo->nkeys; idx++)
+			for (int idx = 0; idx < riinfo->nkeys; idx++)
 			{
 				aclresult = pg_attribute_aclcheck(rel_oid, attnums[idx],
 												  GetUserId(),
@@ -2817,15 +3531,27 @@ ri_ReportViolation(const RI_ConstraintInfo *riinfo,
 		/* Get printable versions of the keys involved */
 		initStringInfo(&key_names);
 		initStringInfo(&key_values);
-		for (idx = 0; idx < riinfo->nkeys; idx++)
+		for (int idx = 0; idx < riinfo->nkeys; idx++)
 		{
 			int			fnum = attnums[idx];
+			Form_pg_attribute att = TupleDescAttr(tupdesc, fnum - 1);
 			char	   *name,
 					   *val;
+			Datum		datum;
+			bool		isnull;
 
-			name = SPI_fname(tupdesc, fnum);
-			val = SPI_getvalue(violator, tupdesc, fnum);
-			if (!val)
+			name = NameStr(att->attname);
+
+			datum = slot_getattr(violatorslot, fnum, &isnull);
+			if (!isnull)
+			{
+				Oid			foutoid;
+				bool		typisvarlena;
+
+				getTypeOutputInfo(att->atttypid, &foutoid, &typisvarlena);
+				val = OidOutputFunctionCall(foutoid, datum);
+			}
+			else
 				val = "null";
 
 			if (idx > 0)
@@ -2838,7 +3564,17 @@ ri_ReportViolation(const RI_ConstraintInfo *riinfo,
 		}
 	}
 
-	if (onfk)
+	if (partgone)
+		ereport(ERROR,
+				(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
+				 errmsg("removing partition \"%s\" violates foreign key constraint \"%s\"",
+						RelationGetRelationName(pk_rel),
+						NameStr(riinfo->conname)),
+				 errdetail("Key (%s)=(%s) is still referenced from table \"%s\".",
+						   key_names.data, key_values.data,
+						   RelationGetRelationName(fk_rel)),
+				 errtableconstraint(fk_rel, NameStr(riinfo->conname))));
+	else if (onfk)
 		ereport(ERROR,
 				(errcode(ERRCODE_FOREIGN_KEY_VIOLATION),
 				 errmsg("insert or update on table \"%s\" violates foreign key constraint \"%s\"",
@@ -2850,6 +3586,20 @@ ri_ReportViolation(const RI_ConstraintInfo *riinfo,
 						   RelationGetRelationName(pk_rel)) :
 				 errdetail("Key is not present in table \"%s\".",
 						   RelationGetRelationName(pk_rel)),
+				 errtableconstraint(fk_rel, NameStr(riinfo->conname))));
+	else if (is_restrict)
+		ereport(ERROR,
+				(errcode(ERRCODE_RESTRICT_VIOLATION),
+				 errmsg("update or delete on table \"%s\" violates RESTRICT setting of foreign key constraint \"%s\" on table \"%s\"",
+						RelationGetRelationName(pk_rel),
+						NameStr(riinfo->conname),
+						RelationGetRelationName(fk_rel)),
+				 has_perm ?
+				 errdetail("Key (%s)=(%s) is referenced from table \"%s\".",
+						   key_names.data, key_values.data,
+						   RelationGetRelationName(fk_rel)) :
+				 errdetail("Key is referenced from table \"%s\".",
+						   RelationGetRelationName(fk_rel)),
 				 errtableconstraint(fk_rel, NameStr(riinfo->conname))));
 	else
 		ereport(ERROR,
@@ -2868,21 +3618,19 @@ ri_ReportViolation(const RI_ConstraintInfo *riinfo,
 }
 
 
-/* ----------
+/*
  * ri_NullCheck -
  *
- *	Determine the NULL state of all key values in a tuple
+ * Determine the NULL state of all key values in a tuple
  *
- *	Returns one of RI_KEYS_ALL_NULL, RI_KEYS_NONE_NULL or RI_KEYS_SOME_NULL.
- * ----------
+ * Returns one of RI_KEYS_ALL_NULL, RI_KEYS_NONE_NULL or RI_KEYS_SOME_NULL.
  */
 static int
 ri_NullCheck(TupleDesc tupDesc,
-			 HeapTuple tup,
+			 TupleTableSlot *slot,
 			 const RI_ConstraintInfo *riinfo, bool rel_is_pk)
 {
 	const int16 *attnums;
-	int			i;
 	bool		allnull = true;
 	bool		nonenull = true;
 
@@ -2891,9 +3639,9 @@ ri_NullCheck(TupleDesc tupDesc,
 	else
 		attnums = riinfo->fk_attnums;
 
-	for (i = 0; i < riinfo->nkeys; i++)
+	for (int i = 0; i < riinfo->nkeys; i++)
 	{
-		if (heap_attisnull(tup, attnums[i], tupDesc))
+		if (slot_attisnull(slot, attnums[i]))
 			nonenull = false;
 		else
 			allnull = false;
@@ -2909,37 +3657,39 @@ ri_NullCheck(TupleDesc tupDesc,
 }
 
 
-/* ----------
+/*
  * ri_InitHashTables -
  *
- *	Initialize our internal hash tables.
- * ----------
+ * Initialize our internal hash tables.
  */
 static void
 ri_InitHashTables(void)
 {
 	HASHCTL		ctl;
 
-	memset(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(Oid);
 	ctl.entrysize = sizeof(RI_ConstraintInfo);
 	ri_constraint_cache = hash_create("RI constraint cache",
 									  RI_INIT_CONSTRAINTHASHSIZE,
 									  &ctl, HASH_ELEM | HASH_BLOBS);
 
-	/* Arrange to flush cache on pg_constraint changes */
+	/* Arrange to flush cache on pg_constraint, pg_amop or pg_cast changes */
 	CacheRegisterSyscacheCallback(CONSTROID,
 								  InvalidateConstraintCacheCallBack,
 								  (Datum) 0);
+	CacheRegisterSyscacheCallback(AMOPOPID,
+								  InvalidateConstraintCacheCallBack,
+								  (Datum) 0);
+	CacheRegisterSyscacheCallback(CASTSOURCETARGET,
+								  InvalidateConstraintCacheCallBack,
+								  (Datum) 0);
 
-	memset(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(RI_QueryKey);
 	ctl.entrysize = sizeof(RI_QueryHashEntry);
 	ri_query_cache = hash_create("RI query cache",
 								 RI_INIT_QUERYHASHSIZE,
 								 &ctl, HASH_ELEM | HASH_BLOBS);
 
-	memset(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(RI_CompareKey);
 	ctl.entrysize = sizeof(RI_CompareHashEntry);
 	ri_compare_cache = hash_create("RI compare cache",
@@ -2948,12 +3698,11 @@ ri_InitHashTables(void)
 }
 
 
-/* ----------
+/*
  * ri_FetchPreparedPlan -
  *
- *	Lookup for a query key in our private hash table of prepared
- *	and saved SPI execution plans. Return the plan if found or NULL.
- * ----------
+ * Lookup for a query key in our private hash table of prepared
+ * and saved SPI execution plans. Return the plan if found or NULL.
  */
 static SPIPlanPtr
 ri_FetchPreparedPlan(RI_QueryKey *key)
@@ -2971,7 +3720,7 @@ ri_FetchPreparedPlan(RI_QueryKey *key)
 	 * Lookup for the key
 	 */
 	entry = (RI_QueryHashEntry *) hash_search(ri_query_cache,
-											  (void *) key,
+											  key,
 											  HASH_FIND, NULL);
 	if (entry == NULL)
 		return NULL;
@@ -2991,22 +3740,41 @@ ri_FetchPreparedPlan(RI_QueryKey *key)
 		return plan;
 
 	/*
-	 * Otherwise we might as well flush the cached plan now, to free a little
-	 * memory space before we make a new one.
+	 * Otherwise, detach the stale plan from the entry so that the caller's
+	 * replacement can be hashed under the same key, and free it if we can.
+	 *
+	 * We can't if an RI check further up the stack is executing this very
+	 * plan.  The check's query can run user-defined code (a cast function
+	 * applied to the FK values, or a trigger fired by a cascaded update or
+	 * delete, say) whose DML fires another RI check for the same constraint,
+	 * and hence the same query key, before the outer SPI_execute_snapshot()
+	 * returns.  If the plan has been invalidated in between, freeing it here
+	 * would pull the SPIPlan out from under the outer _SPI_execute_plan(). So
+	 * in that case queue it on ri_plan_dead_list, to be freed once no check
+	 * is executing it any more.
 	 */
 	entry->plan = NULL;
 	if (plan)
-		SPI_freeplan(plan);
+	{
+		if (!ri_PlanIsExecuting(plan))
+			SPI_freeplan(plan);
+		else
+		{
+			MemoryContext oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+
+			ri_plan_dead_list = lappend(ri_plan_dead_list, plan);
+			MemoryContextSwitchTo(oldcxt);
+		}
+	}
 
 	return NULL;
 }
 
 
-/* ----------
+/*
  * ri_HashPreparedPlan -
  *
- *	Add another plan to our private SPI query plan hashtable.
- * ----------
+ * Add another plan to our private SPI query plan hashtable.
  */
 static void
 ri_HashPreparedPlan(RI_QueryKey *key, SPIPlanPtr plan)
@@ -3025,45 +3793,124 @@ ri_HashPreparedPlan(RI_QueryKey *key, SPIPlanPtr plan)
 	 * invalid by ri_FetchPreparedPlan.
 	 */
 	entry = (RI_QueryHashEntry *) hash_search(ri_query_cache,
-											  (void *) key,
+											  key,
 											  HASH_ENTER, &found);
 	Assert(!found || entry->plan == NULL);
 	entry->plan = plan;
 }
 
 
-/* ----------
- * ri_KeysEqual -
+/*
+ * ri_PushExecutingPlan -
  *
- *	Check if all key values in OLD and NEW are equal.
+ * Record that ri_PerformCheck() is about to execute plan.  Returns the depth
+ * of the stack before the push; the caller pops by setting
+ * ri_executing_depth back to it when SPI_execute_snapshot() returns or
+ * throws an error.
+ */
+static int
+ri_PushExecutingPlan(SPIPlanPtr plan)
+{
+	int			depth = ri_executing_depth;
+
+	if (ri_executing_depth >= ri_executing_maxdepth)
+	{
+		int			newmax = Max(8, ri_executing_maxdepth * 2);
+
+		if (ri_executing_plans == NULL)
+			ri_executing_plans = (SPIPlanPtr *)
+				MemoryContextAlloc(TopMemoryContext,
+								   newmax * sizeof(SPIPlanPtr));
+		else
+			ri_executing_plans = (SPIPlanPtr *)
+				repalloc(ri_executing_plans, newmax * sizeof(SPIPlanPtr));
+		ri_executing_maxdepth = newmax;
+	}
+	ri_executing_plans[ri_executing_depth++] = plan;
+
+	return depth;
+}
+
+/*
+ * ri_PlanIsExecuting -
  *
- *	Note: at some point we might wish to redefine this as checking for
- *	"IS NOT DISTINCT" rather than "=", that is, allow two nulls to be
- *	considered equal.  Currently there is no need since all callers have
- *	previously found at least one of the rows to contain no nulls.
- * ----------
+ * Is plan being executed by an ri_PerformCheck() call in progress?  The
+ * stack is as deep as RI checks nest, so a linear scan is fine.
  */
 static bool
-ri_KeysEqual(Relation rel, HeapTuple oldtup, HeapTuple newtup,
+ri_PlanIsExecuting(SPIPlanPtr plan)
+{
+	for (int i = 0; i < ri_executing_depth; i++)
+	{
+		if (ri_executing_plans[i] == plan)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * ri_FreeDeadPlans -
+ *
+ * Free the plans queued on ri_plan_dead_list that no RI check is executing
+ * any more, keeping the others queued.  With the stack empty, that is all of
+ * them.
+ */
+static void
+ri_FreeDeadPlans(void)
+{
+	List	   *plans = ri_plan_dead_list;
+	ListCell   *lc;
+
+	/*
+	 * Detach the list from the static before freeing, so that an error while
+	 * freeing a plan does not leave a dangling pointer to a half-freed plan
+	 * in it.  Not expected, but we may be called from the abort path, where
+	 * no further cleanup pass would come to fix that up.
+	 */
+	ri_plan_dead_list = NIL;
+
+	foreach(lc, plans)
+	{
+		SPIPlanPtr	plan = (SPIPlanPtr) lfirst(lc);
+
+		if (ri_PlanIsExecuting(plan))
+			continue;
+		SPI_freeplan(plan);
+		plans = foreach_delete_current(plans, lc);
+	}
+
+	/* Put back whatever is still executing, if any. */
+	Assert(plans == NIL || ri_executing_depth > 0);
+	ri_plan_dead_list = plans;
+}
+
+
+/*
+ * ri_KeysEqual -
+ *
+ * Check if all key values in OLD and NEW are "equivalent":
+ * For normal FKs we check for equality.
+ * For temporal FKs we check that the PK side is a superset of its old value,
+ * or the FK side is a subset of its old value.
+ *
+ * Note: at some point we might wish to redefine this as checking for
+ * "IS NOT DISTINCT" rather than "=", that is, allow two nulls to be
+ * considered equal.  Currently there is no need since all callers have
+ * previously found at least one of the rows to contain no nulls.
+ */
+static bool
+ri_KeysEqual(Relation rel, TupleTableSlot *oldslot, TupleTableSlot *newslot,
 			 const RI_ConstraintInfo *riinfo, bool rel_is_pk)
 {
-	TupleDesc	tupdesc = RelationGetDescr(rel);
 	const int16 *attnums;
-	const Oid  *eq_oprs;
-	int			i;
 
 	if (rel_is_pk)
-	{
 		attnums = riinfo->pk_attnums;
-		eq_oprs = riinfo->pp_eq_oprs;
-	}
 	else
-	{
 		attnums = riinfo->fk_attnums;
-		eq_oprs = riinfo->ff_eq_oprs;
-	}
 
-	for (i = 0; i < riinfo->nkeys; i++)
+	/* XXX: could be worthwhile to fetch all necessary attrs at once */
+	for (int i = 0; i < riinfo->nkeys; i++)
 	{
 		Datum		oldvalue;
 		Datum		newvalue;
@@ -3072,70 +3919,126 @@ ri_KeysEqual(Relation rel, HeapTuple oldtup, HeapTuple newtup,
 		/*
 		 * Get one attribute's oldvalue. If it is NULL - they're not equal.
 		 */
-		oldvalue = heap_getattr(oldtup, attnums[i], tupdesc, &isnull);
+		oldvalue = slot_getattr(oldslot, attnums[i], &isnull);
 		if (isnull)
 			return false;
 
 		/*
 		 * Get one attribute's newvalue. If it is NULL - they're not equal.
 		 */
-		newvalue = heap_getattr(newtup, attnums[i], tupdesc, &isnull);
+		newvalue = slot_getattr(newslot, attnums[i], &isnull);
 		if (isnull)
 			return false;
 
-		/*
-		 * Compare them with the appropriate equality operator.
-		 */
-		if (!ri_AttributesEqual(eq_oprs[i], RIAttType(rel, attnums[i]),
-								oldvalue, newvalue))
-			return false;
+		if (rel_is_pk)
+		{
+			/*
+			 * If we are looking at the PK table, then do a bytewise
+			 * comparison.  We must propagate PK changes if the value is
+			 * changed to one that "looks" different but would compare as
+			 * equal using the equality operator.  This only makes a
+			 * difference for ON UPDATE CASCADE, but for consistency we treat
+			 * all changes to the PK the same.
+			 */
+			CompactAttribute *att = TupleDescCompactAttr(oldslot->tts_tupleDescriptor, attnums[i] - 1);
+
+			if (!datum_image_eq(oldvalue, newvalue, att->attbyval, att->attlen))
+				return false;
+		}
+		else
+		{
+			Oid			eq_opr;
+
+			/*
+			 * When comparing the PERIOD columns we can skip the check
+			 * whenever the referencing column stayed equal or shrank, so test
+			 * with the contained-by operator instead.
+			 */
+			if (riinfo->hasperiod && i == riinfo->nkeys - 1)
+				eq_opr = riinfo->period_contained_by_oper;
+			else
+				eq_opr = riinfo->ff_eq_oprs[i];
+
+			/*
+			 * For the FK table, compare with the appropriate equality
+			 * operator.  Changes that compare equal will still satisfy the
+			 * constraint after the update.
+			 */
+			if (!ri_CompareWithCast(eq_opr, RIAttType(rel, attnums[i]), RIAttCollation(rel, attnums[i]),
+									newvalue, oldvalue))
+				return false;
+		}
 	}
 
 	return true;
 }
 
 
-/* ----------
- * ri_AttributesEqual -
+/*
+ * ri_CompareWithCast -
  *
- *	Call the appropriate equality comparison operator for two values.
+ * Call the appropriate comparison operator for two values.
+ * Normally this is equality, but for the PERIOD part of foreign keys
+ * it is ContainedBy, so the order of lhs vs rhs is significant.
+ * See below for how the collation is applied.
  *
- *	NB: we have already checked that neither value is null.
- * ----------
+ * NB: we have already checked that neither value is null.
  */
 static bool
-ri_AttributesEqual(Oid eq_opr, Oid typeid,
-				   Datum oldvalue, Datum newvalue)
+ri_CompareWithCast(Oid eq_opr, Oid typeid, Oid collid,
+				   Datum lhs, Datum rhs)
 {
 	RI_CompareHashEntry *entry = ri_HashCompareOp(eq_opr, typeid);
 
 	/* Do we need to cast the values? */
 	if (OidIsValid(entry->cast_func_finfo.fn_oid))
 	{
-		oldvalue = FunctionCall3(&entry->cast_func_finfo,
-								 oldvalue,
-								 Int32GetDatum(-1), /* typmod */
-								 BoolGetDatum(false));	/* implicit coercion */
-		newvalue = FunctionCall3(&entry->cast_func_finfo,
-								 newvalue,
-								 Int32GetDatum(-1), /* typmod */
-								 BoolGetDatum(false));	/* implicit coercion */
+		Oid			castfunc = entry->cast_func_finfo.fn_oid;
+		AclResult	aclresult;
+
+		aclresult = object_aclcheck(ProcedureRelationId, castfunc,
+									GetUserId(), ACL_EXECUTE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, OBJECT_FUNCTION,
+						   get_func_name(castfunc));
+		InvokeFunctionExecuteHook(castfunc);
+
+		lhs = FunctionCall3(&entry->cast_func_finfo,
+							lhs,
+							Int32GetDatum(-1),	/* typmod */
+							BoolGetDatum(false));	/* implicit coercion */
+		rhs = FunctionCall3(&entry->cast_func_finfo,
+							rhs,
+							Int32GetDatum(-1),	/* typmod */
+							BoolGetDatum(false));	/* implicit coercion */
 	}
 
 	/*
-	 * Apply the comparison operator.  We assume it doesn't care about
-	 * collations.
+	 * Apply the comparison operator.
+	 *
+	 * Note: This function is part of a call stack that determines whether an
+	 * update to a row is significant enough that it needs checking or action
+	 * on the other side of a foreign-key constraint.  Therefore, the
+	 * comparison here would need to be done with the collation of the *other*
+	 * table.  For simplicity (e.g., we might not even have the other table
+	 * open), we'll use our own collation.  This is fine because we require
+	 * that both collations have the same notion of equality (either they are
+	 * both deterministic or else they are both the same).
+	 *
+	 * With range/multirangetypes, the collation of the base type is stored as
+	 * part of the rangetype (pg_range.rngcollation), and always used, so
+	 * there is no danger of inconsistency even using a non-equals operator.
+	 * But if we support arbitrary types with PERIOD, we should perhaps just
+	 * always force a re-check.
 	 */
-	return DatumGetBool(FunctionCall2(&entry->eq_opr_finfo,
-									  oldvalue, newvalue));
+	return DatumGetBool(FunctionCall2Coll(&entry->eq_opr_finfo, collid, lhs, rhs));
 }
 
-/* ----------
+/*
  * ri_HashCompareOp -
  *
- *	See if we know how to compare two values, and create a new hash entry
- *	if not.
- * ----------
+ * See if we know how to compare two values, and create a new hash entry
+ * if not.
  */
 static RI_CompareHashEntry *
 ri_HashCompareOp(Oid eq_opr, Oid typeid)
@@ -3157,7 +4060,7 @@ ri_HashCompareOp(Oid eq_opr, Oid typeid)
 	key.eq_opr = eq_opr;
 	key.typeid = typeid;
 	entry = (RI_CompareHashEntry *) hash_search(ri_compare_cache,
-												(void *) &key,
+												&key,
 												HASH_ENTER, &found);
 	if (!found)
 		entry->valid = false;
@@ -3183,7 +4086,7 @@ ri_HashCompareOp(Oid eq_opr, Oid typeid)
 		 * the cast function to get to the operator's input type.
 		 *
 		 * XXX eventually it would be good to support array-coercion cases
-		 * here and in ri_AttributesEqual().  At the moment there is no point
+		 * here and in ri_CompareWithCast().  At the moment there is no point
 		 * because cases involving nonidentical array types will be rejected
 		 * at constraint creation time.
 		 *
@@ -3253,4 +4156,54 @@ RI_FKey_trigger_type(Oid tgfoid)
 	}
 
 	return RI_TRIGGER_NONE;
+}
+
+/*
+ * AtEOXact_RI
+ *		End-of-transaction cleanup for referential integrity.
+ *
+ * This releases objects that were detached from the RI caches during the
+ * transaction but could not be freed on the spot, because an RI check
+ * further up the stack might still have been using them:
+ *
+ * - fast-path metadata detached by InvalidateConstraintCacheCallBack(),
+ *   queued on ri_fpmeta_dead_list;
+ *
+ * - SPI plans found invalid by ri_FetchPreparedPlan() while a check was
+ *   executing them, queued on ri_plan_dead_list.  These are normally freed
+ *   as soon as the check executing them finishes; we only see them here if
+ *   an error interrupted that check and no later check finished normally in
+ *   the transaction.
+ *
+ * Here no RI check can be in progress, so both can be released.  The
+ * release is the same on the commit and the abort path; isCommit only
+ * decides whether we can assert that the stack of executing plans is empty.
+ *
+ * There is no AtEOSubXact_RI() counterpart.  Nothing here is scoped to a
+ * subtransaction: a detached object stays reachable from its dead list
+ * whichever subtransaction detached it, and a check using one may be
+ * running at an outer level, so releasing at subtransaction end would be
+ * unsafe as well as unnecessary.
+ */
+void
+AtEOXact_RI(bool isCommit)
+{
+	while (ri_fpmeta_dead_list != NULL)
+	{
+		FastPathMeta *dead = ri_fpmeta_dead_list;
+
+		ri_fpmeta_dead_list = dead->next_dead;
+		pfree(dead);
+	}
+
+	/*
+	 * No RI check can be in progress here, so clear the stack.  On commit it
+	 * must be empty already, since ri_PerformCheck() pops its plan whether
+	 * the query returns or throws.  On abort it may not be, because a FATAL
+	 * error skips those pops.
+	 */
+	Assert(ri_executing_depth == 0 || !isCommit);
+	ri_executing_depth = 0;
+	if (ri_plan_dead_list != NIL)
+		ri_FreeDeadPlans();
 }

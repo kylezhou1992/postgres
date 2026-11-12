@@ -3,7 +3,7 @@
  * ginvalidate.c
  *	  Opclass validator for GIN.
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -19,13 +19,10 @@
 #include "catalog/pg_amop.h"
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_opclass.h"
-#include "catalog/pg_opfamily.h"
 #include "catalog/pg_type.h"
-#include "utils/builtins.h"
 #include "utils/lsyscache.h"
-#include "utils/syscache.h"
 #include "utils/regproc.h"
-
+#include "utils/syscache.h"
 
 /*
  * Validator for a GIN opclass.
@@ -40,8 +37,6 @@ ginvalidate(Oid opclassoid)
 	Oid			opcintype;
 	Oid			opckeytype;
 	char	   *opclassname;
-	HeapTuple	familytup;
-	Form_pg_opfamily familyform;
 	char	   *opfamilyname;
 	CatCList   *proclist,
 			   *oprlist;
@@ -64,12 +59,7 @@ ginvalidate(Oid opclassoid)
 	opclassname = NameStr(classform->opcname);
 
 	/* Fetch opfamily information */
-	familytup = SearchSysCache1(OPFAMILYOID, ObjectIdGetDatum(opfamilyoid));
-	if (!HeapTupleIsValid(familytup))
-		elog(ERROR, "cache lookup failed for operator family %u", opfamilyoid);
-	familyform = (Form_pg_opfamily) GETSTRUCT(familytup);
-
-	opfamilyname = NameStr(familyform->opfname);
+	opfamilyname = get_opfamily_name(opfamilyoid, false);
 
 	/* Fetch all operators and support functions of the opfamily */
 	oprlist = SearchSysCacheList1(AMOPSTRATEGY, ObjectIdGetDatum(opfamilyoid));
@@ -142,6 +132,9 @@ ginvalidate(Oid opclassoid)
 											opcintype, INT4OID,
 											INTERNALOID, INTERNALOID,
 											INTERNALOID);
+				break;
+			case GIN_OPTIONS_PROC:
+				ok = check_amoptsproc_signature(procform->amproc);
 				break;
 			default:
 				ereport(INFO,
@@ -238,7 +231,8 @@ ginvalidate(Oid opclassoid)
 		if (opclassgroup &&
 			(opclassgroup->functionset & (((uint64) 1) << i)) != 0)
 			continue;			/* got it */
-		if (i == GIN_COMPARE_PROC || i == GIN_COMPARE_PARTIAL_PROC)
+		if (i == GIN_COMPARE_PROC || i == GIN_COMPARE_PARTIAL_PROC ||
+			i == GIN_OPTIONS_PROC)
 			continue;			/* optional method */
 		if (i == GIN_CONSISTENT_PROC || i == GIN_TRICONSISTENT_PROC)
 			continue;			/* don't need both, see check below loop */
@@ -263,8 +257,72 @@ ginvalidate(Oid opclassoid)
 
 	ReleaseCatCacheList(proclist);
 	ReleaseCatCacheList(oprlist);
-	ReleaseSysCache(familytup);
 	ReleaseSysCache(classtup);
 
 	return result;
+}
+
+/*
+ * Prechecking function for adding operators/functions to a GIN opfamily.
+ */
+void
+ginadjustmembers(Oid opfamilyoid,
+				 Oid opclassoid,
+				 List *operators,
+				 List *functions)
+{
+	ListCell   *lc;
+
+	/*
+	 * Operator members of a GIN opfamily should never have hard dependencies,
+	 * since their connection to the opfamily depends only on what the support
+	 * functions think, and that can be altered.  For consistency, we make all
+	 * soft dependencies point to the opfamily, though a soft dependency on
+	 * the opclass would work as well in the CREATE OPERATOR CLASS case.
+	 */
+	foreach(lc, operators)
+	{
+		OpFamilyMember *op = (OpFamilyMember *) lfirst(lc);
+
+		op->ref_is_hard = false;
+		op->ref_is_family = true;
+		op->refobjid = opfamilyoid;
+	}
+
+	/*
+	 * Required support functions should have hard dependencies.  Preferably
+	 * those are just dependencies on the opclass, but if we're in ALTER
+	 * OPERATOR FAMILY, we leave the dependency pointing at the whole
+	 * opfamily.  (Given that GIN opclasses generally don't share opfamilies,
+	 * it seems unlikely to be worth working harder.)
+	 */
+	foreach(lc, functions)
+	{
+		OpFamilyMember *op = (OpFamilyMember *) lfirst(lc);
+
+		switch (op->number)
+		{
+			case GIN_EXTRACTVALUE_PROC:
+			case GIN_EXTRACTQUERY_PROC:
+				/* Required support function */
+				op->ref_is_hard = true;
+				break;
+			case GIN_COMPARE_PROC:
+			case GIN_CONSISTENT_PROC:
+			case GIN_COMPARE_PARTIAL_PROC:
+			case GIN_TRICONSISTENT_PROC:
+			case GIN_OPTIONS_PROC:
+				/* Optional, so force it to be a soft family dependency */
+				op->ref_is_hard = false;
+				op->ref_is_family = true;
+				op->refobjid = opfamilyoid;
+				break;
+			default:
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("support function number %d is invalid for access method %s",
+								op->number, "gin")));
+				break;
+		}
+	}
 }

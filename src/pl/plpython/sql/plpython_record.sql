@@ -27,7 +27,7 @@ elif typ == 'obj':
 	type_record.first = first
 	type_record.second = second
 	return type_record
-$$ LANGUAGE plpythonu;
+$$ LANGUAGE plpython3u;
 
 CREATE FUNCTION test_type_record_as(typ text, first text, second integer, retnull boolean) RETURNS type_record AS $$
 if retnull:
@@ -45,20 +45,20 @@ elif typ == 'obj':
 	return type_record
 elif typ == 'str':
 	return "('%s',%r)" % (first, second)
-$$ LANGUAGE plpythonu;
+$$ LANGUAGE plpython3u;
 
 CREATE FUNCTION test_in_out_params(first in text, second out text) AS $$
 return first + '_in_to_out';
-$$ LANGUAGE plpythonu;
+$$ LANGUAGE plpython3u;
 
 CREATE FUNCTION test_in_out_params_multi(first in text,
                                          second out text, third out text) AS $$
 return (first + '_record_in_to_out_1', first + '_record_in_to_out_2');
-$$ LANGUAGE plpythonu;
+$$ LANGUAGE plpython3u;
 
 CREATE FUNCTION test_inout_params(first inout text) AS $$
 return first + '_inout';
-$$ LANGUAGE plpythonu;
+$$ LANGUAGE plpython3u;
 
 
 -- Test tuple returning functions
@@ -132,18 +132,35 @@ ALTER TYPE type_record ADD ATTRIBUTE second int4;
 
 SELECT * FROM test_type_record_as('obj', 'one', 1, false);
 
+-- check handling of record types defined by the calling query
+
+CREATE FUNCTION test_returns_record() RETURNS record AS $$
+   return (1, 2)
+$$ LANGUAGE plpython3u;
+
+SELECT * FROM test_returns_record() AS (a int, b int);
+SELECT * FROM test_returns_record();  -- fail
+
+-- alternate spelling of identical functionality
+CREATE FUNCTION test_returns_out_record(OUT r record) AS $$
+   return (1, 2)
+$$ LANGUAGE plpython3u;
+
+SELECT * FROM test_returns_out_record() AS (a int, b int);
+SELECT * FROM test_returns_out_record();  -- fail
+
 -- errors cases
 
 CREATE FUNCTION test_type_record_error1() RETURNS type_record AS $$
     return { 'first': 'first' }
-$$ LANGUAGE plpythonu;
+$$ LANGUAGE plpython3u;
 
 SELECT * FROM test_type_record_error1();
 
 
 CREATE FUNCTION test_type_record_error2() RETURNS type_record AS $$
     return [ 'first' ]
-$$ LANGUAGE plpythonu;
+$$ LANGUAGE plpython3u;
 
 SELECT * FROM test_type_record_error2();
 
@@ -152,12 +169,12 @@ CREATE FUNCTION test_type_record_error3() RETURNS type_record AS $$
     class type_record: pass
     type_record.first = 'first'
     return type_record
-$$ LANGUAGE plpythonu;
+$$ LANGUAGE plpython3u;
 
 SELECT * FROM test_type_record_error3();
 
 CREATE FUNCTION test_type_record_error4() RETURNS type_record AS $$
     return 'foo'
-$$ LANGUAGE plpythonu;
+$$ LANGUAGE plpython3u;
 
 SELECT * FROM test_type_record_error4();

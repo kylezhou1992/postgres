@@ -4,7 +4,7 @@
  *	  various support functions for SP-GiST
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -19,22 +19,22 @@
 #include "access/htup_details.h"
 #include "access/reloptions.h"
 #include "access/spgist_private.h"
+#include "access/toast_compression.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/pg_amop.h"
-#include "optimizer/paths.h"
+#include "commands/vacuum.h"
+#include "nodes/nodeFuncs.h"
+#include "parser/parse_coerce.h"
 #include "storage/bufmgr.h"
 #include "storage/indexfsm.h"
-#include "storage/lmgr.h"
-#include "utils/builtins.h"
 #include "utils/catcache.h"
+#include "utils/fmgrprotos.h"
 #include "utils/index_selfuncs.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
 #include "utils/syscache.h"
 
-extern Expr *spgcanorderbyop(IndexOptInfo *index,
-				PathKey *pathkey, int pathkeyno,
-				Expr *orderby_clause, int *indexcol_p);
 
 /*
  * SP-GiST handler function: return IndexAmRoutine with access method parameters
@@ -43,55 +43,142 @@ extern Expr *spgcanorderbyop(IndexOptInfo *index,
 Datum
 spghandler(PG_FUNCTION_ARGS)
 {
-	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
+	static const IndexAmRoutine amroutine = {
+		.type = T_IndexAmRoutine,
+		.amstrategies = 0,
+		.amsupport = SPGISTNProc,
+		.amoptsprocnum = SPGIST_OPTIONS_PROC,
+		.amcanorder = false,
+		.amcanorderbyop = true,
+		.amcanhash = false,
+		.amconsistentequality = false,
+		.amconsistentordering = false,
+		.amcanbackward = false,
+		.amcanunique = false,
+		.amcanmulticol = false,
+		.amoptionalkey = true,
+		.amsearcharray = false,
+		.amsearchnulls = true,
+		.amstorage = true,
+		.amclusterable = false,
+		.ampredlocks = false,
+		.amcanparallel = false,
+		.amcanbuildparallel = false,
+		.amcaninclude = true,
+		.amusemaintenanceworkmem = false,
+		.amsummarizing = false,
+		.amparallelvacuumoptions =
+		VACUUM_OPTION_PARALLEL_BULKDEL | VACUUM_OPTION_PARALLEL_COND_CLEANUP,
+		.amkeytype = InvalidOid,
 
-	amroutine->amstrategies = 0;
-	amroutine->amsupport = SPGISTNProc;
-	amroutine->amcanorder = false;
-	amroutine->amcanorderbyop = true;
-	amroutine->amcanbackward = false;
-	amroutine->amcanunique = false;
-	amroutine->amcanmulticol = false;
-	amroutine->amoptionalkey = true;
-	amroutine->amsearcharray = false;
-	amroutine->amsearchnulls = true;
-	amroutine->amstorage = false;
-	amroutine->amclusterable = false;
-	amroutine->ampredlocks = false;
-	amroutine->amcanparallel = false;
-	amroutine->amcaninclude = false;
-	amroutine->amkeytype = InvalidOid;
+		.ambuild = spgbuild,
+		.ambuildempty = spgbuildempty,
+		.aminsert = spginsert,
+		.aminsertcleanup = NULL,
+		.ambulkdelete = spgbulkdelete,
+		.amvacuumcleanup = spgvacuumcleanup,
+		.amcanreturn = spgcanreturn,
+		.amcostestimate = spgcostestimate,
+		.amgettreeheight = NULL,
+		.amoptions = spgoptions,
+		.amproperty = spgproperty,
+		.ambuildphasename = NULL,
+		.amvalidate = spgvalidate,
+		.amadjustmembers = spgadjustmembers,
+		.ambeginscan = spgbeginscan,
+		.amrescan = spgrescan,
+		.amgettuple = spggettuple,
+		.amgetbitmap = spggetbitmap,
+		.amendscan = spgendscan,
+		.ammarkpos = NULL,
+		.amrestrpos = NULL,
+		.amestimateparallelscan = NULL,
+		.aminitparallelscan = NULL,
+		.amparallelrescan = NULL,
+		.amtranslatestrategy = NULL,
+		.amtranslatecmptype = NULL,
+	};
 
-	amroutine->ambuild = spgbuild;
-	amroutine->ambuildempty = spgbuildempty;
-	amroutine->aminsert = spginsert;
-	amroutine->ambulkdelete = spgbulkdelete;
-	amroutine->amvacuumcleanup = spgvacuumcleanup;
-	amroutine->amcanreturn = spgcanreturn;
-	amroutine->amcostestimate = spgcostestimate;
-	amroutine->amoptions = spgoptions;
-	amroutine->amproperty = spgproperty;
-	amroutine->amvalidate = spgvalidate;
-	amroutine->ambeginscan = spgbeginscan;
-	amroutine->amrescan = spgrescan;
-	amroutine->amgettuple = spggettuple;
-	amroutine->amgetbitmap = spggetbitmap;
-	amroutine->amendscan = spgendscan;
-	amroutine->ammarkpos = NULL;
-	amroutine->amrestrpos = NULL;
-	amroutine->amestimateparallelscan = NULL;
-	amroutine->aminitparallelscan = NULL;
-	amroutine->amparallelrescan = NULL;
+	PG_RETURN_POINTER(&amroutine);
+}
 
-	PG_RETURN_POINTER(amroutine);
+/*
+ * GetIndexInputType
+ *		Determine the nominal input data type for an index column
+ *
+ * We define the "nominal" input type as the associated opclass's opcintype,
+ * or if that is a polymorphic type, the base type of the heap column or
+ * expression that is the index's input.  The reason for preferring the
+ * opcintype is that non-polymorphic opclasses probably don't want to hear
+ * about binary-compatible input types.  For instance, if a text opclass
+ * is being used with a varchar heap column, we want to report "text" not
+ * "varchar".  Likewise, opclasses don't want to hear about domain types,
+ * so if we do consult the actual input type, we make sure to flatten domains.
+ *
+ * At some point maybe this should go somewhere else, but it's not clear
+ * if any other index AMs have a use for it.
+ */
+static Oid
+GetIndexInputType(Relation index, AttrNumber indexcol)
+{
+	Oid			opcintype;
+	AttrNumber	heapcol;
+	List	   *indexprs;
+	ListCell   *indexpr_item;
+
+	Assert(index->rd_index != NULL);
+	Assert(indexcol > 0 && indexcol <= index->rd_index->indnkeyatts);
+	opcintype = index->rd_opcintype[indexcol - 1];
+	if (!IsPolymorphicType(opcintype))
+		return opcintype;
+	heapcol = index->rd_index->indkey.values[indexcol - 1];
+	if (heapcol != 0)			/* Simple index column? */
+		return getBaseType(get_atttype(index->rd_index->indrelid, heapcol));
+
+	/*
+	 * If the index expressions are already cached, skip calling
+	 * RelationGetIndexExpressions, as it will make a copy which is overkill.
+	 * We're not going to modify the trees, and we're not going to do anything
+	 * that would invalidate the relcache entry before we're done.
+	 */
+	if (index->rd_indexprs)
+		indexprs = index->rd_indexprs;
+	else
+		indexprs = RelationGetIndexExpressions(index);
+	indexpr_item = list_head(indexprs);
+	for (int i = 1; i <= index->rd_index->indnkeyatts; i++)
+	{
+		if (index->rd_index->indkey.values[i - 1] == 0)
+		{
+			/* expression column */
+			if (indexpr_item == NULL)
+				elog(ERROR, "wrong number of index expressions");
+			if (i == indexcol)
+				return getBaseType(exprType((Node *) lfirst(indexpr_item)));
+			indexpr_item = lnext(indexprs, indexpr_item);
+		}
+	}
+	elog(ERROR, "wrong number of index expressions");
+	return InvalidOid;			/* keep compiler quiet */
 }
 
 /* Fill in a SpGistTypeDesc struct with info about the specified data type */
 static void
 fillTypeDesc(SpGistTypeDesc *desc, Oid type)
 {
+	HeapTuple	tp;
+	Form_pg_type typtup;
+
 	desc->type = type;
-	get_typlenbyval(type, &desc->attlen, &desc->attbyval);
+	tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type));
+	if (!HeapTupleIsValid(tp))
+		elog(ERROR, "cache lookup failed for type %u", type);
+	typtup = (Form_pg_type) GETSTRUCT(tp);
+	desc->attlen = typtup->typlen;
+	desc->attbyval = typtup->typbyval;
+	desc->attalign = typtup->typalign;
+	desc->attstorage = typtup->typstorage;
+	ReleaseSysCache(tp);
 }
 
 /*
@@ -108,36 +195,56 @@ spgGetCache(Relation index)
 		Oid			atttype;
 		spgConfigIn in;
 		FmgrInfo   *procinfo;
-		Buffer		metabuffer;
-		SpGistMetaPageData *metadata;
 
 		cache = MemoryContextAllocZero(index->rd_indexcxt,
 									   sizeof(SpGistCache));
 
-		/* SPGiST doesn't support multi-column indexes */
-		Assert(index->rd_att->natts == 1);
+		/* SPGiST must have one key column and can also have INCLUDE columns */
+		Assert(IndexRelationGetNumberOfKeyAttributes(index) == 1);
+		Assert(IndexRelationGetNumberOfAttributes(index) <= INDEX_MAX_KEYS);
 
 		/*
-		 * Get the actual data type of the indexed column from the index
-		 * tupdesc.  We pass this to the opclass config function so that
-		 * polymorphic opclasses are possible.
+		 * Get the actual (well, nominal) data type of the key column.  We
+		 * pass this to the opclass config function so that polymorphic
+		 * opclasses are possible.
 		 */
-		atttype = TupleDescAttr(index->rd_att, 0)->atttypid;
+		atttype = GetIndexInputType(index, spgKeyColumn + 1);
 
 		/* Call the config function to get config info for the opclass */
 		in.attType = atttype;
 
 		procinfo = index_getprocinfo(index, 1, SPGIST_CONFIG_PROC);
 		FunctionCall2Coll(procinfo,
-						  index->rd_indcollation[0],
+						  index->rd_indcollation[spgKeyColumn],
 						  PointerGetDatum(&in),
 						  PointerGetDatum(&cache->config));
+
+		/*
+		 * If leafType isn't specified, use the declared index column type,
+		 * which index.c will have derived from the opclass's opcintype.
+		 * (Although we now make spgvalidate.c warn if these aren't the same,
+		 * old user-defined opclasses may not set the STORAGE parameter
+		 * correctly, so believe leafType if it's given.)
+		 */
+		if (!OidIsValid(cache->config.leafType))
+		{
+			cache->config.leafType =
+				TupleDescAttr(RelationGetDescr(index), spgKeyColumn)->atttypid;
+
+			/*
+			 * If index column type is binary-coercible to atttype (for
+			 * example, it's a domain over atttype), treat it as plain atttype
+			 * to avoid thinking we need to compress.
+			 */
+			if (cache->config.leafType != atttype &&
+				IsBinaryCoercible(cache->config.leafType, atttype))
+				cache->config.leafType = atttype;
+		}
 
 		/* Get the information we need about each relevant datatype */
 		fillTypeDesc(&cache->attType, atttype);
 
-		if (OidIsValid(cache->config.leafType) &&
-			cache->config.leafType != atttype)
+		if (cache->config.leafType != atttype)
 		{
 			if (!OidIsValid(index_getprocid(index, 1, SPGIST_COMPRESS_PROC)))
 				ereport(ERROR,
@@ -148,27 +255,37 @@ spgGetCache(Relation index)
 		}
 		else
 		{
+			/* Save lookups in this common case */
 			cache->attLeafType = cache->attType;
 		}
 
 		fillTypeDesc(&cache->attPrefixType, cache->config.prefixType);
 		fillTypeDesc(&cache->attLabelType, cache->config.labelType);
 
-		/* Last, get the lastUsedPages data from the metapage */
-		metabuffer = ReadBuffer(index, SPGIST_METAPAGE_BLKNO);
-		LockBuffer(metabuffer, BUFFER_LOCK_SHARE);
+		/*
+		 * Finally, if it's a real index (not a partitioned one), get the
+		 * lastUsedPages data from the metapage
+		 */
+		if (index->rd_rel->relkind != RELKIND_PARTITIONED_INDEX)
+		{
+			Buffer		metabuffer;
+			SpGistMetaPageData *metadata;
 
-		metadata = SpGistPageGetMeta(BufferGetPage(metabuffer));
+			metabuffer = ReadBuffer(index, SPGIST_METAPAGE_BLKNO);
+			LockBuffer(metabuffer, BUFFER_LOCK_SHARE);
 
-		if (metadata->magicNumber != SPGIST_MAGIC_NUMBER)
-			elog(ERROR, "index \"%s\" is not an SP-GiST index",
-				 RelationGetRelationName(index));
+			metadata = SpGistPageGetMeta(BufferGetPage(metabuffer));
 
-		cache->lastUsedPages = metadata->lastUsedPages;
+			if (metadata->magicNumber != SPGIST_MAGIC_NUMBER)
+				elog(ERROR, "index \"%s\" is not an SP-GiST index",
+					 RelationGetRelationName(index));
 
-		UnlockReleaseBuffer(metabuffer);
+			cache->lastUsedPages = metadata->lastUsedPages;
 
-		index->rd_amcache = (void *) cache;
+			UnlockReleaseBuffer(metabuffer);
+		}
+
+		index->rd_amcache = cache;
 	}
 	else
 	{
@@ -179,11 +296,59 @@ spgGetCache(Relation index)
 	return cache;
 }
 
+/*
+ * Compute a tuple descriptor for leaf tuples or index-only-scan result tuples.
+ *
+ * We can use the relcache's tupdesc as-is in many cases, and it's always
+ * OK so far as any INCLUDE columns are concerned.  However, the entry for
+ * the key column has to match leafType in the first case or attType in the
+ * second case.  While the relcache's tupdesc *should* show leafType, this
+ * might not hold for legacy user-defined opclasses, since before v14 they
+ * were not allowed to declare their true storage type in CREATE OPCLASS.
+ * Also, attType can be different from what is in the relcache.
+ *
+ * This function gives back either a pointer to the relcache's tupdesc
+ * if that is suitable, or a palloc'd copy that's been adjusted to match
+ * the specified key column type.  We can avoid doing any catalog lookups
+ * here by insisting that the caller pass an SpGistTypeDesc not just an OID.
+ */
+TupleDesc
+getSpGistTupleDesc(Relation index, SpGistTypeDesc *keyType)
+{
+	TupleDesc	outTupDesc;
+	Form_pg_attribute att;
+
+	if (keyType->type ==
+		TupleDescAttr(RelationGetDescr(index), spgKeyColumn)->atttypid)
+		outTupDesc = RelationGetDescr(index);
+	else
+	{
+		outTupDesc = CreateTupleDescCopy(RelationGetDescr(index));
+		att = TupleDescAttr(outTupDesc, spgKeyColumn);
+		/* It's sufficient to update the type-dependent fields of the column */
+		att->atttypid = keyType->type;
+		att->atttypmod = -1;
+		att->attlen = keyType->attlen;
+		att->attbyval = keyType->attbyval;
+		att->attalign = keyType->attalign;
+		att->attstorage = keyType->attstorage;
+		/* We shouldn't need to bother with making these valid: */
+		att->attcompression = InvalidCompressionMethod;
+		att->attcollation = InvalidOid;
+
+		populate_compact_attribute(outTupDesc, spgKeyColumn);
+		TupleDescFinalize(outTupDesc);
+	}
+	return outTupDesc;
+}
+
 /* Initialize SpGistState for working with the given index */
 void
 initSpGistState(SpGistState *state, Relation index)
 {
 	SpGistCache *cache;
+
+	state->index = index;
 
 	/* Get cached static information about index */
 	cache = spgGetCache(index);
@@ -194,11 +359,25 @@ initSpGistState(SpGistState *state, Relation index)
 	state->attPrefixType = cache->attPrefixType;
 	state->attLabelType = cache->attLabelType;
 
+	/* Ensure we have a valid descriptor for leaf tuples */
+	state->leafTupDesc = getSpGistTupleDesc(state->index, &state->attLeafType);
+
 	/* Make workspace for constructing dead tuples */
 	state->deadTupleStorage = palloc0(SGDTSIZE);
 
-	/* Set XID to use in redirection tuples */
-	state->myXid = GetTopTransactionIdIfAny();
+	/*
+	 * Set horizon XID to use in redirection tuples.  Use our own XID if we
+	 * have one, else use InvalidTransactionId.  The latter case can happen in
+	 * VACUUM or REINDEX CONCURRENTLY, and in neither case would it be okay to
+	 * force an XID to be assigned.  VACUUM won't create any redirection
+	 * tuples anyway, but REINDEX CONCURRENTLY can.  Fortunately, REINDEX
+	 * CONCURRENTLY doesn't mark the index valid until the end, so there could
+	 * never be any concurrent scans "in flight" to a redirection tuple it has
+	 * inserted.  And it locks out VACUUM until the end, too.  So it's okay
+	 * for VACUUM to immediately expire a redirection tuple that contains an
+	 * invalid xid.
+	 */
+	state->redirectXid = GetTopTransactionIdIfAny();
 
 	/* Assume we're not in an index build (spgbuild will override) */
 	state->isBuild = false;
@@ -214,7 +393,6 @@ Buffer
 SpGistNewBuffer(Relation index)
 {
 	Buffer		buffer;
-	bool		needLock;
 
 	/* First, try to get a page from FSM */
 	for (;;)
@@ -254,16 +432,8 @@ SpGistNewBuffer(Relation index)
 		ReleaseBuffer(buffer);
 	}
 
-	/* Must extend the file */
-	needLock = !RELATION_IS_LOCAL(index);
-	if (needLock)
-		LockRelationForExtension(index, ExclusiveLock);
-
-	buffer = ReadBuffer(index, P_NEW);
-	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-
-	if (needLock)
-		UnlockRelationForExtension(index, ExclusiveLock);
+	buffer = ExtendBufferedRel(BMR_REL(index), MAIN_FORKNUM, NULL,
+							   EB_LOCK_FIRST);
 
 	return buffer;
 }
@@ -411,8 +581,7 @@ SpGistGetBuffer(Relation index, int flags, int needSpace, bool *isNew)
 	 * related to the ones already on it.  But fillfactor mustn't cause an
 	 * error for requests that would otherwise be legal.
 	 */
-	needSpace += RelationGetTargetPageFreeSpace(index,
-												SPGIST_DEFAULT_FILLFACTOR);
+	needSpace += SpGistGetTargetPageFreeSpace(index);
 	needSpace = Min(needSpace, SPGIST_PAGE_CAPACITY);
 
 	/* Get the cache entry for this flags setting */
@@ -539,9 +708,8 @@ SpGistInitPage(Page page, uint16 f)
 {
 	SpGistPageOpaque opaque;
 
-	PageInit(page, BLCKSZ, MAXALIGN(sizeof(SpGistPageOpaqueData)));
+	PageInit(page, BLCKSZ, sizeof(SpGistPageOpaqueData));
 	opaque = SpGistPageGetOpaque(page);
-	memset(opaque, 0, sizeof(SpGistPageOpaqueData));
 	opaque->flags = f;
 	opaque->spgist_page_id = SPGIST_PAGE_ID;
 }
@@ -589,17 +757,25 @@ SpGistInitMetapage(Page page)
 bytea *
 spgoptions(Datum reloptions, bool validate)
 {
-	return default_reloptions(reloptions, validate, RELOPT_KIND_SPGIST);
+	static const relopt_parse_elt tab[] = {
+		{"fillfactor", RELOPT_TYPE_INT, offsetof(SpGistOptions, fillfactor)},
+	};
+
+	return (bytea *) build_reloptions(reloptions, validate,
+									  RELOPT_KIND_SPGIST,
+									  sizeof(SpGistOptions),
+									  tab, lengthof(tab));
 }
 
 /*
- * Get the space needed to store a non-null datum of the indicated type.
+ * Get the space needed to store a non-null datum of the indicated type
+ * in an inner tuple (that is, as a prefix or node label).
  * Note the result is already rounded up to a MAXALIGN boundary.
- * Also, we follow the SPGiST convention that pass-by-val types are
- * just stored in their Datum representation (compare memcpyDatum).
+ * Here we follow the convention that pass-by-val types are just stored
+ * in their Datum representation (compare memcpyInnerDatum).
  */
 unsigned int
-SpGistGetTypeSize(SpGistTypeDesc *att, Datum datum)
+SpGistGetInnerTypeSize(SpGistTypeDesc *att, Datum datum)
 {
 	unsigned int size;
 
@@ -608,16 +784,16 @@ SpGistGetTypeSize(SpGistTypeDesc *att, Datum datum)
 	else if (att->attlen > 0)
 		size = att->attlen;
 	else
-		size = VARSIZE_ANY(datum);
+		size = VARSIZE_ANY(DatumGetPointer(datum));
 
 	return MAXALIGN(size);
 }
 
 /*
- * Copy the given non-null datum to *target
+ * Copy the given non-null datum to *target, in the inner-tuple case
  */
 static void
-memcpyDatum(void *target, SpGistTypeDesc *att, Datum datum)
+memcpyInnerDatum(void *target, SpGistTypeDesc *att, Datum datum)
 {
 	unsigned int size;
 
@@ -627,29 +803,117 @@ memcpyDatum(void *target, SpGistTypeDesc *att, Datum datum)
 	}
 	else
 	{
-		size = (att->attlen > 0) ? att->attlen : VARSIZE_ANY(datum);
+		size = (att->attlen > 0) ? att->attlen : VARSIZE_ANY(DatumGetPointer(datum));
 		memcpy(target, DatumGetPointer(datum), size);
 	}
 }
 
 /*
- * Construct a leaf tuple containing the given heap TID and datum value
+ * Compute space required for a leaf tuple holding the given data.
+ *
+ * This must match the size-calculation portion of spgFormLeafTuple.
  */
-SpGistLeafTuple
-spgFormLeafTuple(SpGistState *state, ItemPointer heapPtr,
-				 Datum datum, bool isnull)
+Size
+SpGistGetLeafTupleSize(TupleDesc tupleDescriptor,
+					   const Datum *datums, const bool *isnulls)
 {
-	SpGistLeafTuple tup;
-	unsigned int size;
-
-	/* compute space needed (note result is already maxaligned) */
-	size = SGLTHDRSZ;
-	if (!isnull)
-		size += SpGistGetTypeSize(&state->attLeafType, datum);
+	Size		size;
+	Size		data_size;
+	bool		needs_null_mask = false;
+	int			natts = tupleDescriptor->natts;
 
 	/*
-	 * Ensure that we can replace the tuple with a dead tuple later.  This
-	 * test is unnecessary when !isnull, but let's be safe.
+	 * Decide whether we need a nulls bitmask.
+	 *
+	 * If there is only a key attribute (natts == 1), never use a bitmask, for
+	 * compatibility with the pre-v14 layout of leaf tuples.  Otherwise, we
+	 * need one if any attribute is null.
+	 */
+	if (natts > 1)
+	{
+		for (int i = 0; i < natts; i++)
+		{
+			if (isnulls[i])
+			{
+				needs_null_mask = true;
+				break;
+			}
+		}
+	}
+
+	/*
+	 * Calculate size of the data part; same as for heap tuples.
+	 */
+	data_size = heap_compute_data_size(tupleDescriptor, datums, isnulls, false);
+
+	/*
+	 * Compute total size.
+	 */
+	size = SGLTHDRSZ(needs_null_mask);
+	size += data_size;
+	size = MAXALIGN(size);
+
+	/*
+	 * Ensure that we can replace the tuple with a dead tuple later. This test
+	 * is unnecessary when there are any non-null attributes, but be safe.
+	 */
+	if (size < SGDTSIZE)
+		size = SGDTSIZE;
+
+	return size;
+}
+
+/*
+ * Construct a leaf tuple containing the given heap TID and datum values
+ */
+SpGistLeafTuple
+spgFormLeafTuple(SpGistState *state, const ItemPointerData *heapPtr,
+				 const Datum *datums, const bool *isnulls)
+{
+	SpGistLeafTuple tup;
+	TupleDesc	tupleDescriptor = state->leafTupDesc;
+	Size		size;
+	Size		hoff;
+	Size		data_size;
+	bool		needs_null_mask = false;
+	int			natts = tupleDescriptor->natts;
+	char	   *tp;				/* ptr to tuple data */
+	uint16		tupmask = 0;	/* unused heap_fill_tuple output */
+
+	/*
+	 * Decide whether we need a nulls bitmask.
+	 *
+	 * If there is only a key attribute (natts == 1), never use a bitmask, for
+	 * compatibility with the pre-v14 layout of leaf tuples.  Otherwise, we
+	 * need one if any attribute is null.
+	 */
+	if (natts > 1)
+	{
+		for (int i = 0; i < natts; i++)
+		{
+			if (isnulls[i])
+			{
+				needs_null_mask = true;
+				break;
+			}
+		}
+	}
+
+	/*
+	 * Calculate size of the data part; same as for heap tuples.
+	 */
+	data_size = heap_compute_data_size(tupleDescriptor, datums, isnulls, false);
+
+	/*
+	 * Compute total size.
+	 */
+	hoff = SGLTHDRSZ(needs_null_mask);
+	size = hoff + data_size;
+	size = MAXALIGN(size);
+
+	/*
+	 * Ensure that we can replace the tuple with a dead tuple later. This test
+	 * is unnecessary when there are any non-null attributes, but be safe.
 	 */
 	if (size < SGDTSIZE)
 		size = SGDTSIZE;
@@ -658,10 +922,29 @@ spgFormLeafTuple(SpGistState *state, ItemPointer heapPtr,
 	tup = (SpGistLeafTuple) palloc0(size);
 
 	tup->size = size;
-	tup->nextOffset = InvalidOffsetNumber;
+	SGLT_SET_NEXTOFFSET(tup, InvalidOffsetNumber);
 	tup->heapPtr = *heapPtr;
-	if (!isnull)
-		memcpyDatum(SGLTDATAPTR(tup), &state->attLeafType, datum);
+
+	tp = (char *) tup + hoff;
+
+	if (needs_null_mask)
+	{
+		uint8	   *bp;			/* ptr to null bitmap in tuple */
+
+		/* Set nullmask presence bit in SpGistLeafTuple header */
+		SGLT_SET_HASNULLMASK(tup, true);
+		/* Fill the data area and null mask */
+		bp = (uint8 *) ((char *) tup + sizeof(SpGistLeafTupleData));
+		heap_fill_tuple(tupleDescriptor, datums, isnulls, tp, data_size,
+						&tupmask, bp);
+	}
+	else if (natts > 1 || !isnulls[spgKeyColumn])
+	{
+		/* Fill data area only */
+		heap_fill_tuple(tupleDescriptor, datums, isnulls, tp, data_size,
+						&tupmask, (uint8 *) NULL);
+	}
+	/* otherwise we have no data, nor a bitmap, to fill */
 
 	return tup;
 }
@@ -682,7 +965,7 @@ spgFormNodeTuple(SpGistState *state, Datum label, bool isnull)
 	/* compute space needed (note result is already maxaligned) */
 	size = SGNTHDRSZ;
 	if (!isnull)
-		size += SpGistGetTypeSize(&state->attLabelType, label);
+		size += SpGistGetInnerTypeSize(&state->attLabelType, label);
 
 	/*
 	 * Here we make sure that the size will fit in the field reserved for it
@@ -706,7 +989,7 @@ spgFormNodeTuple(SpGistState *state, Datum label, bool isnull)
 	ItemPointerSetInvalid(&tup->t_tid);
 
 	if (!isnull)
-		memcpyDatum(SGNTDATAPTR(tup), &state->attLabelType, label);
+		memcpyInnerDatum(SGNTDATAPTR(tup), &state->attLabelType, label);
 
 	return tup;
 }
@@ -726,7 +1009,7 @@ spgFormInnerTuple(SpGistState *state, bool hasPrefix, Datum prefix,
 
 	/* Compute size needed */
 	if (hasPrefix)
-		prefixSize = SpGistGetTypeSize(&state->attPrefixType, prefix);
+		prefixSize = SpGistGetInnerTypeSize(&state->attPrefixType, prefix);
 	else
 		prefixSize = 0;
 
@@ -771,7 +1054,7 @@ spgFormInnerTuple(SpGistState *state, bool hasPrefix, Datum prefix,
 	tup->size = size;
 
 	if (hasPrefix)
-		memcpyDatum(SGITDATAPTR(tup), &state->attPrefixType, prefix);
+		memcpyInnerDatum(SGITDATAPTR(tup), &state->attPrefixType, prefix);
 
 	ptr = (char *) SGITNODEPTR(tup);
 
@@ -805,13 +1088,12 @@ spgFormDeadTuple(SpGistState *state, int tupstate,
 
 	tuple->tupstate = tupstate;
 	tuple->size = SGDTSIZE;
-	tuple->nextOffset = InvalidOffsetNumber;
+	SGLT_SET_NEXTOFFSET(tuple, InvalidOffsetNumber);
 
 	if (tupstate == SPGIST_REDIRECT)
 	{
 		ItemPointerSet(&tuple->pointer, blkno, offnum);
-		Assert(TransactionIdIsValid(state->myXid));
-		tuple->xid = state->myXid;
+		tuple->xid = state->redirectXid;
 	}
 	else
 	{
@@ -820,6 +1102,52 @@ spgFormDeadTuple(SpGistState *state, int tupstate,
 	}
 
 	return tuple;
+}
+
+/*
+ * Convert an SPGiST leaf tuple into Datum/isnull arrays.
+ *
+ * The caller must allocate sufficient storage for the output arrays.
+ * (INDEX_MAX_KEYS entries should be enough.)
+ */
+void
+spgDeformLeafTuple(SpGistLeafTuple tup, TupleDesc tupleDescriptor,
+				   Datum *datums, bool *isnulls, bool keyColumnIsNull)
+{
+	bool		hasNullsMask = SGLT_GET_HASNULLMASK(tup);
+	char	   *tp;				/* ptr to tuple data */
+	uint8	   *bp;				/* ptr to null bitmap in tuple */
+
+	if (keyColumnIsNull && tupleDescriptor->natts == 1)
+	{
+		/*
+		 * Trivial case: there is only the key attribute and we're in a nulls
+		 * tree.  The hasNullsMask bit in the tuple header should not be set
+		 * (and thus we can't use index_deform_tuple_internal), but
+		 * nonetheless the result is NULL.
+		 *
+		 * Note: currently this is dead code, because noplace calls this when
+		 * there is only the key attribute.  But we should cover the case.
+		 */
+		Assert(!hasNullsMask);
+
+		datums[spgKeyColumn] = (Datum) 0;
+		isnulls[spgKeyColumn] = true;
+		return;
+	}
+
+	tp = (char *) tup + SGLTHDRSZ(hasNullsMask);
+	bp = (uint8 *) ((char *) tup + sizeof(SpGistLeafTupleData));
+
+	index_deform_tuple_internal(tupleDescriptor,
+								datums, isnulls,
+								tp, bp, hasNullsMask);
+
+	/*
+	 * Key column isnull value from the tuple should be consistent with
+	 * keyColumnIsNull flag from the caller.
+	 */
+	Assert(keyColumnIsNull == isnulls[spgKeyColumn]);
 }
 
 /*
@@ -848,7 +1176,7 @@ spgExtractNodeLabels(SpGistState *state, SpGistInnerTuple innerTuple)
 	}
 	else
 	{
-		nodeLabels = (Datum *) palloc(sizeof(Datum) * innerTuple->nNodes);
+		nodeLabels = palloc_array(Datum, innerTuple->nNodes);
 		SGITITERATE(innerTuple, i, node)
 		{
 			if (IndexTupleHasNulls(node))
@@ -871,7 +1199,7 @@ spgExtractNodeLabels(SpGistState *state, SpGistInnerTuple innerTuple)
  * rather than returning InvalidOffsetNumber.
  */
 OffsetNumber
-SpGistPageAddNewItem(SpGistState *state, Page page, Item item, Size size,
+SpGistPageAddNewItem(SpGistState *state, Page page, const void *item, Size size,
 					 OffsetNumber *startOffset, bool errorOK)
 {
 	SpGistPageOpaque opaque = SpGistPageGetOpaque(page);
@@ -941,8 +1269,8 @@ SpGistPageAddNewItem(SpGistState *state, Page page, Item item, Size size,
 					*startOffset = offnum + 1;
 			}
 			else
-				elog(PANIC, "failed to add item of size %u to SPGiST index page",
-					 (int) size);
+				elog(PANIC, "failed to add item of size %zu to SPGiST index page",
+					 size);
 
 			return offnum;
 		}
@@ -953,8 +1281,8 @@ SpGistPageAddNewItem(SpGistState *state, Page page, Item item, Size size,
 						 InvalidOffsetNumber, false, false);
 
 	if (offnum == InvalidOffsetNumber && !errorOK)
-		elog(ERROR, "failed to add item of size %u to SPGiST index page",
-			 (int) size);
+		elog(ERROR, "failed to add item of size %zu to SPGiST index page",
+			 size);
 
 	return offnum;
 }
@@ -991,7 +1319,7 @@ spgproperty(Oid index_oid, int attno,
 	/*
 	 * Currently, SP-GiST distance-ordered scans require that there be a
 	 * distance operator in the opclass with the default types. So we assume
-	 * that if such a operator exists, then there's a reason for it.
+	 * that if such an operator exists, then there's a reason for it.
 	 */
 
 	/* First we need to know the column's opclass. */

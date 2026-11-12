@@ -28,6 +28,18 @@ SELECT generate_series(1, generate_series(1, 3)), generate_series(2, 4);
 CREATE TABLE few(id int, dataa text, datab text);
 INSERT INTO few VALUES(1, 'a', 'foo'),(2, 'a', 'bar'),(3, 'b', 'bar');
 
+-- SRF with a provably-dummy relation
+explain (verbose, costs off)
+SELECT unnest(ARRAY[1, 2]) FROM few WHERE false;
+SELECT unnest(ARRAY[1, 2]) FROM few WHERE false;
+
+-- SRF shouldn't prevent upper query from recognizing lower as dummy
+explain (verbose, costs off)
+SELECT * FROM few f1,
+  (SELECT unnest(ARRAY[1,2]) FROM few f2 WHERE false OFFSET 0) ss;
+SELECT * FROM few f1,
+  (SELECT unnest(ARRAY[1,2]) FROM few f2 WHERE false OFFSET 0) ss;
+
 -- SRF output order of sorting is maintained, if SRF is not referenced
 SELECT few.id, generate_series(1,3) g FROM few ORDER BY id DESC;
 
@@ -70,10 +82,14 @@ SELECT sum((3 = ANY(SELECT lag(x) over(order by x)
 -- SRFs are not allowed in window function arguments, either
 SELECT min(generate_series(1, 3)) OVER() FROM few;
 
--- SRFs are normally computed after window functions
+--- ... nor in window definitions
+SELECT sum(id) OVER (PARTITION BY generate_series(1, 3)) FROM few;
+SELECT sum(id) OVER (ORDER BY generate_series(1, 3)) FROM few;
+SELECT sum(id) OVER (ROWS BETWEEN UNBOUNDED PRECEDING
+                     AND generate_series(1, 3) FOLLOWING) FROM few;
+
+-- SRFs are computed after window functions
 SELECT id,lag(id) OVER(), count(*) OVER(), generate_series(1,3) FROM few;
--- unless referencing SRFs
-SELECT SUM(count(*)) OVER(PARTITION BY generate_series(1,3) ORDER BY generate_series(1,3)), generate_series(1,3) g FROM few GROUP BY g;
 
 -- sorting + grouping
 SELECT few.dataa, count(*), min(id), max(id), generate_series(1,3) FROM few GROUP BY few.dataa ORDER BY 5, 1;

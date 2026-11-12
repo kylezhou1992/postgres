@@ -7,25 +7,19 @@
 #include "postgres.h"
 
 #include "access/xact.h"
-#include "utils/memutils.h"
-
-#include "plpython.h"
-
-#include "plpy_subxactobject.h"
-
 #include "plpy_elog.h"
-
+#include "plpy_subxactobject.h"
+#include "plpy_util.h"
+#include "utils/memutils.h"
 
 List	   *explicit_subtransactions = NIL;
 
 
-static void PLy_subtransaction_dealloc(PyObject *subxact);
 static PyObject *PLy_subtransaction_enter(PyObject *self, PyObject *unused);
 static PyObject *PLy_subtransaction_exit(PyObject *self, PyObject *args);
 
-static char PLy_subtransaction_doc[] = {
-	"PostgreSQL subtransaction context manager"
-};
+static char PLy_subtransaction_doc[] =
+"PostgreSQL subtransaction context manager";
 
 static PyMethodDef PLy_subtransaction_methods[] = {
 	{"__enter__", PLy_subtransaction_enter, METH_VARARGS, NULL},
@@ -36,21 +30,35 @@ static PyMethodDef PLy_subtransaction_methods[] = {
 	{NULL, NULL, 0, NULL}
 };
 
-static PyTypeObject PLy_SubtransactionType = {
-	PyVarObject_HEAD_INIT(NULL, 0)
-	.tp_name = "PLySubtransaction",
-	.tp_basicsize = sizeof(PLySubtransactionObject),
-	.tp_dealloc = PLy_subtransaction_dealloc,
-	.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
-	.tp_doc = PLy_subtransaction_doc,
-	.tp_methods = PLy_subtransaction_methods,
+static PyType_Slot PLySubtransaction_slots[] =
+{
+	{
+		Py_tp_doc, (char *) PLy_subtransaction_doc
+	},
+	{
+		Py_tp_methods, PLy_subtransaction_methods
+	},
+	{
+		0, NULL
+	}
 };
+
+static PyType_Spec PLySubtransaction_spec =
+{
+	.name = "PLySubtransaction",
+	.basicsize = sizeof(PLySubtransactionObject),
+	.flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+	.slots = PLySubtransaction_slots,
+};
+
+static PyTypeObject *PLy_SubtransactionType;
 
 
 void
 PLy_subtransaction_init_type(void)
 {
-	if (PyType_Ready(&PLy_SubtransactionType) < 0)
+	PLy_SubtransactionType = (PyTypeObject *) PyType_FromSpec(&PLySubtransaction_spec);
+	if (!PLy_SubtransactionType)
 		elog(ERROR, "could not initialize PLy_SubtransactionType");
 }
 
@@ -60,21 +68,18 @@ PLy_subtransaction_new(PyObject *self, PyObject *unused)
 {
 	PLySubtransactionObject *ob;
 
-	ob = PyObject_New(PLySubtransactionObject, &PLy_SubtransactionType);
-
+	ob = PyObject_New(PLySubtransactionObject, PLy_SubtransactionType);
 	if (ob == NULL)
 		return NULL;
+#if PY_VERSION_HEX < 0x03080000
+	/* Workaround for Python issue 35810; no longer necessary in Python 3.8 */
+	Py_INCREF(PLy_SubtransactionType);
+#endif
 
 	ob->started = false;
 	ob->exited = false;
 
 	return (PyObject *) ob;
-}
-
-/* Python requires a dealloc function to be defined */
-static void
-PLy_subtransaction_dealloc(PyObject *subxact)
-{
 }
 
 /*
@@ -132,7 +137,7 @@ PLy_subtransaction_enter(PyObject *self, PyObject *unused)
  *
  * Exit an explicit subtransaction. exc_type is an exception type, exc
  * is the exception object, tb is the traceback.  If exc_type is None,
- * commit the subtransactiony, if not abort it.
+ * commit the subtransaction, if not abort it.
  *
  * The method signature is chosen to allow subtransaction objects to
  * be used as context managers as described in

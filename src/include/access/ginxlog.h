@@ -2,7 +2,7 @@
  * ginxlog.h
  *	  header file for postgres inverted index xlog implementation.
  *
- *	Copyright (c) 2006-2018, PostgreSQL Global Development Group
+ *	Copyright (c) 2006-2026, PostgreSQL Global Development Group
  *
  *	src/include/access/ginxlog.h
  *--------------------------------------------------------------------------
@@ -15,8 +15,6 @@
 #include "access/xlogreader.h"
 #include "lib/stringinfo.h"
 #include "storage/off.h"
-
-#define XLOG_GIN_CREATE_INDEX  0x00
 
 #define XLOG_GIN_CREATE_PTREE  0x10
 
@@ -112,7 +110,7 @@ typedef struct
 
 typedef struct ginxlogSplit
 {
-	RelFileNode node;
+	RelFileLocator locator;
 	BlockNumber rrlink;			/* right link, or root's blocknumber if root
 								 * split */
 	BlockNumber leftChildBlkno; /* valid on a non-leaf split */
@@ -129,7 +127,7 @@ typedef struct ginxlogSplit
 
 /*
  * Vacuum simply WAL-logs the whole page, when anything is modified. This
- * is functionally identical to heap_newpage records, but is kept separate for
+ * is functionally identical to XLOG_FPI records, but is kept separate for
  * debugging purposes. (When inspecting the WAL stream, it's easier to see
  * what's going on when GIN vacuum records are marked as such, not as heap
  * records.) This is currently only used for entry tree leaf pages.
@@ -158,6 +156,7 @@ typedef struct ginxlogDeletePage
 {
 	OffsetNumber parentOffset;
 	BlockNumber rightLink;
+	TransactionId deleteXid;	/* last Xid which could see this page in scan */
 } ginxlogDeletePage;
 
 #define XLOG_GIN_UPDATE_META_PAGE 0x60
@@ -168,7 +167,7 @@ typedef struct ginxlogDeletePage
  */
 typedef struct ginxlogUpdateMeta
 {
-	RelFileNode node;
+	RelFileLocator locator;
 	GinMetaPageData metadata;
 	BlockNumber prevTail;
 	BlockNumber newRightlink;
@@ -180,6 +179,9 @@ typedef struct ginxlogUpdateMeta
 
 #define XLOG_GIN_INSERT_LISTPAGE  0x70
 
+/*
+ * Backup Blk 0: list page with inserted tuples
+ */
 typedef struct ginxlogInsertListPage
 {
 	BlockNumber rightlink;

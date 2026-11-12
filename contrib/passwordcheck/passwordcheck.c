@@ -3,7 +3,7 @@
  * passwordcheck.c
  *
  *
- * Copyright (c) 2009-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2009-2026, PostgreSQL Global Development Group
  *
  * Author: Laurenz Albe <laurenz.albe@wien.gv.at>
  *
@@ -15,21 +15,26 @@
 #include "postgres.h"
 
 #include <ctype.h>
+#include <limits.h>
 
 #ifdef USE_CRACKLIB
 #include <crack.h>
 #endif
 
 #include "commands/user.h"
-#include "libpq/crypt.h"
 #include "fmgr.h"
+#include "libpq/crypt.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "passwordcheck",
+					.version = PG_VERSION
+);
 
-/* passwords shorter than this will be rejected */
-#define MIN_PWD_LENGTH 8
+/* Saved hook value */
+static check_password_hook_type prev_check_password_hook = NULL;
 
-extern void _PG_init(void);
+/* GUC variables */
+static int	min_password_length = 8;
 
 /*
  * check_password
@@ -55,6 +60,11 @@ check_password(const char *username,
 			   Datum validuntil_time,
 			   bool validuntil_null)
 {
+	if (prev_check_password_hook)
+		prev_check_password_hook(username, shadow_pass,
+								 password_type, validuntil_time,
+								 validuntil_null);
+
 	if (password_type != PASSWORD_TYPE_PLAINTEXT)
 	{
 		/*
@@ -65,7 +75,7 @@ check_password(const char *username,
 		 *
 		 * We only check for username = password.
 		 */
-		char	   *logdetail;
+		const char *logdetail = NULL;
 
 		if (plain_crypt_verify(username, shadow_pass, username, &logdetail) == STATUS_OK)
 			ereport(ERROR,
@@ -82,12 +92,17 @@ check_password(const char *username,
 		int			i;
 		bool		pwd_has_letter,
 					pwd_has_nonletter;
+#ifdef USE_CRACKLIB
+		const char *reason;
+#endif
 
 		/* enforce minimum length */
-		if (pwdlen < MIN_PWD_LENGTH)
+		if (pwdlen < min_password_length)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("password is too short")));
+					 errmsg("password is too short"),
+					 errdetail("Password must be at least \"passwordcheck.min_password_length\" (%d) bytes long.",
+							   min_password_length)));
 
 		/* check if the password contains the username */
 		if (strstr(password, username))
@@ -116,10 +131,11 @@ check_password(const char *username,
 
 #ifdef USE_CRACKLIB
 		/* call cracklib to check password */
-		if (FascistCheck(password, CRACKLIB_DICTPATH))
+		if ((reason = FascistCheck(password, CRACKLIB_DICTPATH)))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("password is easily cracked")));
+					 errmsg("password is easily cracked"),
+					 errdetail_log("cracklib diagnostic: %s", reason)));
 #endif
 	}
 
@@ -132,6 +148,20 @@ check_password(const char *username,
 void
 _PG_init(void)
 {
+	/* Define custom GUC variables. */
+	DefineCustomIntVariable("passwordcheck.min_password_length",
+							"Minimum allowed password length.",
+							NULL,
+							&min_password_length,
+							8,
+							0, INT_MAX,
+							PGC_SUSET,
+							GUC_UNIT_BYTE,
+							NULL, NULL, NULL);
+
+	MarkGUCPrefixReserved("passwordcheck");
+
 	/* activate password checks when the module is loaded */
+	prev_check_password_hook = check_password_hook;
 	check_password_hook = check_password;
 }

@@ -4,7 +4,7 @@
  *	  definition of the "extension" system catalog (pg_extension)
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_extension.h
@@ -19,27 +19,34 @@
 #define PG_EXTENSION_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_extension_d.h"
+#include "catalog/pg_extension_d.h" /* IWYU pragma: export */
 
 /* ----------------
  *		pg_extension definition.  cpp turns this into
  *		typedef struct FormData_pg_extension
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_extension,3079,ExtensionRelationId)
 {
+	Oid			oid;			/* oid */
 	NameData	extname;		/* extension name */
-	Oid			extowner;		/* extension owner */
-	Oid			extnamespace;	/* namespace of contained objects */
+	Oid			extowner BKI_LOOKUP(pg_authid); /* extension owner */
+	Oid			extnamespace BKI_LOOKUP(pg_namespace);	/* namespace of
+														 * contained objects */
 	bool		extrelocatable; /* if true, allow ALTER EXTENSION SET SCHEMA */
 
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	/* extversion may never be null, but the others can be. */
 	text		extversion BKI_FORCE_NOT_NULL;	/* extension version name */
-	Oid			extconfig[1];	/* dumpable configuration tables */
-	text		extcondition[1];	/* WHERE clauses for config tables */
+	Oid			extconfig[] BKI_LOOKUP(pg_class);	/* dumpable configuration
+													 * tables */
+	text		extcondition[]; /* WHERE clauses for config tables */
 #endif
 } FormData_pg_extension;
+
+END_CATALOG_STRUCT
 
 /* ----------------
  *		Form_pg_extension corresponds to a pointer to a tuple with
@@ -47,5 +54,13 @@ CATALOG(pg_extension,3079,ExtensionRelationId)
  * ----------------
  */
 typedef FormData_pg_extension *Form_pg_extension;
+
+DECLARE_TOAST(pg_extension, 4147, 4148);
+
+DECLARE_UNIQUE_INDEX_PKEY(pg_extension_oid_index, 3080, ExtensionOidIndexId, pg_extension, btree(oid oid_ops));
+DECLARE_UNIQUE_INDEX(pg_extension_name_index, 3081, ExtensionNameIndexId, pg_extension, btree(extname name_ops));
+
+MAKE_SYSCACHE(EXTENSIONOID, pg_extension_oid_index, 2);
+MAKE_SYSCACHE(EXTENSIONNAME, pg_extension_name_index, 2);
 
 #endif							/* PG_EXTENSION_H */

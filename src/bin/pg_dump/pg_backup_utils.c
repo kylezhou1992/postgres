@@ -4,7 +4,7 @@
  *	Utility routines shared by pg_dump and pg_restore
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/pg_dump/pg_backup_utils.c
@@ -13,11 +13,51 @@
  */
 #include "postgres_fe.h"
 
+#ifdef WIN32
 #include "parallel.h"
+#endif
 #include "pg_backup_utils.h"
 
 /* Globals exported by this file */
 const char *progname = NULL;
+
+#ifdef WIN32
+
+/*
+ * Flag telling worker threads to stay quiet about query failures because
+ * we're cancelling their queries as part of tearing down the process.  See
+ * the comment in pg_backup_utils.h.
+ *
+ * The cancel thread writes it while worker threads read it, so it's marked
+ * volatile to keep the compiler from caching the value.  A plain volatile
+ * bool isn't a memory barrier, but it's good enough here.  A lot of things
+ * happen between set_cancel_in_progress() in the cancel thread and the other
+ * threads calling is_cancel_in_progress(), including network operations,
+ * which implicitly act as memory barriers.  Furthermore, the flag is only
+ * ever flipped one way (false to true) and a worker briefly observing the
+ * stale false just means it would print one error before the process dies.
+ * The only goal of this flag is to make sure workers don't log "query
+ * cancelled" errors during the shutdown process.
+ *
+ * XXX: This should be swapped out for a proper atomic when we have those in
+ * the frontend code, so that we wouldn't need to rationalizee all of the
+ * above.
+ */
+static volatile bool cancelInProgress = false;
+
+void
+set_cancel_in_progress(void)
+{
+	cancelInProgress = true;
+}
+
+bool
+is_cancel_in_progress(void)
+{
+	return cancelInProgress;
+}
+
+#endif							/* WIN32 */
 
 #define MAX_ON_EXIT_NICELY				20
 
@@ -51,71 +91,19 @@ set_dump_section(const char *arg, int *dumpSections)
 		*dumpSections |= DUMP_POST_DATA;
 	else
 	{
-		fprintf(stderr, _("%s: unrecognized section name: \"%s\"\n"),
-				progname, arg);
-		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
-				progname);
+		pg_log_error("unrecognized section name: \"%s\"", arg);
+		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit_nicely(1);
 	}
 }
 
-
-/*
- * Write a printf-style message to stderr.
- *
- * The program name is prepended, if "progname" has been set.
- * Also, if modulename isn't NULL, that's included too.
- * Note that we'll try to translate the modulename and the fmt string.
- */
-void
-write_msg(const char *modulename, const char *fmt,...)
-{
-	va_list		ap;
-
-	va_start(ap, fmt);
-	vwrite_msg(modulename, fmt, ap);
-	va_end(ap);
-}
-
-/*
- * As write_msg, but pass a va_list not variable arguments.
- */
-void
-vwrite_msg(const char *modulename, const char *fmt, va_list ap)
-{
-	if (progname)
-	{
-		if (modulename)
-			fprintf(stderr, "%s: [%s] ", progname, _(modulename));
-		else
-			fprintf(stderr, "%s: ", progname);
-	}
-	vfprintf(stderr, _(fmt), ap);
-}
-
-/*
- * Fail and die, with a message to stderr.  Parameters as for write_msg.
- *
- * Note that on_exit_nicely callbacks will get run.
- */
-void
-exit_horribly(const char *modulename, const char *fmt,...)
-{
-	va_list		ap;
-
-	va_start(ap, fmt);
-	vwrite_msg(modulename, fmt, ap);
-	va_end(ap);
-
-	exit_nicely(1);
-}
 
 /* Register a callback to be run when exit_nicely is invoked. */
 void
 on_exit_nicely(on_exit_nicely_callback function, void *arg)
 {
 	if (on_exit_nicely_index >= MAX_ON_EXIT_NICELY)
-		exit_horribly(NULL, "out of on_exit_nicely slots\n");
+		pg_fatal("out of on_exit_nicely slots");
 	on_exit_nicely_list[on_exit_nicely_index].function = function;
 	on_exit_nicely_list[on_exit_nicely_index].arg = arg;
 	on_exit_nicely_index++;

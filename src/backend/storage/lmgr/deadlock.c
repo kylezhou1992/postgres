@@ -7,7 +7,7 @@
  * detection and resolution algorithms.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -30,6 +30,7 @@
 #include "pgstat.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
+#include "storage/procnumber.h"
 #include "utils/memutils.h"
 
 
@@ -79,15 +80,15 @@ typedef struct
 static bool DeadLockCheckRecurse(PGPROC *proc);
 static int	TestConfiguration(PGPROC *startProc);
 static bool FindLockCycle(PGPROC *checkProc,
-			  EDGE *softEdges, int *nSoftEdges);
+						  EDGE *softEdges, int *nSoftEdges);
 static bool FindLockCycleRecurse(PGPROC *checkProc, int depth,
-					 EDGE *softEdges, int *nSoftEdges);
+								 EDGE *softEdges, int *nSoftEdges);
 static bool FindLockCycleRecurseMember(PGPROC *checkProc,
-						   PGPROC *checkProcLeader,
-						   int depth, EDGE *softEdges, int *nSoftEdges);
+									   PGPROC *checkProcLeader,
+									   int depth, EDGE *softEdges, int *nSoftEdges);
 static bool ExpandConstraints(EDGE *constraints, int nConstraints);
 static bool TopoSort(LOCK *lock, EDGE *constraints, int nConstraints,
-		 PGPROC **ordering);
+					 PGPROC **ordering);
 
 #ifdef DEBUG_DEADLOCK
 static void PrintLockQueue(LOCK *lock, const char *info);
@@ -134,10 +135,9 @@ static PGPROC *blocking_autovacuum_proc = NULL;
  * This does per-backend initialization of the deadlock checker; primarily,
  * allocation of working memory for DeadLockCheck.  We do this per-backend
  * since there's no percentage in making the kernel do copy-on-write
- * inheritance of workspace from the postmaster.  We want to allocate the
- * space at startup because (a) the deadlock checker might be invoked when
- * there's no free memory left, and (b) the checker is normally run inside a
- * signal handler, which is a very dangerous place to invoke palloc from.
+ * inheritance of workspace from the postmaster.  We allocate the space at
+ * startup because the deadlock checker is run with all the partitions of the
+ * lock table locked, and we want to keep that section as short as possible.
  */
 void
 InitDeadLockChecking(void)
@@ -151,16 +151,16 @@ InitDeadLockChecking(void)
 	 * FindLockCycle needs at most MaxBackends entries in visitedProcs[] and
 	 * deadlockDetails[].
 	 */
-	visitedProcs = (PGPROC **) palloc(MaxBackends * sizeof(PGPROC *));
-	deadlockDetails = (DEADLOCK_INFO *) palloc(MaxBackends * sizeof(DEADLOCK_INFO));
+	visitedProcs = palloc_array(PGPROC *, MaxBackends);
+	deadlockDetails = palloc_array(DEADLOCK_INFO, MaxBackends);
 
 	/*
 	 * TopoSort needs to consider at most MaxBackends wait-queue entries, and
 	 * it needn't run concurrently with FindLockCycle.
 	 */
 	topoProcs = visitedProcs;	/* re-use this space */
-	beforeConstraints = (int *) palloc(MaxBackends * sizeof(int));
-	afterConstraints = (int *) palloc(MaxBackends * sizeof(int));
+	beforeConstraints = palloc_array(int, MaxBackends);
+	afterConstraints = palloc_array(int, MaxBackends);
 
 	/*
 	 * We need to consider rearranging at most MaxBackends/2 wait queues
@@ -168,9 +168,8 @@ InitDeadLockChecking(void)
 	 * and the expanded form of the wait queues can't involve more than
 	 * MaxBackends total waiters.
 	 */
-	waitOrders = (WAIT_ORDER *)
-		palloc((MaxBackends / 2) * sizeof(WAIT_ORDER));
-	waitOrderProcs = (PGPROC **) palloc(MaxBackends * sizeof(PGPROC *));
+	waitOrders = palloc_array(WAIT_ORDER, MaxBackends / 2);
+	waitOrderProcs = palloc_array(PGPROC *, MaxBackends);
 
 	/*
 	 * Allow at most MaxBackends distinct constraints in a configuration. (Is
@@ -181,7 +180,7 @@ InitDeadLockChecking(void)
 	 * really big might potentially allow a stack-overflow problem.
 	 */
 	maxCurConstraints = MaxBackends;
-	curConstraints = (EDGE *) palloc(maxCurConstraints * sizeof(EDGE));
+	curConstraints = palloc_array(EDGE, maxCurConstraints);
 
 	/*
 	 * Allow up to 3*MaxBackends constraints to be saved without having to
@@ -191,9 +190,12 @@ InitDeadLockChecking(void)
 	 * last MaxBackends entries in possibleConstraints[] are reserved as
 	 * output workspace for FindLockCycle.
 	 */
-	maxPossibleConstraints = MaxBackends * 4;
-	possibleConstraints =
-		(EDGE *) palloc(maxPossibleConstraints * sizeof(EDGE));
+	{
+		StaticAssertDecl(MAX_BACKENDS_BITS <= (32 - 3),
+						 "MAX_BACKENDS_BITS too big for * 4");
+		maxPossibleConstraints = MaxBackends * 4;
+		possibleConstraints = palloc_array(EDGE, maxPossibleConstraints);
+	}
 
 	MemoryContextSwitchTo(oldcxt);
 }
@@ -210,15 +212,11 @@ InitDeadLockChecking(void)
  *
  * On failure, deadlock details are recorded in deadlockDetails[] for
  * subsequent printing by DeadLockReport().  That activity is separate
- * because (a) we don't want to do it while holding all those LWLocks,
- * and (b) we are typically invoked inside a signal handler.
+ * because we don't want to do it while holding all those LWLocks.
  */
 DeadLockState
 DeadLockCheck(PGPROC *proc)
 {
-	int			i,
-				j;
-
 	/* Initialize to "no constraints" */
 	nCurConstraints = 0;
 	nPossibleConstraints = 0;
@@ -246,26 +244,23 @@ DeadLockCheck(PGPROC *proc)
 	}
 
 	/* Apply any needed rearrangements of wait queues */
-	for (i = 0; i < nWaitOrders; i++)
+	for (int i = 0; i < nWaitOrders; i++)
 	{
 		LOCK	   *lock = waitOrders[i].lock;
 		PGPROC	  **procs = waitOrders[i].procs;
 		int			nProcs = waitOrders[i].nProcs;
-		PROC_QUEUE *waitQueue = &(lock->waitProcs);
+		dclist_head *waitQueue = &lock->waitProcs;
 
-		Assert(nProcs == waitQueue->size);
+		Assert(nProcs == dclist_count(waitQueue));
 
 #ifdef DEBUG_DEADLOCK
 		PrintLockQueue(lock, "DeadLockCheck:");
 #endif
 
 		/* Reset the queue and re-add procs in the desired order */
-		ProcQueueInit(waitQueue);
-		for (j = 0; j < nProcs; j++)
-		{
-			SHMQueueInsertBefore(&(waitQueue->links), &(procs[j]->links));
-			waitQueue->size++;
-		}
+		dclist_init(waitQueue);
+		for (int j = 0; j < nProcs; j++)
+			dclist_push_tail(waitQueue, &procs[j]->waitLink);
 
 #ifdef DEBUG_DEADLOCK
 		PrintLockQueue(lock, "rearranged to:");
@@ -507,7 +502,7 @@ FindLockCycleRecurse(PGPROC *checkProc,
 	 * If the process is waiting, there is an outgoing waits-for edge to each
 	 * process that blocks it.
 	 */
-	if (checkProc->links.next != NULL && checkProc->waitLock != NULL &&
+	if (!dlist_node_is_detached(&checkProc->waitLink) &&
 		FindLockCycleRecurseMember(checkProc, checkProc, depth, softEdges,
 								   nSoftEdges))
 		return true;
@@ -525,7 +520,7 @@ FindLockCycleRecurse(PGPROC *checkProc,
 
 		memberProc = dlist_container(PGPROC, lockGroupLink, iter.cur);
 
-		if (memberProc->links.next != NULL && memberProc->waitLock != NULL &&
+		if (!dlist_node_is_detached(&memberProc->waitLink) && memberProc->waitLock != NULL &&
 			memberProc != checkProc &&
 			FindLockCycleRecurseMember(memberProc, checkProc, depth, softEdges,
 									   nSoftEdges))
@@ -544,16 +539,20 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
 {
 	PGPROC	   *proc;
 	LOCK	   *lock = checkProc->waitLock;
-	PGXACT	   *pgxact;
-	PROCLOCK   *proclock;
-	SHM_QUEUE  *procLocks;
+	dlist_iter	proclock_iter;
 	LockMethod	lockMethodTable;
-	PROC_QUEUE *waitQueue;
-	int			queue_size;
 	int			conflictMask;
 	int			i;
 	int			numLockModes,
 				lm;
+
+	/*
+	 * The relation extension lock can never participate in actual deadlock
+	 * cycle.  See Assert in LockAcquireExtended.  So, there is no advantage
+	 * in checking wait edges from it.
+	 */
+	if (LOCK_LOCKTAG(*lock) == LOCKTAG_RELATION_EXTEND)
+		return false;
 
 	lockMethodTable = GetLocksMethodTable(lock);
 	numLockModes = lockMethodTable->numLockModes;
@@ -563,17 +562,12 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
 	 * Scan for procs that already hold conflicting locks.  These are "hard"
 	 * edges in the waits-for graph.
 	 */
-	procLocks = &(lock->procLocks);
-
-	proclock = (PROCLOCK *) SHMQueueNext(procLocks, procLocks,
-										 offsetof(PROCLOCK, lockLink));
-
-	while (proclock)
+	dlist_foreach(proclock_iter, &lock->procLocks)
 	{
+		PROCLOCK   *proclock = dlist_container(PROCLOCK, lockLink, proclock_iter.cur);
 		PGPROC	   *leader;
 
 		proc = proclock->tag.myProc;
-		pgxact = &ProcGlobal->allPgXact[proc->pgprocno];
 		leader = proc->lockGroupLeader == NULL ? proc : proc->lockGroupLeader;
 
 		/* A proc never blocks itself or any other lock group member */
@@ -611,17 +605,17 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
 					 * that an autovacuum won't be canceled with less than
 					 * deadlock_timeout grace period.
 					 *
-					 * Note we read vacuumFlags without any locking.  This is
+					 * Note we read statusFlags without any locking.  This is
 					 * OK only for checking the PROC_IS_AUTOVACUUM flag,
 					 * because that flag is set at process start and never
 					 * reset.  There is logic elsewhere to avoid canceling an
 					 * autovacuum that is working to prevent XID wraparound
-					 * problems (which needs to read a different vacuumFlag
+					 * problems (which needs to read a different statusFlags
 					 * bit), but we don't do that here to avoid grabbing
 					 * ProcArrayLock.
 					 */
 					if (checkProc == MyProc &&
-						pgxact->vacuumFlags & PROC_IS_AUTOVACUUM)
+						proc->statusFlags & PROC_IS_AUTOVACUUM)
 						blocking_autovacuum_proc = proc;
 
 					/* We're done looking at this proclock */
@@ -629,9 +623,6 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
 				}
 			}
 		}
-
-		proclock = (PROCLOCK *) SHMQueueNext(procLocks, &proclock->lockLink,
-											 offsetof(PROCLOCK, lockLink));
 	}
 
 	/*
@@ -653,8 +644,7 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
 	{
 		/* Use the given hypothetical wait queue order */
 		PGPROC	  **procs = waitOrders[i].procs;
-
-		queue_size = waitOrders[i].nProcs;
+		int			queue_size = waitOrders[i].nProcs;
 
 		for (i = 0; i < queue_size; i++)
 		{
@@ -704,9 +694,11 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
 	else
 	{
 		PGPROC	   *lastGroupMember = NULL;
+		dlist_iter	proc_iter;
+		dclist_head *waitQueue;
 
 		/* Use the true lock wait queue order */
-		waitQueue = &(lock->waitProcs);
+		waitQueue = &lock->waitProcs;
 
 		/*
 		 * Find the last member of the lock group that is present in the wait
@@ -719,13 +711,12 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
 			lastGroupMember = checkProc;
 		else
 		{
-			proc = (PGPROC *) waitQueue->links.next;
-			queue_size = waitQueue->size;
-			while (queue_size-- > 0)
+			dclist_foreach(proc_iter, waitQueue)
 			{
+				proc = dlist_container(PGPROC, waitLink, proc_iter.cur);
+
 				if (proc->lockGroupLeader == checkProcLeader)
 					lastGroupMember = proc;
-				proc = (PGPROC *) proc->links.next;
 			}
 			Assert(lastGroupMember != NULL);
 		}
@@ -733,11 +724,11 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
 		/*
 		 * OK, now rescan (or scan) the queue to identify the soft conflicts.
 		 */
-		queue_size = waitQueue->size;
-		proc = (PGPROC *) waitQueue->links.next;
-		while (queue_size-- > 0)
+		dclist_foreach(proc_iter, waitQueue)
 		{
 			PGPROC	   *leader;
+
+			proc = dlist_container(PGPROC, waitLink, proc_iter.cur);
 
 			leader = proc->lockGroupLeader == NULL ? proc :
 				proc->lockGroupLeader;
@@ -772,8 +763,6 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
 					return true;
 				}
 			}
-
-			proc = (PGPROC *) proc->links.next;
 		}
 	}
 
@@ -825,8 +814,8 @@ ExpandConstraints(EDGE *constraints,
 		/* No, so allocate a new list */
 		waitOrders[nWaitOrders].lock = lock;
 		waitOrders[nWaitOrders].procs = waitOrderProcs + nWaitOrderProcs;
-		waitOrders[nWaitOrders].nProcs = lock->waitProcs.size;
-		nWaitOrderProcs += lock->waitProcs.size;
+		waitOrders[nWaitOrders].nProcs = dclist_count(&lock->waitProcs);
+		nWaitOrderProcs += dclist_count(&lock->waitProcs);
 		Assert(nWaitOrderProcs <= MaxBackends);
 
 		/*
@@ -873,8 +862,8 @@ TopoSort(LOCK *lock,
 		 int nConstraints,
 		 PGPROC **ordering)		/* output argument */
 {
-	PROC_QUEUE *waitQueue = &(lock->waitProcs);
-	int			queue_size = waitQueue->size;
+	dclist_head *waitQueue = &lock->waitProcs;
+	int			queue_size = dclist_count(waitQueue);
 	PGPROC	   *proc;
 	int			i,
 				j,
@@ -882,14 +871,16 @@ TopoSort(LOCK *lock,
 				k,
 				kk,
 				last;
+	dlist_iter	proc_iter;
 
 	/* First, fill topoProcs[] array with the procs in their current order */
-	proc = (PGPROC *) waitQueue->links.next;
-	for (i = 0; i < queue_size; i++)
+	i = 0;
+	dclist_foreach(proc_iter, waitQueue)
 	{
-		topoProcs[i] = proc;
-		proc = (PGPROC *) proc->links.next;
+		proc = dlist_container(PGPROC, waitLink, proc_iter.cur);
+		topoProcs[i++] = proc;
 	}
+	Assert(i == queue_size);
 
 	/*
 	 * Scan the constraints, and for each proc in the array, generate a count
@@ -922,6 +913,12 @@ TopoSort(LOCK *lock,
 		 * in the same lock group on the queue, set their number of
 		 * beforeConstraints to -1 to indicate that they should be emitted
 		 * with their groupmates rather than considered separately.
+		 *
+		 * In this loop and the similar one just below, it's critical that we
+		 * consistently select the same representative member of any one lock
+		 * group, so that all the constraints are associated with the same
+		 * proc, and the -1's are only associated with not-representative
+		 * members.  We select the last one in the topoProcs array.
 		 */
 		proc = constraints[i].waiter;
 		Assert(proc != NULL);
@@ -940,7 +937,6 @@ TopoSort(LOCK *lock,
 					Assert(beforeConstraints[j] <= 0);
 					beforeConstraints[j] = -1;
 				}
-				break;
 			}
 		}
 
@@ -977,6 +973,7 @@ TopoSort(LOCK *lock,
 		if (kk < 0)
 			continue;
 
+		Assert(beforeConstraints[jj] >= 0);
 		beforeConstraints[jj]++;	/* waiter must come before */
 		/* add this constraint to list of after-constraints for blocker */
 		constraints[i].pred = jj;
@@ -1053,17 +1050,16 @@ TopoSort(LOCK *lock,
 static void
 PrintLockQueue(LOCK *lock, const char *info)
 {
-	PROC_QUEUE *waitQueue = &(lock->waitProcs);
-	int			queue_size = waitQueue->size;
-	PGPROC	   *proc;
-	int			i;
+	dclist_head *waitQueue = &lock->waitProcs;
+	dlist_iter	proc_iter;
 
 	printf("%s lock %p queue ", info, lock);
-	proc = (PGPROC *) waitQueue->links.next;
-	for (i = 0; i < queue_size; i++)
+
+	dclist_foreach(proc_iter, waitQueue)
 	{
+		PGPROC	   *proc = dlist_container(PGPROC, waitLink, proc_iter.cur);
+
 		printf(" %d", proc->pid);
-		proc = (PGPROC *) proc->links.next;
 	}
 	printf("\n");
 	fflush(stdout);
@@ -1115,7 +1111,7 @@ DeadLockReport(void)
 	}
 
 	/* Duplicate all the above for the server ... */
-	appendStringInfoString(&logbuf, clientbuf.data);
+	appendBinaryStringInfo(&logbuf, clientbuf.data, clientbuf.len);
 
 	/* ... and add info about query strings */
 	for (i = 0; i < nDeadlockDetails; i++)

@@ -1,65 +1,94 @@
 # German message translation file for pg_config
-# Peter Eisentraut <peter_e@gmx.net>, 2004 - 2016.
+# Peter Eisentraut <peter@eisentraut.org>, 2004 - 2024.
 #
 # Use these quotes: »%s«
 #
 msgid ""
 msgstr ""
-"Project-Id-Version: PostgreSQL 9.6\n"
-"Report-Msgid-Bugs-To: pgsql-bugs@postgresql.org\n"
-"POT-Creation-Date: 2016-04-25 01:14+0000\n"
-"PO-Revision-Date: 2016-04-24 22:47-0400\n"
-"Last-Translator: Peter Eisentraut <peter_e@gmx.net>\n"
-"Language-Team: Peter Eisentraut <peter_e@gmx.net>\n"
+"Project-Id-Version: PostgreSQL 17\n"
+"Report-Msgid-Bugs-To: pgsql-bugs@lists.postgresql.org\n"
+"POT-Creation-Date: 2026-05-28 19:22+0000\n"
+"PO-Revision-Date: 2024-03-26 10:37+0100\n"
+"Last-Translator: Peter Eisentraut <peter@eisentraut.org>\n"
+"Language-Team: German <pgsql-translators@postgresql.org>\n"
 "Language: de\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 
-#: ../../common/config_info.c:131 ../../common/config_info.c:139
-#: ../../common/config_info.c:147 ../../common/config_info.c:155
-#: ../../common/config_info.c:163 ../../common/config_info.c:171
-#: ../../common/config_info.c:179 ../../common/config_info.c:187
-#: ../../common/config_info.c:195
+#: ../../common/config_info.c:134 ../../common/config_info.c:142
+#: ../../common/config_info.c:150 ../../common/config_info.c:158
+#: ../../common/config_info.c:166 ../../common/config_info.c:174
+#: ../../common/config_info.c:182 ../../common/config_info.c:190
 msgid "not recorded"
 msgstr "nicht aufgezeichnet"
 
-#: ../../common/exec.c:127 ../../common/exec.c:241 ../../common/exec.c:284
+#: ../../common/exec.c:175
 #, c-format
-msgid "could not identify current directory: %s"
-msgstr "konnte aktuelles Verzeichnis nicht ermitteln: %s"
+msgid "invalid binary \"%s\": %m"
+msgstr "ungültige Programmdatei »%s«: %m"
 
-#: ../../common/exec.c:146
+#: ../../common/exec.c:218
 #, c-format
-msgid "invalid binary \"%s\""
-msgstr "ungültige Programmdatei »%s«"
+msgid "could not read binary \"%s\": %m"
+msgstr "konnte Programmdatei »%s« nicht lesen: %m"
 
-#: ../../common/exec.c:195
-#, c-format
-msgid "could not read binary \"%s\""
-msgstr "konnte Programmdatei »%s« nicht lesen"
-
-#: ../../common/exec.c:202
+#: ../../common/exec.c:226
 #, c-format
 msgid "could not find a \"%s\" to execute"
 msgstr "konnte kein »%s« zum Ausführen finden"
 
-#: ../../common/exec.c:257 ../../common/exec.c:293
+#: ../../common/exec.c:253
 #, c-format
-msgid "could not change directory to \"%s\": %s"
-msgstr "konnte nicht in Verzeichnis »%s« wechseln: %s"
+msgid "could not resolve path \"%s\" to absolute form: %m"
+msgstr "konnte Pfad »%s« nicht in absolute Form auflösen: %m"
 
-#: ../../common/exec.c:272
+#: ../../common/exec.c:364
 #, c-format
-msgid "could not read symbolic link \"%s\""
-msgstr "konnte symbolische Verknüpfung »%s« nicht lesen"
+msgid "could not execute command \"%s\": %m"
+msgstr "konnte Befehl »%s« nicht ausführen: %m"
 
-#: ../../common/exec.c:523
+#: ../../common/exec.c:376
 #, c-format
-msgid "pclose failed: %s"
-msgstr "pclose fehlgeschlagen: %s"
+msgid "could not read from command \"%s\": %m"
+msgstr "konnte nicht von Befehl »%s« lesen: %m"
 
-#: pg_config.c:74
+#: ../../common/exec.c:379
+#, c-format
+msgid "no data was returned by command \"%s\""
+msgstr "Befehl »%s« gab keine Daten zurück"
+
+#: ../../common/exec.c:406
+#, c-format
+msgid "%s() failed: %m"
+msgstr "%s() fehlgeschlagen: %m"
+
+#: ../../common/exec.c:544 ../../common/exec.c:589 ../../common/exec.c:681
+msgid "out of memory"
+msgstr "Speicher aufgebraucht"
+
+#: ../../common/fe_memutils.c:41 ../../common/fe_memutils.c:81
+#: ../../common/fe_memutils.c:104 ../../common/fe_memutils.c:167
+#, c-format
+msgid "out of memory\n"
+msgstr "Speicher aufgebraucht\n"
+
+#: ../../common/fe_memutils.c:98 ../../common/fe_memutils.c:159
+#, c-format
+msgid "cannot duplicate null pointer (internal error)\n"
+msgstr "kann NULL-Zeiger nicht kopieren (interner Fehler)\n"
+
+#: ../../common/fe_memutils.c:209
+#, c-format
+msgid "invalid memory allocation request size %zu + %zu\n"
+msgstr "ungültige Speicheranforderungsgröße %zu + %zu\n"
+
+#: ../../common/fe_memutils.c:228
+#, c-format
+msgid "invalid memory allocation request size %zu * %zu\n"
+msgstr "ungültige Speicheranforderungsgröße %zu * %zu\n"
+
+#: pg_config.c:73
 #, c-format
 msgid ""
 "\n"
@@ -70,12 +99,12 @@ msgstr ""
 "%s gibt Informationen über die installierte Version von PostgreSQL.\n"
 "\n"
 
-#: pg_config.c:75
+#: pg_config.c:74
 #, c-format
 msgid "Usage:\n"
 msgstr "Aufruf:\n"
 
-#: pg_config.c:76
+#: pg_config.c:75
 #, c-format
 msgid ""
 "  %s [OPTION]...\n"
@@ -84,27 +113,27 @@ msgstr ""
 "  %s [OPTION]...\n"
 "\n"
 
-#: pg_config.c:77
+#: pg_config.c:76
 #, c-format
 msgid "Options:\n"
 msgstr "Optionen:\n"
 
-#: pg_config.c:78
+#: pg_config.c:77
 #, c-format
 msgid "  --bindir              show location of user executables\n"
 msgstr "  --bindir              zeige Installationsverzeichnis der Benutzerprogramme\n"
 
-#: pg_config.c:79
+#: pg_config.c:78
 #, c-format
 msgid "  --docdir              show location of documentation files\n"
 msgstr "  --docdir              zeige Installationsverzeichnis der Dokumentation\n"
 
-#: pg_config.c:80
+#: pg_config.c:79
 #, c-format
 msgid "  --htmldir             show location of HTML documentation files\n"
 msgstr "  --htmldir             zeige Installationsverzeichnis der HTML-Dokumentation\n"
 
-#: pg_config.c:81
+#: pg_config.c:80
 #, c-format
 msgid ""
 "  --includedir          show location of C header files of the client\n"
@@ -113,60 +142,60 @@ msgstr ""
 "  --includedir          zeige Installationsverzeichnis der Headerdateien der\n"
 "                        Client-Schnittstellen\n"
 
-#: pg_config.c:83
+#: pg_config.c:82
 #, c-format
 msgid "  --pkgincludedir       show location of other C header files\n"
 msgstr "  --pkgincludedir       zeige Installationsverzeichnis von weiteren Headerdateien\n"
 
-#: pg_config.c:84
+#: pg_config.c:83
 #, c-format
 msgid "  --includedir-server   show location of C header files for the server\n"
 msgstr ""
 "  --includedir-server   zeige Installationsverzeichnis der Headerdateien des\n"
 "                        Servers\n"
 
-#: pg_config.c:85
+#: pg_config.c:84
 #, c-format
 msgid "  --libdir              show location of object code libraries\n"
 msgstr "  --libdir              zeige Installationsverzeichnis der Objektbibliotheken\n"
 
-#: pg_config.c:86
+#: pg_config.c:85
 #, c-format
 msgid "  --pkglibdir           show location of dynamically loadable modules\n"
 msgstr ""
 "  --pkglibdir           zeige Installationsverzeichnis der dynamisch\n"
 "                        ladbaren Module\n"
 
-#: pg_config.c:87
+#: pg_config.c:86
 #, c-format
 msgid "  --localedir           show location of locale support files\n"
 msgstr "  --localedir           zeige Installationsverzeichnis der Locale-Dateien\n"
 
-#: pg_config.c:88
+#: pg_config.c:87
 #, c-format
 msgid "  --mandir              show location of manual pages\n"
 msgstr "  --mandir              zeige Installationsverzeichnis der Manpages\n"
 
-#: pg_config.c:89
+#: pg_config.c:88
 #, c-format
 msgid "  --sharedir            show location of architecture-independent support files\n"
 msgstr ""
 "  --sharedir            zeige Installationsverzeichnis der architektur-\n"
 "                        unabhängigen Datendateien\n"
 
-#: pg_config.c:90
+#: pg_config.c:89
 #, c-format
 msgid "  --sysconfdir          show location of system-wide configuration files\n"
 msgstr ""
 "  --sysconfdir          zeige Installationsverzeichnis der systemweiten\n"
 "                        Konfigurationsdateien\n"
 
-#: pg_config.c:91
+#: pg_config.c:90
 #, c-format
 msgid "  --pgxs                show location of extension makefile\n"
 msgstr "  --pgxs                zeige Ort der Erweiterungs-Makefile\n"
 
-#: pg_config.c:92
+#: pg_config.c:91
 #, c-format
 msgid ""
 "  --configure           show options given to \"configure\" script when\n"
@@ -175,57 +204,57 @@ msgstr ""
 "  --configure           zeige Optionen des »configure«-Skriptes beim Bauen\n"
 "                        von PostgreSQL\n"
 
-#: pg_config.c:94
+#: pg_config.c:93
 #, c-format
 msgid "  --cc                  show CC value used when PostgreSQL was built\n"
 msgstr "  --cc                  zeige CC-Wert, mit dem PostgreSQL gebaut wurde\n"
 
-#: pg_config.c:95
+#: pg_config.c:94
 #, c-format
 msgid "  --cppflags            show CPPFLAGS value used when PostgreSQL was built\n"
 msgstr "  --cppflags            zeige CPPFLAGS-Wert, mit dem PostgreSQL gebaut wurde\n"
 
-#: pg_config.c:96
+#: pg_config.c:95
 #, c-format
 msgid "  --cflags              show CFLAGS value used when PostgreSQL was built\n"
 msgstr "  --cflags              zeige CFLAGS-Wert, mit dem PostgreSQL gebaut wurde\n"
 
-#: pg_config.c:97
+#: pg_config.c:96
 #, c-format
 msgid "  --cflags_sl           show CFLAGS_SL value used when PostgreSQL was built\n"
 msgstr "  --cflags_sl           zeige CFLAGS_SL-Wert, mit dem PostgreSQL gebaut wurde\n"
 
-#: pg_config.c:98
+#: pg_config.c:97
 #, c-format
 msgid "  --ldflags             show LDFLAGS value used when PostgreSQL was built\n"
 msgstr "  --ldflags             zeige LDFLAGS-Wert, mit dem PostgreSQL gebaut wurde\n"
 
-#: pg_config.c:99
+#: pg_config.c:98
 #, c-format
 msgid "  --ldflags_ex          show LDFLAGS_EX value used when PostgreSQL was built\n"
 msgstr "  --ldflags_ex          zeige LDFLAGS_EX-Wert, mit dem PostgreSQL gebaut wurde\n"
 
-#: pg_config.c:100
+#: pg_config.c:99
 #, c-format
 msgid "  --ldflags_sl          show LDFLAGS_SL value used when PostgreSQL was built\n"
 msgstr "  --ldflags_sl          zeige LDFLAGS_SL-Wert, mit dem PostgreSQL gebaut wurde\n"
 
-#: pg_config.c:101
+#: pg_config.c:100
 #, c-format
 msgid "  --libs                show LIBS value used when PostgreSQL was built\n"
 msgstr "  --libs                zeige LIBS-Wert, mit dem PostgreSQL gebaut wurde\n"
 
-#: pg_config.c:102
+#: pg_config.c:101
 #, c-format
 msgid "  --version             show the PostgreSQL version\n"
 msgstr "  --version             zeige PostgreSQL-Version\n"
 
-#: pg_config.c:103
+#: pg_config.c:102
 #, c-format
 msgid "  -?, --help            show this help, then exit\n"
 msgstr "  -?, --help            diese Hilfe anzeigen, dann beenden\n"
 
-#: pg_config.c:104
+#: pg_config.c:103
 #, c-format
 msgid ""
 "\n"
@@ -236,10 +265,15 @@ msgstr ""
 "Ohne Argumente werden alle bekannten Informationen angezeigt.\n"
 "\n"
 
+#: pg_config.c:104
+#, c-format
+msgid "Report bugs to <%s>.\n"
+msgstr "Berichten Sie Fehler an <%s>.\n"
+
 #: pg_config.c:105
 #, c-format
-msgid "Report bugs to <pgsql-bugs@postgresql.org>.\n"
-msgstr "Berichten Sie Fehler an <pgsql-bugs@postgresql.org>.\n"
+msgid "%s home page: <%s>\n"
+msgstr "%s Homepage: <%s>\n"
 
 #: pg_config.c:111
 #, c-format

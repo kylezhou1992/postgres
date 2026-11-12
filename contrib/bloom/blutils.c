@@ -3,7 +3,7 @@
  * blutils.c
  *		Bloom index utilities.
  *
- * Portions Copyright (c) 2016-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2016-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1990-1993, Regents of the University of California
  *
  * IDENTIFICATION
@@ -15,17 +15,13 @@
 
 #include "access/amapi.h"
 #include "access/generic_xlog.h"
-#include "catalog/index.h"
-#include "storage/lmgr.h"
-#include "miscadmin.h"
+#include "access/reloptions.h"
+#include "bloom.h"
+#include "commands/vacuum.h"
 #include "storage/bufmgr.h"
 #include "storage/indexfsm.h"
 #include "utils/memutils.h"
-#include "access/reloptions.h"
-#include "storage/freespace.h"
-#include "storage/indexfsm.h"
-
-#include "bloom.h"
+#include "varatt.h"
 
 /* Signature dealing macros - note i is assumed to be of type int */
 #define GETWORD(x,i) ( *( (BloomSignatureWord *)(x) + ( (i) / SIGNWORDBITS ) ) )
@@ -60,7 +56,8 @@ _PG_init(void)
 	/* Option for length of signature */
 	add_int_reloption(bl_relopt_kind, "length",
 					  "Length of signature in bits",
-					  DEFAULT_BLOOM_LENGTH, 1, MAX_BLOOM_LENGTH);
+					  DEFAULT_BLOOM_LENGTH, 1, MAX_BLOOM_LENGTH,
+					  AccessExclusiveLock);
 	bl_relopt_tab[0].optname = "length";
 	bl_relopt_tab[0].opttype = RELOPT_TYPE_INT;
 	bl_relopt_tab[0].offset = offsetof(BloomOptions, bloomLength);
@@ -71,7 +68,8 @@ _PG_init(void)
 		snprintf(buf, sizeof(buf), "col%d", i + 1);
 		add_int_reloption(bl_relopt_kind, buf,
 						  "Number of bits generated for each index column",
-						  DEFAULT_BLOOM_BITS, 1, MAX_BLOOM_BITS);
+						  DEFAULT_BLOOM_BITS, 1, MAX_BLOOM_BITS,
+						  AccessExclusiveLock);
 		bl_relopt_tab[i + 1].optname = MemoryContextStrdup(TopMemoryContext,
 														   buf);
 		bl_relopt_tab[i + 1].opttype = RELOPT_TYPE_INT;
@@ -88,7 +86,7 @@ makeDefaultBloomOptions(void)
 	BloomOptions *opts;
 	int			i;
 
-	opts = (BloomOptions *) palloc0(sizeof(BloomOptions));
+	opts = palloc0_object(BloomOptions);
 	/* Convert DEFAULT_BLOOM_LENGTH from # of bits to # of words */
 	opts->bloomLength = (DEFAULT_BLOOM_LENGTH + SIGNWORDBITS - 1) / SIGNWORDBITS;
 	for (i = 0; i < INDEX_MAX_KEYS; i++)
@@ -104,47 +102,62 @@ makeDefaultBloomOptions(void)
 Datum
 blhandler(PG_FUNCTION_ARGS)
 {
-	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
+	static const IndexAmRoutine amroutine = {
+		.type = T_IndexAmRoutine,
+		.amstrategies = BLOOM_NSTRATEGIES,
+		.amsupport = BLOOM_NPROC,
+		.amoptsprocnum = BLOOM_OPTIONS_PROC,
+		.amcanorder = false,
+		.amcanorderbyop = false,
+		.amcanhash = false,
+		.amconsistentequality = false,
+		.amconsistentordering = false,
+		.amcanbackward = false,
+		.amcanunique = false,
+		.amcanmulticol = true,
+		.amoptionalkey = true,
+		.amsearcharray = false,
+		.amsearchnulls = false,
+		.amstorage = false,
+		.amclusterable = false,
+		.ampredlocks = false,
+		.amcanparallel = false,
+		.amcanbuildparallel = false,
+		.amcaninclude = false,
+		.amusemaintenanceworkmem = false,
+		.amparallelvacuumoptions =
+		VACUUM_OPTION_PARALLEL_BULKDEL | VACUUM_OPTION_PARALLEL_CLEANUP,
+		.amkeytype = InvalidOid,
 
-	amroutine->amstrategies = BLOOM_NSTRATEGIES;
-	amroutine->amsupport = BLOOM_NPROC;
-	amroutine->amcanorder = false;
-	amroutine->amcanorderbyop = false;
-	amroutine->amcanbackward = false;
-	amroutine->amcanunique = false;
-	amroutine->amcanmulticol = true;
-	amroutine->amoptionalkey = true;
-	amroutine->amsearcharray = false;
-	amroutine->amsearchnulls = false;
-	amroutine->amstorage = false;
-	amroutine->amclusterable = false;
-	amroutine->ampredlocks = false;
-	amroutine->amcanparallel = false;
-	amroutine->amcaninclude = false;
-	amroutine->amkeytype = InvalidOid;
+		.ambuild = blbuild,
+		.ambuildempty = blbuildempty,
+		.aminsert = blinsert,
+		.aminsertcleanup = NULL,
+		.ambulkdelete = blbulkdelete,
+		.amvacuumcleanup = blvacuumcleanup,
+		.amcanreturn = NULL,
+		.amcostestimate = blcostestimate,
+		.amgettreeheight = NULL,
+		.amoptions = bloptions,
+		.amproperty = NULL,
+		.ambuildphasename = NULL,
+		.amvalidate = blvalidate,
+		.amadjustmembers = NULL,
+		.ambeginscan = blbeginscan,
+		.amrescan = blrescan,
+		.amgettuple = NULL,
+		.amgetbitmap = blgetbitmap,
+		.amendscan = blendscan,
+		.ammarkpos = NULL,
+		.amrestrpos = NULL,
+		.amestimateparallelscan = NULL,
+		.aminitparallelscan = NULL,
+		.amparallelrescan = NULL,
+		.amtranslatestrategy = NULL,
+		.amtranslatecmptype = NULL,
+	};
 
-	amroutine->ambuild = blbuild;
-	amroutine->ambuildempty = blbuildempty;
-	amroutine->aminsert = blinsert;
-	amroutine->ambulkdelete = blbulkdelete;
-	amroutine->amvacuumcleanup = blvacuumcleanup;
-	amroutine->amcanreturn = NULL;
-	amroutine->amcostestimate = blcostestimate;
-	amroutine->amoptions = bloptions;
-	amroutine->amproperty = NULL;
-	amroutine->amvalidate = blvalidate;
-	amroutine->ambeginscan = blbeginscan;
-	amroutine->amrescan = blrescan;
-	amroutine->amgettuple = NULL;
-	amroutine->amgetbitmap = blgetbitmap;
-	amroutine->amendscan = blendscan;
-	amroutine->ammarkpos = NULL;
-	amroutine->amrestrpos = NULL;
-	amroutine->amestimateparallelscan = NULL;
-	amroutine->aminitparallelscan = NULL;
-	amroutine->amparallelrescan = NULL;
-
-	PG_RETURN_POINTER(amroutine);
+	PG_RETURN_POINTER(&amroutine);
 }
 
 /*
@@ -163,6 +176,7 @@ initBloomState(BloomState *state, Relation index)
 		fmgr_info_copy(&(state->hashFn[i]),
 					   index_getprocinfo(index, i + 1, BLOOM_HASH_PROC),
 					   CurrentMemoryContext);
+		state->collations[i] = index->rd_indcollation[i];
 	}
 
 	/* Initialize amcache if needed with options from metapage */
@@ -191,7 +205,7 @@ initBloomState(BloomState *state, Relation index)
 
 		UnlockReleaseBuffer(buffer);
 
-		index->rd_amcache = (void *) opts;
+		index->rd_amcache = opts;
 	}
 
 	memcpy(&state->opts, index->rd_amcache, sizeof(state->opts));
@@ -267,7 +281,7 @@ signValue(BloomState *state, BloomSignatureWord *sign, Datum value, int attno)
 	 * different columns will be mapped into different bits because of step
 	 * above
 	 */
-	hashVal = DatumGetInt32(FunctionCall1(&state->hashFn[attno], value));
+	hashVal = DatumGetInt32(FunctionCall1Coll(&state->hashFn[attno], state->collations[attno], value));
 	mySrand(hashVal ^ myRand());
 
 	for (j = 0; j < state->opts.bitSize[attno]; j++)
@@ -311,7 +325,7 @@ BloomPageAddItem(BloomState *state, Page page, BloomTuple *tuple)
 {
 	BloomTuple *itup;
 	BloomPageOpaque opaque;
-	Pointer		ptr;
+	char	   *ptr;
 
 	/* We shouldn't be pointed to an invalid page */
 	Assert(!PageIsNew(page) && !BloomPageIsDeleted(page));
@@ -323,11 +337,11 @@ BloomPageAddItem(BloomState *state, Page page, BloomTuple *tuple)
 	/* Copy new tuple to the end of page */
 	opaque = BloomPageGetOpaque(page);
 	itup = BloomPageGetTuple(state, page, opaque->maxoff + 1);
-	memcpy((Pointer) itup, (Pointer) tuple, state->sizeOfBloomTuple);
+	memcpy(itup, tuple, state->sizeOfBloomTuple);
 
 	/* Adjust maxoff and pd_lower */
 	opaque->maxoff++;
-	ptr = (Pointer) BloomPageGetTuple(state, page, opaque->maxoff + 1);
+	ptr = (char *) BloomPageGetTuple(state, page, opaque->maxoff + 1);
 	((PageHeader) page)->pd_lower = ptr - page;
 
 	/* Assert we didn't overrun available space */
@@ -339,13 +353,12 @@ BloomPageAddItem(BloomState *state, Page page, BloomTuple *tuple)
 /*
  * Allocate a new page (either by recycling, or by extending the index file)
  * The returned buffer is already pinned and exclusive-locked
- * Caller is responsible for initializing the page by calling BloomInitBuffer
+ * Caller is responsible for initializing the page by calling BloomInitPage
  */
 Buffer
 BloomNewBuffer(Relation index)
 {
 	Buffer		buffer;
-	bool		needLock;
 
 	/* First, try to get a page from FSM */
 	for (;;)
@@ -379,15 +392,8 @@ BloomNewBuffer(Relation index)
 	}
 
 	/* Must extend the file */
-	needLock = !RELATION_IS_LOCAL(index);
-	if (needLock)
-		LockRelationForExtension(index, ExclusiveLock);
-
-	buffer = ReadBuffer(index, P_NEW);
-	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-
-	if (needLock)
-		UnlockRelationForExtension(index, ExclusiveLock);
+	buffer = ExtendBufferedRel(BMR_REL(index), MAIN_FORKNUM, NULL,
+							   EB_LOCK_FIRST);
 
 	return buffer;
 }
@@ -403,7 +409,6 @@ BloomInitPage(Page page, uint16 flags)
 	PageInit(page, BLCKSZ, sizeof(BloomPageOpaqueData));
 
 	opaque = BloomPageGetOpaque(page);
-	memset(opaque, 0, sizeof(BloomPageOpaqueData));
 	opaque->flags = flags;
 	opaque->bloom_page_id = BLOOM_PAGE_ID;
 }
@@ -444,7 +449,7 @@ BloomFillMetapage(Relation index, Page metaPage)
  * Initialize metapage for bloom index.
  */
 void
-BloomInitMetapage(Relation index)
+BloomInitMetapage(Relation index, ForkNumber forknum)
 {
 	Buffer		metaBuffer;
 	Page		metaPage;
@@ -452,9 +457,11 @@ BloomInitMetapage(Relation index)
 
 	/*
 	 * Make a new page; since it is first page it should be associated with
-	 * block number 0 (BLOOM_METAPAGE_BLKNO).
+	 * block number 0 (BLOOM_METAPAGE_BLKNO).  No need to hold the extension
+	 * lock because there cannot be concurrent inserters yet.
 	 */
-	metaBuffer = BloomNewBuffer(index);
+	metaBuffer = ReadBufferExtended(index, forknum, P_NEW, RBM_NORMAL, NULL);
+	LockBuffer(metaBuffer, BUFFER_LOCK_EXCLUSIVE);
 	Assert(BufferGetBlockNumber(metaBuffer) == BLOOM_METAPAGE_BLKNO);
 
 	/* Initialize contents of meta page */
@@ -473,18 +480,18 @@ BloomInitMetapage(Relation index)
 bytea *
 bloptions(Datum reloptions, bool validate)
 {
-	relopt_value *options;
-	int			numoptions;
 	BloomOptions *rdopts;
 
 	/* Parse the user-given reloptions */
-	options = parseRelOptions(reloptions, validate, bl_relopt_kind, &numoptions);
-	rdopts = allocateReloptStruct(sizeof(BloomOptions), options, numoptions);
-	fillRelOptions((void *) rdopts, sizeof(BloomOptions), options, numoptions,
-				   validate, bl_relopt_tab, lengthof(bl_relopt_tab));
+	rdopts = (BloomOptions *) build_reloptions(reloptions, validate,
+											   bl_relopt_kind,
+											   sizeof(BloomOptions),
+											   bl_relopt_tab,
+											   lengthof(bl_relopt_tab));
 
 	/* Convert signature length from # of bits to # to words, rounding up */
-	rdopts->bloomLength = (rdopts->bloomLength + SIGNWORDBITS - 1) / SIGNWORDBITS;
+	if (rdopts)
+		rdopts->bloomLength = (rdopts->bloomLength + SIGNWORDBITS - 1) / SIGNWORDBITS;
 
 	return (bytea *) rdopts;
 }

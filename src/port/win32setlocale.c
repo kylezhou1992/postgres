@@ -3,7 +3,7 @@
  * win32setlocale.c
  *		Wrapper to work around bugs in Windows setlocale() implementation
  *
- * Copyright (c) 2011-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2011-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/port/win32setlocale.c
@@ -96,8 +96,12 @@ static const struct locale_map locale_map_result[] = {
 	 *
 	 * It's not clear what encoding setlocale() uses when it returns the
 	 * locale name, so to play it safe, we search for "Norwegian (Bok*l)".
+	 *
+	 * Just to make life even more complicated, some versions of Windows spell
+	 * the locale name without parentheses.  Translate that too.
 	 */
 	{"Norwegian (Bokm", "l)_Norway", "Norwegian_Norway"},
+	{"Norwegian Bokm", "l_Norway", "Norwegian_Norway"},
 	{NULL, NULL, NULL}
 };
 
@@ -115,9 +119,9 @@ map_locale(const struct locale_map *map, const char *locale)
 		const char *needle_start = map[i].locale_name_start;
 		const char *needle_end = map[i].locale_name_end;
 		const char *replacement = map[i].replacement;
-		char	   *match;
-		char	   *match_start = NULL;
-		char	   *match_end = NULL;
+		const char *match;
+		const char *match_start = NULL;
+		const char *match_end = NULL;
 
 		match = strstr(locale, needle_start);
 		if (match)
@@ -144,7 +148,7 @@ map_locale(const struct locale_map *map, const char *locale)
 			/* Found a match. Replace the matched string. */
 			int			matchpos = match_start - locale;
 			int			replacementlen = strlen(replacement);
-			char	   *rest = match_end;
+			const char *rest = match_end;
 			int			restlen = strlen(rest);
 
 			/* check that the result fits in the static buffer */

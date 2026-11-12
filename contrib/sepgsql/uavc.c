@@ -6,20 +6,19 @@
  * access control decisions recently used, and reduce number of kernel
  * invocations to avoid unnecessary performance hit.
  *
- * Copyright (c) 2011-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2011-2026, PostgreSQL Global Development Group
  *
  * -------------------------------------------------------------------------
  */
 #include "postgres.h"
 
-#include "access/hash.h"
 #include "catalog/pg_proc.h"
 #include "commands/seclabel.h"
+#include "common/hashfn.h"
+#include "sepgsql.h"
 #include "storage/ipc.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
-
-#include "sepgsql.h"
 
 /*
  * avc_cache
@@ -45,7 +44,7 @@ typedef struct
 	/* true, if tcontext is valid */
 	char	   *ncontext;		/* temporary scontext on execution of trusted
 								 * procedure, or NULL elsewhere */
-}			avc_cache;
+} avc_cache;
 
 /*
  * Declaration of static variables
@@ -67,8 +66,8 @@ static char *avc_unlabeled;		/* system 'unlabeled' label */
 static uint32
 sepgsql_avc_hash(const char *scontext, const char *tcontext, uint16 tclass)
 {
-	return hash_any((const unsigned char *) scontext, strlen(scontext))
-		^ hash_any((const unsigned char *) tcontext, strlen(tcontext))
+	return hash_bytes((const unsigned char *) scontext, strlen(scontext))
+		^ hash_bytes((const unsigned char *) tcontext, strlen(tcontext))
 		^ tclass;
 }
 
@@ -93,24 +92,20 @@ static void
 sepgsql_avc_reclaim(void)
 {
 	ListCell   *cell;
-	ListCell   *next;
-	ListCell   *prev;
 	int			index;
 
 	while (avc_num_caches >= avc_threshold - AVC_NUM_RECLAIM)
 	{
 		index = avc_lru_hint;
 
-		prev = NULL;
-		for (cell = list_head(avc_slots[index]); cell; cell = next)
+		foreach(cell, avc_slots[index])
 		{
 			avc_cache  *cache = lfirst(cell);
 
-			next = lnext(cell);
 			if (!cache->hot_cache)
 			{
 				avc_slots[index]
-					= list_delete_cell(avc_slots[index], cell, prev);
+					= foreach_delete_current(avc_slots[index], cell);
 
 				pfree(cache->scontext);
 				pfree(cache->tcontext);
@@ -123,7 +118,6 @@ sepgsql_avc_reclaim(void)
 			else
 			{
 				cache->hot_cache = false;
-				prev = cell;
 			}
 		}
 		avc_lru_hint = (avc_lru_hint + 1) % AVC_NUM_SLOTS;
@@ -177,7 +171,7 @@ sepgsql_avc_unlabeled(void)
 {
 	if (!avc_unlabeled)
 	{
-		security_context_t unlabeled;
+		char	   *unlabeled;
 
 		if (security_get_initial_context_raw("unlabeled", &unlabeled) < 0)
 			ereport(ERROR,
@@ -187,14 +181,11 @@ sepgsql_avc_unlabeled(void)
 		{
 			avc_unlabeled = MemoryContextStrdup(avc_mem_cxt, unlabeled);
 		}
-		PG_CATCH();
+		PG_FINALLY();
 		{
 			freecon(unlabeled);
-			PG_RE_THROW();
 		}
 		PG_END_TRY();
-
-		freecon(unlabeled);
 	}
 	return avc_unlabeled;
 }
@@ -225,7 +216,7 @@ sepgsql_avc_compute(const char *scontext, const char *tcontext, uint16 tclass)
 	 * policy is reloaded, validation status shall be kept, so we also cache
 	 * whether the supplied security context was valid, or not.
 	 */
-	if (security_check_context_raw((security_context_t) tcontext) != 0)
+	if (security_check_context_raw(tcontext) != 0)
 		ucontext = sepgsql_avc_unlabeled();
 
 	/*
@@ -266,7 +257,7 @@ sepgsql_avc_compute(const char *scontext, const char *tcontext, uint16 tclass)
 	 */
 	oldctx = MemoryContextSwitchTo(avc_mem_cxt);
 
-	cache = palloc0(sizeof(avc_cache));
+	cache = palloc0_object(avc_cache);
 
 	cache->hash = hash;
 	cache->scontext = pstrdup(scontext);
@@ -408,6 +399,7 @@ sepgsql_avc_check_perms_label(const char *tcontext,
 		sepgsql_get_mode() != SEPGSQL_MODE_INTERNAL)
 	{
 		sepgsql_audit_log(denied != 0,
+						  (sepgsql_getenforce() && !cache->permissive),
 						  cache->scontext,
 						  cache->tcontext_is_valid ?
 						  cache->tcontext : sepgsql_avc_unlabeled(),

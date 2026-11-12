@@ -12,31 +12,29 @@ subdir = src/backend/storage/lmgr
 top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
-OBJS = lmgr.o lock.o proc.o deadlock.o lwlock.o lwlocknames.o spin.o \
-	s_lock.o predicate.o condition_variable.o
+OBJS = \
+	condition_variable.o \
+	deadlock.o \
+	lmgr.o \
+	lock.o \
+	lwlock.o \
+	predicate.o \
+	proc.o \
+	s_lock.o \
 
 include $(top_srcdir)/src/backend/common.mk
 
-ifdef TAS
-TASPATH = $(top_builddir)/src/backend/port/tas.o
-endif
-
-s_lock_test: s_lock.c $(top_builddir)/src/port/libpgport.a
+s_lock_test: s_lock.c $(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DS_LOCK_TEST=1 $(srcdir)/s_lock.c \
-		$(TASPATH) -L $(top_builddir)/src/port -lpgport -o s_lock_test
+		-L $(top_builddir)/src/common -lpgcommon \
+		-L $(top_builddir)/src/port -lpgport -lm -o s_lock_test
 
-# see notes in src/backend/parser/Makefile
-lwlocknames.c: lwlocknames.h
-	touch $@
-
-lwlocknames.h: $(top_srcdir)/src/backend/storage/lmgr/lwlocknames.txt generate-lwlocknames.pl
-	$(PERL) $(srcdir)/generate-lwlocknames.pl $<
+lwlocknames.h: ../../../include/storage/lwlocklist.h ../../utils/activity/wait_event_names.txt generate-lwlocknames.pl
+	$(PERL) $(srcdir)/generate-lwlocknames.pl $^
 
 check: s_lock_test
 	./s_lock_test
 
-clean distclean:
+clean:
 	rm -f s_lock_test
-
-maintainer-clean: clean
-	rm -f lwlocknames.h lwlocknames.c
+	rm -f lwlocknames.h

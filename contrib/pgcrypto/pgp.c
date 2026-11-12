@@ -31,8 +31,8 @@
 
 #include "postgres.h"
 
-#include "px.h"
 #include "pgp.h"
+#include "px.h"
 
 /*
  * Defaults.
@@ -49,12 +49,12 @@ static int	def_use_sess_key = 0;
 static int	def_text_mode = 0;
 static int	def_unicode_mode = 0;
 static int	def_convert_crlf = 0;
+static int	def_ignore_cipher_failure = 0;
 
 struct digest_info
 {
 	const char *name;
 	int			code;
-	const char *int_name;
 };
 
 struct cipher_info
@@ -134,16 +134,6 @@ pgp_get_digest_name(int code)
 	return NULL;
 }
 
-const char *
-pgp_get_cipher_name(int code)
-{
-	const struct cipher_info *i = get_cipher_info(code);
-
-	if (i != NULL)
-		return i->name;
-	return NULL;
-}
-
 int
 pgp_get_cipher_key_size(int code)
 {
@@ -201,8 +191,7 @@ pgp_init(PGP_Context **ctx_p)
 {
 	PGP_Context *ctx;
 
-	ctx = px_alloc(sizeof *ctx);
-	memset(ctx, 0, sizeof *ctx);
+	ctx = palloc0(sizeof *ctx);
 
 	ctx->cipher_algo = def_cipher_algo;
 	ctx->s2k_cipher_algo = def_s2k_cipher_algo;
@@ -216,6 +205,7 @@ pgp_init(PGP_Context **ctx_p)
 	ctx->unicode_mode = def_unicode_mode;
 	ctx->convert_crlf = def_convert_crlf;
 	ctx->text_mode = def_text_mode;
+	ctx->ignore_cipher_failure = def_ignore_cipher_failure;
 
 	*ctx_p = ctx;
 	return 0;
@@ -226,8 +216,8 @@ pgp_free(PGP_Context *ctx)
 {
 	if (ctx->pub_key)
 		pgp_key_free(ctx->pub_key);
-	px_memset(ctx, 0, sizeof *ctx);
-	px_free(ctx);
+	explicit_bzero(ctx, sizeof *ctx);
+	pfree(ctx);
 	return 0;
 }
 
@@ -358,6 +348,13 @@ int
 pgp_set_unicode_mode(PGP_Context *ctx, int mode)
 {
 	ctx->unicode_mode = mode ? 1 : 0;
+	return 0;
+}
+
+int
+pgp_set_ignore_cipher_failure(PGP_Context *ctx, int ignore)
+{
+	ctx->ignore_cipher_failure = ignore ? 1 : 0;
 	return 0;
 }
 

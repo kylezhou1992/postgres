@@ -5,7 +5,7 @@
  *	  and related modules.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/execdesc.h
@@ -42,29 +42,40 @@ typedef struct QueryDesc
 	ParamListInfo params;		/* param values being passed in */
 	QueryEnvironment *queryEnv; /* query environment passed in */
 	int			instrument_options; /* OR of InstrumentOption flags */
+	int			query_instr_options;	/* OR of InstrumentOption flags for
+										 * query_instr */
 
 	/* These fields are set by ExecutorStart */
 	TupleDesc	tupDesc;		/* descriptor for result tuples */
 	EState	   *estate;			/* executor's query-wide state */
 	PlanState  *planstate;		/* tree of per-plan-node state */
 
-	/* This field is set by ExecutorRun */
+	/* This field is set by ExecutePlan */
 	bool		already_executed;	/* true if previously executed */
 
-	/* This is always set NULL by the core system, but plugins can change it */
-	struct Instrumentation *totaltime;	/* total time spent in ExecutorRun */
+	/* This field is allocated by ExecutorStart if needed */
+	struct Instrumentation *query_instr;	/* query level instrumentation */
+
+	/* Private state of extensions; see GetQueryDescExtensionId() */
+	void	  **extension_state;
+	int			extension_state_allocated;
 } QueryDesc;
 
 /* in pquery.c */
 extern QueryDesc *CreateQueryDesc(PlannedStmt *plannedstmt,
-				const char *sourceText,
-				Snapshot snapshot,
-				Snapshot crosscheck_snapshot,
-				DestReceiver *dest,
-				ParamListInfo params,
-				QueryEnvironment *queryEnv,
-				int instrument_options);
+								  const char *sourceText,
+								  Snapshot snapshot,
+								  Snapshot crosscheck_snapshot,
+								  DestReceiver *dest,
+								  ParamListInfo params,
+								  QueryEnvironment *queryEnv,
+								  int instrument_options);
 
 extern void FreeQueryDesc(QueryDesc *qdesc);
+
+extern int	GetQueryDescExtensionId(const char *extension_name);
+extern void *GetQueryDescExtensionState(QueryDesc *qdesc, int extension_id);
+extern void SetQueryDescExtensionState(QueryDesc *qdesc, int extension_id,
+									   void *opaque);
 
 #endif							/* EXECDESC_H  */

@@ -169,9 +169,7 @@ Recovery
 --------
 
 The FSM is not explicitly WAL-logged. Instead, we rely on a bunch of
-self-correcting measures to repair possible corruption. As a result when
-we write to the FSM we treat that as a hint and thus use MarkBufferDirtyHint()
-rather than MarkBufferDirty().
+self-correcting measures to repair possible corruption.
 
 First of all, whenever a value is set on an FSM page, the root node of the
 page is compared against the new value after bubbling up the change is
@@ -187,6 +185,34 @@ space on corresponding heap pages, as it proceeds through the heap.  This
 goes through fsm_set_avail(), so that the upper nodes on those pages are
 immediately updated.  Periodically, VACUUM calls FreeSpaceMapVacuum[Range]
 to propagate the new free-space info into the upper pages of the FSM tree.
+
+As a result when we write to the FSM we treat that as a hint and thus use
+MarkBufferDirtyHint() rather than MarkBufferDirty().  Every read here uses
+RBM_ZERO_ON_ERROR to bypass checksum mismatches and other verification
+failures.
+
+That RBM_ZERO_ON_ERROR is a property of this directory, not of the FSM fork
+itself.  The files themselves are ordinary relation files, and plenty of code
+outside freespace.c reads them and does verify checksums:
+RelationCopyStorage(), which ALTER TABLE ... SET TABLESPACE runs over every
+fork; the read stream in RelationCopyStorageUsingBuffer(), used by
+CREATE DATABASE ... STRATEGY = wal_log; and the checksum verification in base
+backups and in pg_checksums.  The alternative would be all such code skipping
+checksum validation of *_fsm files, and that may be the right call someday.
+Today they do verify, so what we write here has to be valid.
+
+So the full page images MarkBufferDirtyHint() writes are not just an
+optimization that reduces how often RBM_ZERO_ON_ERROR loses knowledge.
+When checksums or wal_log_hints are enabled they are what keeps an FSM page
+that reaches disk either checksum-valid or repairable by a later FPI.  Do not
+replace MarkBufferDirtyHint() with MarkBufferDirty() here on the grounds that
+the FSM survives torn pages; it does, but the rest of the system is not
+promised the same.
+
+Relation extension is not WAL-logged.  Hence, after WAL replay, an on-disk FSM
+slot may indicate free space in PageIsNew() blocks that never reached disk.
+We detect this case by comparing against the actual relation size, and we mark
+the block as full in that case.
 
 TODO
 ----

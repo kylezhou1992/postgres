@@ -5,7 +5,7 @@
  *
  * Original coding 1998, Jan Wieck.  Heavily revised 2003, Tom Lane.
  *
- * Copyright (c) 1998-2018, PostgreSQL Global Development Group
+ * Copyright (c) 1998-2026, PostgreSQL Global Development Group
  *
  * src/include/utils/numeric.h
  *
@@ -14,14 +14,28 @@
 #ifndef _PG_NUMERIC_H_
 #define _PG_NUMERIC_H_
 
+#include "common/pg_prng.h"
 #include "fmgr.h"
 
+/* forward declaration to avoid node.h include */
+typedef struct Node Node;
+
 /*
- * Limit on the precision (and hence scale) specifiable in a NUMERIC typmod.
- * Note that the implementation limit on the length of a numeric value is
- * much larger --- beware of what you use this for!
+ * Limits on the precision and scale specifiable in a NUMERIC typmod.  The
+ * precision is strictly positive, but the scale may be positive or negative.
+ * A negative scale implies rounding before the decimal point.
+ *
+ * Note that the minimum display scale defined below is zero --- we always
+ * display all digits before the decimal point, even when the scale is
+ * negative.
+ *
+ * Note that the implementation limits on the precision and display scale of a
+ * numeric value are much larger --- beware of what you use these for!
  */
 #define NUMERIC_MAX_PRECISION		1000
+
+#define NUMERIC_MIN_SCALE			(-1000)
+#define NUMERIC_MAX_SCALE			1000
 
 /*
  * Internal limits on the scales chosen for calculation results
@@ -46,9 +60,24 @@ typedef struct NumericData *Numeric;
  * fmgr interface macros
  */
 
-#define DatumGetNumeric(X)		  ((Numeric) PG_DETOAST_DATUM(X))
-#define DatumGetNumericCopy(X)	  ((Numeric) PG_DETOAST_DATUM_COPY(X))
-#define NumericGetDatum(X)		  PointerGetDatum(X)
+static inline Numeric
+DatumGetNumeric(Datum X)
+{
+	return (Numeric) PG_DETOAST_DATUM(X);
+}
+
+static inline Numeric
+DatumGetNumericCopy(Datum X)
+{
+	return (Numeric) PG_DETOAST_DATUM_COPY(X);
+}
+
+static inline Datum
+NumericGetDatum(Numeric X)
+{
+	return PointerGetDatum(X);
+}
+
 #define PG_GETARG_NUMERIC(n)	  DatumGetNumeric(PG_GETARG_DATUM(n))
 #define PG_GETARG_NUMERIC_COPY(n) DatumGetNumericCopy(PG_GETARG_DATUM(n))
 #define PG_RETURN_NUMERIC(x)	  return NumericGetDatum(x)
@@ -57,8 +86,25 @@ typedef struct NumericData *Numeric;
  * Utility functions in numeric.c
  */
 extern bool numeric_is_nan(Numeric num);
-int32		numeric_maximum_size(int32 typmod);
+extern bool numeric_is_inf(Numeric num);
+extern int32 numeric_maximum_size(int32 typmod);
 extern char *numeric_out_sci(Numeric num, int scale);
 extern char *numeric_normalize(Numeric num);
+
+extern Numeric int64_to_numeric(int64 val);
+extern Numeric int64_div_fast_to_numeric(int64 val1, int log10val2);
+
+extern Numeric numeric_add_safe(Numeric num1, Numeric num2, Node *escontext);
+extern Numeric numeric_sub_safe(Numeric num1, Numeric num2, Node *escontext);
+extern Numeric numeric_mul_safe(Numeric num1, Numeric num2, Node *escontext);
+extern Numeric numeric_div_safe(Numeric num1, Numeric num2, Node *escontext);
+extern Numeric numeric_mod_safe(Numeric num1, Numeric num2, Node *escontext);
+extern int32 numeric_int4_safe(Numeric num, Node *escontext);
+extern int64 numeric_int8_safe(Numeric num, Node *escontext);
+extern int32 make_numeric_typmod_safe(int32 precision, int32 scale,
+									  Node *escontext);
+
+extern Numeric random_numeric(pg_prng_state *state,
+							  Numeric rmin, Numeric rmax);
 
 #endif							/* _PG_NUMERIC_H_ */

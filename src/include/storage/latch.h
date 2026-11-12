@@ -84,13 +84,14 @@
  * use of any generic handler.
  *
  *
- * WaitEventSets allow to wait for latches being set and additional events -
- * postmaster dying and socket readiness of several sockets currently - at the
- * same time.  On many platforms using a long lived event set is more
- * efficient than using WaitLatch or WaitLatchOrSocket.
+ * See also WaitEventSets in waiteventset.h. They allow to wait for latches
+ * being set and additional events - postmaster dying and socket readiness of
+ * several sockets currently - at the same time.  On many platforms using a
+ * long lived event set is more efficient than using WaitLatch or
+ * WaitLatchOrSocket.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/latch.h
@@ -102,6 +103,10 @@
 
 #include <signal.h>
 
+#include "storage/waiteventset.h"	/* for WL_* arguments to WaitLatch */
+#include "utils/wait_classes.h"  /* for backward compatibility */	/* IWYU pragma: keep */
+
+
 /*
  * Latch structure should be treated as opaque and only accessed through
  * the public functions. It is defined here to allow embedding Latches as
@@ -110,6 +115,7 @@
 typedef struct Latch
 {
 	sig_atomic_t is_set;
+	sig_atomic_t maybe_sleeping;
 	bool		is_shared;
 	int			owner_pid;
 #ifdef WIN32
@@ -118,72 +124,19 @@ typedef struct Latch
 } Latch;
 
 /*
- * Bitmasks for events that may wake-up WaitLatch(), WaitLatchOrSocket(), or
- * WaitEventSetWait().
- */
-#define WL_LATCH_SET		 (1 << 0)
-#define WL_SOCKET_READABLE	 (1 << 1)
-#define WL_SOCKET_WRITEABLE  (1 << 2)
-#define WL_TIMEOUT			 (1 << 3)	/* not for WaitEventSetWait() */
-#define WL_POSTMASTER_DEATH  (1 << 4)
-#ifdef WIN32
-#define WL_SOCKET_CONNECTED  (1 << 5)
-#else
-/* avoid having to deal with case on platforms not requiring it */
-#define WL_SOCKET_CONNECTED  WL_SOCKET_WRITEABLE
-#endif
-
-#define WL_SOCKET_MASK		(WL_SOCKET_READABLE | \
-							 WL_SOCKET_WRITEABLE | \
-							 WL_SOCKET_CONNECTED)
-
-typedef struct WaitEvent
-{
-	int			pos;			/* position in the event data structure */
-	uint32		events;			/* triggered events */
-	pgsocket	fd;				/* socket fd associated with event */
-	void	   *user_data;		/* pointer provided in AddWaitEventToSet */
-#ifdef WIN32
-	bool		reset;			/* Is reset of the event required? */
-#endif
-} WaitEvent;
-
-/* forward declaration to avoid exposing latch.c implementation details */
-typedef struct WaitEventSet WaitEventSet;
-
-/*
  * prototypes for functions in latch.c
  */
-extern void InitializeLatchSupport(void);
-extern void InitLatch(volatile Latch *latch);
-extern void InitSharedLatch(volatile Latch *latch);
-extern void OwnLatch(volatile Latch *latch);
-extern void DisownLatch(volatile Latch *latch);
-extern void SetLatch(volatile Latch *latch);
-extern void ResetLatch(volatile Latch *latch);
+extern void InitLatch(Latch *latch);
+extern void InitSharedLatch(Latch *latch);
+extern void OwnLatch(Latch *latch);
+extern void DisownLatch(Latch *latch);
+extern void SetLatch(Latch *latch);
+extern void ResetLatch(Latch *latch);
 
-extern WaitEventSet *CreateWaitEventSet(MemoryContext context, int nevents);
-extern void FreeWaitEventSet(WaitEventSet *set);
-extern int AddWaitEventToSet(WaitEventSet *set, uint32 events, pgsocket fd,
-				  Latch *latch, void *user_data);
-extern void ModifyWaitEvent(WaitEventSet *set, int pos, uint32 events, Latch *latch);
-
-extern int WaitEventSetWait(WaitEventSet *set, long timeout,
-				 WaitEvent *occurred_events, int nevents,
-				 uint32 wait_event_info);
-extern int WaitLatch(volatile Latch *latch, int wakeEvents, long timeout,
-		  uint32 wait_event_info);
-extern int WaitLatchOrSocket(volatile Latch *latch, int wakeEvents,
-				  pgsocket sock, long timeout, uint32 wait_event_info);
-
-/*
- * Unix implementation uses SIGUSR1 for inter-process signaling.
- * Win32 doesn't need this.
- */
-#ifndef WIN32
-extern void latch_sigusr1_handler(void);
-#else
-#define latch_sigusr1_handler()  ((void) 0)
-#endif
+extern int	WaitLatch(Latch *latch, int wakeEvents, long timeout,
+					  uint32 wait_event_info);
+extern int	WaitLatchOrSocket(Latch *latch, int wakeEvents,
+							  pgsocket sock, long timeout, uint32 wait_event_info);
+extern void InitializeLatchWaitSet(void);
 
 #endif							/* LATCH_H */

@@ -1,21 +1,23 @@
 #include "postgres.h"
 
-#include "plpython.h"
+#include "miscadmin.h"
 #include "plpy_elog.h"
 #include "plpy_typeio.h"
-#include "utils/jsonb.h"
+#include "plpy_util.h"
 #include "utils/fmgrprotos.h"
+#include "utils/jsonb.h"
 #include "utils/numeric.h"
 
-PG_MODULE_MAGIC;
-
-void		_PG_init(void);
+PG_MODULE_MAGIC_EXT(
+					.name = "jsonb_plpython",
+					.version = PG_VERSION
+);
 
 /* for PLyObject_AsString in plpy_typeio.c */
 typedef char *(*PLyObject_AsString_t) (PyObject *plrv);
 static PLyObject_AsString_t PLyObject_AsString_p;
 
-typedef void (*PLy_elog_impl_t) (int elevel, const char *fmt,...);
+typedef void (*PLy_elog_impl_t) (int elevel, const char *fmt, ...);
 static PLy_elog_impl_t PLy_elog_impl_p;
 
 /*
@@ -25,14 +27,18 @@ static PLy_elog_impl_t PLy_elog_impl_p;
 static PyObject *decimal_constructor;
 
 static PyObject *PLyObject_FromJsonbContainer(JsonbContainer *jsonb);
-static JsonbValue *PLyObject_ToJsonbValue(PyObject *obj,
-					   JsonbParseState **jsonb_state, bool is_elem);
+static void PLyObject_ToJsonbValue(PyObject *obj,
+								   JsonbInState *jsonb_state, bool is_elem);
 
-#if PY_MAJOR_VERSION >= 3
 typedef PyObject *(*PLyUnicode_FromStringAndSize_t)
 			(const char *s, Py_ssize_t size);
 static PLyUnicode_FromStringAndSize_t PLyUnicode_FromStringAndSize_p;
-#endif
+
+/* Static asserts verify that typedefs above match original declarations */
+StaticAssertVariableIsOfType(&PLyObject_AsString, PLyObject_AsString_t);
+StaticAssertVariableIsOfType(&PLyUnicode_FromStringAndSize, PLyUnicode_FromStringAndSize_t);
+StaticAssertVariableIsOfType(&PLy_elog_impl, PLy_elog_impl_t);
+
 
 /*
  * Module initialize function: fetch function pointers for cross-module calls.
@@ -40,19 +46,12 @@ static PLyUnicode_FromStringAndSize_t PLyUnicode_FromStringAndSize_p;
 void
 _PG_init(void)
 {
-	/* Asserts verify that typedefs above match original declarations */
-	AssertVariableIsOfType(&PLyObject_AsString, PLyObject_AsString_t);
 	PLyObject_AsString_p = (PLyObject_AsString_t)
 		load_external_function("$libdir/" PLPYTHON_LIBNAME, "PLyObject_AsString",
 							   true, NULL);
-#if PY_MAJOR_VERSION >= 3
-	AssertVariableIsOfType(&PLyUnicode_FromStringAndSize, PLyUnicode_FromStringAndSize_t);
 	PLyUnicode_FromStringAndSize_p = (PLyUnicode_FromStringAndSize_t)
 		load_external_function("$libdir/" PLPYTHON_LIBNAME, "PLyUnicode_FromStringAndSize",
 							   true, NULL);
-#endif
-
-	AssertVariableIsOfType(&PLy_elog_impl, PLy_elog_impl_t);
 	PLy_elog_impl_p = (PLy_elog_impl_t)
 		load_external_function("$libdir/" PLPYTHON_LIBNAME, "PLy_elog_impl",
 							   true, NULL);
@@ -65,25 +64,25 @@ _PG_init(void)
 #define PLy_elog (PLy_elog_impl_p)
 
 /*
- * PLyString_FromJsonbValue
+ * PLyUnicode_FromJsonbValue
  *
  * Transform string JsonbValue to Python string.
  */
 static PyObject *
-PLyString_FromJsonbValue(JsonbValue *jbv)
+PLyUnicode_FromJsonbValue(JsonbValue *jbv)
 {
 	Assert(jbv->type == jbvString);
 
-	return PyString_FromStringAndSize(jbv->val.string.val, jbv->val.string.len);
+	return PLyUnicode_FromStringAndSize(jbv->val.string.val, jbv->val.string.len);
 }
 
 /*
- * PLyString_ToJsonbValue
+ * PLyUnicode_ToJsonbValue
  *
  * Transform Python string to JsonbValue.
  */
 static void
-PLyString_ToJsonbValue(PyObject *obj, JsonbValue *jbvElem)
+PLyUnicode_ToJsonbValue(PyObject *obj, JsonbValue *jbvElem)
 {
 	jbvElem->type = jbvString;
 	jbvElem->val.string.val = PLyObject_AsString(obj);
@@ -118,7 +117,7 @@ PLyObject_FromJsonbValue(JsonbValue *jsonbValue)
 			}
 
 		case jbvString:
-			return PLyString_FromJsonbValue(jsonbValue);
+			return PLyUnicode_FromJsonbValue(jsonbValue);
 
 		case jbvBool:
 			if (jsonbValue->val.boolean)
@@ -133,7 +132,7 @@ PLyObject_FromJsonbValue(JsonbValue *jsonbValue)
 }
 
 /*
- * PLyObject_FromJsonb
+ * PLyObject_FromJsonbContainer
  *
  * Transform JsonbContainer to PyObject.
  */
@@ -144,6 +143,9 @@ PLyObject_FromJsonbContainer(JsonbContainer *jsonb)
 	JsonbValue	v;
 	JsonbIterator *it;
 	PyObject   *result;
+
+	/* this can recurse via PLyObject_FromJsonbValue() */
+	check_stack_depth();
 
 	it = JsonbIteratorInit(jsonb);
 	r = JsonbIteratorNext(&it, &v, true);
@@ -164,56 +166,91 @@ PLyObject_FromJsonbContainer(JsonbContainer *jsonb)
 			}
 			else
 			{
-				/* array in v */
+				PyObject   *volatile elem = NULL;
+
 				result = PyList_New(0);
 				if (!result)
 					return NULL;
 
-				while ((r = JsonbIteratorNext(&it, &v, true)) != WJB_DONE)
+				PG_TRY();
 				{
-					if (r == WJB_ELEM)
+					while ((r = JsonbIteratorNext(&it, &v, true)) != WJB_DONE)
 					{
-						PyObject   *elem = PLyObject_FromJsonbValue(&v);
+						if (r != WJB_ELEM)
+							continue;
+
+						elem = PLyObject_FromJsonbValue(&v);
 
 						PyList_Append(result, elem);
 						Py_XDECREF(elem);
+						elem = NULL;
 					}
 				}
+				PG_CATCH();
+				{
+					Py_XDECREF(elem);
+					Py_XDECREF(result);
+					PG_RE_THROW();
+				}
+				PG_END_TRY();
 			}
 			break;
 
 		case WJB_BEGIN_OBJECT:
-			result = PyDict_New();
-			if (!result)
-				return NULL;
-
-			while ((r = JsonbIteratorNext(&it, &v, true)) != WJB_DONE)
 			{
-				if (r == WJB_KEY)
+				PyObject   *volatile result_v = PyDict_New();
+				PyObject   *volatile key = NULL;
+				PyObject   *volatile val = NULL;
+
+				if (!result_v)
+					return NULL;
+
+				PG_TRY();
 				{
-					PyObject   *key = PLyString_FromJsonbValue(&v);
-
-					if (!key)
-						return NULL;
-
-					r = JsonbIteratorNext(&it, &v, true);
-
-					if (r == WJB_VALUE)
+					while ((r = JsonbIteratorNext(&it, &v, true)) != WJB_DONE)
 					{
-						PyObject   *value = PLyObject_FromJsonbValue(&v);
+						if (r != WJB_KEY)
+							continue;
 
-						if (!value)
+						key = PLyUnicode_FromJsonbValue(&v);
+						if (!key)
 						{
-							Py_XDECREF(key);
-							return NULL;
+							Py_XDECREF(result_v);
+							result_v = NULL;
+							break;
 						}
 
-						PyDict_SetItem(result, key, value);
-						Py_XDECREF(value);
-					}
+						if ((r = JsonbIteratorNext(&it, &v, true)) != WJB_VALUE)
+							elog(ERROR, "unexpected jsonb token: %d", r);
 
-					Py_XDECREF(key);
+						val = PLyObject_FromJsonbValue(&v);
+						if (!val)
+						{
+							Py_XDECREF(key);
+							key = NULL;
+							Py_XDECREF(result_v);
+							result_v = NULL;
+							break;
+						}
+
+						PyDict_SetItem(result_v, key, val);
+
+						Py_XDECREF(key);
+						key = NULL;
+						Py_XDECREF(val);
+						val = NULL;
+					}
 				}
+				PG_CATCH();
+				{
+					Py_XDECREF(result_v);
+					Py_XDECREF(key);
+					Py_XDECREF(val);
+					PG_RE_THROW();
+				}
+				PG_END_TRY();
+
+				result = result_v;
 			}
 			break;
 
@@ -230,24 +267,23 @@ PLyObject_FromJsonbContainer(JsonbContainer *jsonb)
  *
  * Transform Python dict to JsonbValue.
  */
-static JsonbValue *
-PLyMapping_ToJsonbValue(PyObject *obj, JsonbParseState **jsonb_state)
+static void
+PLyMapping_ToJsonbValue(PyObject *obj, JsonbInState *jsonb_state)
 {
 	Py_ssize_t	pcount;
-	JsonbValue *out = NULL;
-
-	/* We need it volatile, since we use it after longjmp */
-	volatile PyObject *items_v = NULL;
+	PyObject   *volatile items;
 
 	pcount = PyMapping_Size(obj);
-	items_v = PyMapping_Items(obj);
+	if (pcount < 0)
+		PLy_elog(ERROR, "could not get size of Python mapping");
+
+	items = PyMapping_Items(obj);
+	if (items == NULL)
+		PLy_elog(ERROR, "could not get items from Python mapping");
 
 	PG_TRY();
 	{
 		Py_ssize_t	i;
-		PyObject   *items;
-
-		items = (PyObject *) items_v;
 
 		pushJsonbValue(jsonb_state, WJB_BEGIN_OBJECT, NULL);
 
@@ -255,8 +291,15 @@ PLyMapping_ToJsonbValue(PyObject *obj, JsonbParseState **jsonb_state)
 		{
 			JsonbValue	jbvKey;
 			PyObject   *item = PyList_GetItem(items, i);
-			PyObject   *key = PyTuple_GetItem(item, 0);
-			PyObject   *value = PyTuple_GetItem(item, 1);
+			PyObject   *key;
+			PyObject   *value;
+
+			/* The mapping's items() must yield key/value pairs */
+			if (item == NULL || !PyTuple_Check(item) || PyTuple_Size(item) < 2)
+				PLy_elog(ERROR, "items() of a Python mapping must return key/value pairs");
+
+			key = PyTuple_GetItem(item, 0);
+			value = PyTuple_GetItem(item, 1);
 
 			/* Python dictionary can have None as key */
 			if (key == Py_None)
@@ -268,23 +311,20 @@ PLyMapping_ToJsonbValue(PyObject *obj, JsonbParseState **jsonb_state)
 			else
 			{
 				/* All others types of keys we serialize to string */
-				PLyString_ToJsonbValue(key, &jbvKey);
+				PLyUnicode_ToJsonbValue(key, &jbvKey);
 			}
 
-			(void) pushJsonbValue(jsonb_state, WJB_KEY, &jbvKey);
-			(void) PLyObject_ToJsonbValue(value, jsonb_state, false);
+			pushJsonbValue(jsonb_state, WJB_KEY, &jbvKey);
+			PLyObject_ToJsonbValue(value, jsonb_state, false);
 		}
 
-		out = pushJsonbValue(jsonb_state, WJB_END_OBJECT, NULL);
+		pushJsonbValue(jsonb_state, WJB_END_OBJECT, NULL);
 	}
-	PG_CATCH();
+	PG_FINALLY();
 	{
-		Py_DECREF(items_v);
-		PG_RE_THROW();
+		Py_DECREF(items);
 	}
 	PG_END_TRY();
-
-	return out;
 }
 
 /*
@@ -293,26 +333,40 @@ PLyMapping_ToJsonbValue(PyObject *obj, JsonbParseState **jsonb_state)
  * Transform python list to JsonbValue. Expects transformed PyObject and
  * a state required for jsonb construction.
  */
-static JsonbValue *
-PLySequence_ToJsonbValue(PyObject *obj, JsonbParseState **jsonb_state)
+static void
+PLySequence_ToJsonbValue(PyObject *obj, JsonbInState *jsonb_state)
 {
 	Py_ssize_t	i;
 	Py_ssize_t	pcount;
+	PyObject   *volatile value = NULL;
 
 	pcount = PySequence_Size(obj);
 
 	pushJsonbValue(jsonb_state, WJB_BEGIN_ARRAY, NULL);
 
-	for (i = 0; i < pcount; i++)
+	PG_TRY();
 	{
-		PyObject   *value = PySequence_GetItem(obj, i);
+		for (i = 0; i < pcount; i++)
+		{
+			value = PySequence_GetItem(obj, i);
 
-		(void) PLyObject_ToJsonbValue(value, jsonb_state, true);
+			/* PySequence_GetItem() can return NULL, with an exception set */
+			if (value == NULL)
+				PLy_elog(ERROR, "could not get element %d from sequence", (int) i);
 
-		Py_XDECREF(value);
+			PLyObject_ToJsonbValue(value, jsonb_state, true);
+			Py_XDECREF(value);
+			value = NULL;
+		}
 	}
+	PG_CATCH();
+	{
+		Py_XDECREF(value);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
-	return pushJsonbValue(jsonb_state, WJB_END_ARRAY, NULL);
+	pushJsonbValue(jsonb_state, WJB_END_ARRAY, NULL);
 }
 
 /*
@@ -340,21 +394,24 @@ PLyNumber_ToJsonbValue(PyObject *obj, JsonbValue *jbvNum)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 (errmsg("could not convert value \"%s\" to jsonb", str))));
+				 errmsg("could not convert value \"%s\" to jsonb", str)));
 	}
 	PG_END_TRY();
 
 	pfree(str);
 
 	/*
-	 * jsonb doesn't allow NaN (per JSON specification), so we have to prevent
-	 * it here explicitly.  (Infinity is also not allowed in jsonb, but
-	 * numeric_in above already catches that.)
+	 * jsonb doesn't allow NaN or infinity (per JSON specification), so we
+	 * have to reject those here explicitly.
 	 */
 	if (numeric_is_nan(num))
 		ereport(ERROR,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-				 (errmsg("cannot convert NaN to jsonb"))));
+				 errmsg("cannot convert NaN to jsonb")));
+	if (numeric_is_inf(num))
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("cannot convert infinity to jsonb")));
 
 	jbvNum->type = jbvNumeric;
 	jbvNum->val.numeric = num;
@@ -367,30 +424,34 @@ PLyNumber_ToJsonbValue(PyObject *obj, JsonbValue *jbvNum)
  *
  * Transform python object to JsonbValue.
  */
-static JsonbValue *
-PLyObject_ToJsonbValue(PyObject *obj, JsonbParseState **jsonb_state, bool is_elem)
+static void
+PLyObject_ToJsonbValue(PyObject *obj, JsonbInState *jsonb_state, bool is_elem)
 {
-	JsonbValue	buf;
 	JsonbValue *out;
 
-	if (!(PyString_Check(obj) || PyUnicode_Check(obj)))
+	/* this can recurse via PLyMapping_ToJsonbValue() */
+	check_stack_depth();
+
+	if (!PyUnicode_Check(obj))
 	{
 		if (PySequence_Check(obj))
-			return PLySequence_ToJsonbValue(obj, jsonb_state);
+		{
+			PLySequence_ToJsonbValue(obj, jsonb_state);
+			return;
+		}
 		else if (PyMapping_Check(obj))
-			return PLyMapping_ToJsonbValue(obj, jsonb_state);
+		{
+			PLyMapping_ToJsonbValue(obj, jsonb_state);
+			return;
+		}
 	}
 
-	/* Allocate JsonbValue in heap only if it is raw scalar value. */
-	if (*jsonb_state)
-		out = &buf;
-	else
-		out = palloc(sizeof(JsonbValue));
+	out = palloc_object(JsonbValue);
 
 	if (obj == Py_None)
 		out->type = jbvNull;
-	else if (PyString_Check(obj) || PyUnicode_Check(obj))
-		PLyString_ToJsonbValue(obj, out);
+	else if (PyUnicode_Check(obj))
+		PLyUnicode_ToJsonbValue(obj, out);
 
 	/*
 	 * PyNumber_Check() returns true for booleans, so boolean check should
@@ -406,13 +467,23 @@ PLyObject_ToJsonbValue(PyObject *obj, JsonbParseState **jsonb_state, bool is_ele
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 (errmsg("Python type \"%s\" cannot be transformed to jsonb",
-						 PLyObject_AsString((PyObject *) obj->ob_type)))));
+				 errmsg("Python type \"%s\" cannot be transformed to jsonb",
+						PLyObject_AsString((PyObject *) obj->ob_type))));
 
-	/* Push result into 'jsonb_state' unless it is raw scalar value. */
-	return (*jsonb_state ?
-			pushJsonbValue(jsonb_state, is_elem ? WJB_ELEM : WJB_VALUE, out) :
-			out);
+	if (jsonb_state->parseState)
+	{
+		/* We're in an array or object, so push value as element or field. */
+		pushJsonbValue(jsonb_state, is_elem ? WJB_ELEM : WJB_VALUE, out);
+	}
+	else
+	{
+		/*
+		 * We are at top level, so it's a raw scalar.  If we just shove the
+		 * scalar value into jsonb_state->result, JsonbValueToJsonb will take
+		 * care of wrapping it into a dummy array.
+		 */
+		jsonb_state->result = out;
+	}
 }
 
 /*
@@ -424,13 +495,11 @@ PG_FUNCTION_INFO_V1(plpython_to_jsonb);
 Datum
 plpython_to_jsonb(PG_FUNCTION_ARGS)
 {
-	PyObject   *obj;
-	JsonbValue *out;
-	JsonbParseState *jsonb_state = NULL;
+	PyObject   *obj = (PyObject *) PG_GETARG_POINTER(0);
+	JsonbInState jsonb_state = {0};
 
-	obj = (PyObject *) PG_GETARG_POINTER(0);
-	out = PLyObject_ToJsonbValue(obj, &jsonb_state, true);
-	PG_RETURN_POINTER(JsonbValueToJsonb(out));
+	PLyObject_ToJsonbValue(obj, &jsonb_state, true);
+	PG_RETURN_POINTER(JsonbValueToJsonb(jsonb_state.result));
 }
 
 /*

@@ -3,7 +3,7 @@
  * geqo_eval.c
  *	  Routines to evaluate query trees
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/optimizer/geqo/geqo_eval.c
@@ -11,19 +11,19 @@
  *-------------------------------------------------------------------------
  */
 
-/* contributed by:
-   =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
-   *  Martin Utesch				 * Institute of Automatic Control	   *
-   =							 = University of Mining and Technology =
-   *  utesch@aut.tu-freiberg.de  * Freiberg, Germany				   *
-   =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
+/*
+ * contributed by:
+ * =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
+ * *  Martin Utesch				 * Institute of Automatic Control	   *
+ * =							 = University of Mining and Technology =
+ * *  utesch@aut.tu-freiberg.de  * Freiberg, Germany				   *
+ * =*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=
  */
 
 #include "postgres.h"
 
 #include <float.h>
 #include <limits.h>
-#include <math.h>
 
 #include "optimizer/geqo.h"
 #include "optimizer/joininfo.h"
@@ -40,26 +40,26 @@ typedef struct
 } Clump;
 
 static List *merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump,
-			int num_gene, bool force);
+						 int num_gene, bool force);
 static bool desirable_join(PlannerInfo *root,
-			   RelOptInfo *outer_rel, RelOptInfo *inner_rel);
+						   RelOptInfo *outer_rel, RelOptInfo *inner_rel);
 
 
 /*
  * geqo_eval
  *
- * Returns cost of a query tree as an individual of the population.
+ * Returns the fitness of a query tree as an individual of the population.
  *
- * If no legal join order can be extracted from the proposed tour,
- * returns DBL_MAX.
+ * If no legal join order can be extracted from the proposed tour, returns
+ * the invalid fitness described in geqo_gene.h.
  */
-Cost
+Fitness
 geqo_eval(PlannerInfo *root, Gene *tour, int num_gene)
 {
 	MemoryContext mycontext;
 	MemoryContext oldcxt;
 	RelOptInfo *joinrel;
-	Cost		fitness;
+	Fitness		fitness;
 	int			savelength;
 	struct HTAB *savehash;
 
@@ -112,10 +112,14 @@ geqo_eval(PlannerInfo *root, Gene *tour, int num_gene)
 	{
 		Path	   *best_path = joinrel->cheapest_total_path;
 
-		fitness = best_path->total_cost;
+		fitness.disabled_nodes = best_path->disabled_nodes;
+		fitness.cost = best_path->total_cost;
 	}
 	else
-		fitness = DBL_MAX;
+	{
+		fitness.disabled_nodes = INT_MAX;
+		fitness.cost = DBL_MAX;
+	}
 
 	/*
 	 * Restore join_rel_list to its former state, and put back original
@@ -162,7 +166,7 @@ geqo_eval(PlannerInfo *root, Gene *tour, int num_gene)
 RelOptInfo *
 gimme_tree(PlannerInfo *root, Gene *tour, int num_gene)
 {
-	GeqoPrivateData *private = (GeqoPrivateData *) root->join_search_private;
+	GeqoPrivateData *private = GetGeqoPrivateData(root);
 	List	   *clumps;
 	int			rel_count;
 
@@ -191,7 +195,7 @@ gimme_tree(PlannerInfo *root, Gene *tour, int num_gene)
 										  cur_rel_index - 1);
 
 		/* Make it into a single-rel clump */
-		cur_clump = (Clump *) palloc(sizeof(Clump));
+		cur_clump = palloc_object(Clump);
 		cur_clump->joinrel = cur_rel;
 		cur_clump->size = 1;
 
@@ -238,11 +242,10 @@ static List *
 merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump, int num_gene,
 			bool force)
 {
-	ListCell   *prev;
 	ListCell   *lc;
+	int			pos;
 
 	/* Look for a clump that new_clump can join to */
-	prev = NULL;
 	foreach(lc, clumps)
 	{
 		Clump	   *old_clump = (Clump *) lfirst(lc);
@@ -265,6 +268,9 @@ merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump, int num_gene,
 			/* Keep searching if join order is not valid */
 			if (joinrel)
 			{
+				bool		is_top_rel = bms_equal(joinrel->relids,
+												   root->all_query_rels);
+
 				/* Create paths for partitionwise joins. */
 				generate_partitionwise_join_paths(root, joinrel);
 
@@ -274,11 +280,27 @@ merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump, int num_gene,
 				 * rel once we know the final targetlist (see
 				 * grouping_planner).
 				 */
-				if (old_clump->size + new_clump->size < num_gene)
-					generate_gather_paths(root, joinrel, false);
+				if (!is_top_rel)
+					generate_useful_gather_paths(root, joinrel, false);
 
 				/* Find and save the cheapest paths for this joinrel */
 				set_cheapest(joinrel);
+
+				/*
+				 * Except for the topmost scan/join rel, consider generating
+				 * partial aggregation paths for the grouped relation on top
+				 * of the paths of this rel.  After that, we're done creating
+				 * paths for the grouped relation, so run set_cheapest().
+				 */
+				if (joinrel->grouped_rel != NULL && !is_top_rel)
+				{
+					RelOptInfo *grouped_rel = joinrel->grouped_rel;
+
+					Assert(IS_GROUPED_REL(grouped_rel));
+
+					generate_grouped_paths(root, grouped_rel, joinrel);
+					set_cheapest(grouped_rel);
+				}
 
 				/* Absorb new clump into old */
 				old_clump->joinrel = joinrel;
@@ -286,7 +308,7 @@ merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump, int num_gene,
 				pfree(new_clump);
 
 				/* Remove old_clump from list */
-				clumps = list_delete_cell(clumps, lc, prev);
+				clumps = foreach_delete_current(clumps, lc);
 
 				/*
 				 * Recursively try to merge the enlarged old_clump with
@@ -296,7 +318,6 @@ merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump, int num_gene,
 				return merge_clump(root, clumps, old_clump, num_gene, force);
 			}
 		}
-		prev = lc;
 	}
 
 	/*
@@ -307,21 +328,15 @@ merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump, int num_gene,
 	if (clumps == NIL || new_clump->size == 1)
 		return lappend(clumps, new_clump);
 
-	/* Check if it belongs at the front */
-	lc = list_head(clumps);
-	if (new_clump->size > ((Clump *) lfirst(lc))->size)
-		return lcons(new_clump, clumps);
-
 	/* Else search for the place to insert it */
-	for (;;)
+	for (pos = 0; pos < list_length(clumps); pos++)
 	{
-		ListCell   *nxt = lnext(lc);
+		Clump	   *old_clump = (Clump *) list_nth(clumps, pos);
 
-		if (nxt == NULL || new_clump->size > ((Clump *) lfirst(nxt))->size)
-			break;				/* it belongs after 'lc', before 'nxt' */
-		lc = nxt;
+		if (new_clump->size > old_clump->size)
+			break;				/* new_clump belongs before old_clump */
 	}
-	lappend_cell(clumps, lc, new_clump);
+	clumps = list_insert_nth(clumps, pos, new_clump);
 
 	return clumps;
 }

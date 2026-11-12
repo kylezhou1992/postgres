@@ -3,7 +3,7 @@
  * nodeNamedtuplestorescan.c
  *	  routines to handle NamedTuplestoreScan nodes.
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -15,10 +15,10 @@
 
 #include "postgres.h"
 
-#include "executor/execdebug.h"
+#include "executor/executor.h"
 #include "executor/nodeNamedtuplestorescan.h"
-#include "miscadmin.h"
 #include "utils/queryenvironment.h"
+#include "utils/tuplestore.h"
 
 static TupleTableSlot *NamedTuplestoreScanNext(NamedTuplestoreScanState *node);
 
@@ -135,11 +135,16 @@ ExecInitNamedTuplestoreScan(NamedTuplestoreScan *node, EState *estate, int eflag
 	ExecAssignExprContext(estate, &scanstate->ss.ps);
 
 	/*
-	 * Tuple table and result type initialization. The scan tuple type is
-	 * specified for the tuplestore.
+	 * The scan tuple type is specified for the tuplestore.
 	 */
-	ExecInitResultTupleSlotTL(estate, &scanstate->ss.ps);
-	ExecInitScanTupleSlot(estate, &scanstate->ss, scanstate->tupdesc);
+	ExecInitScanTupleSlot(estate, &scanstate->ss, scanstate->tupdesc,
+						  &TTSOpsMinimalTuple, 0);
+
+	/*
+	 * Initialize result type and projection.
+	 */
+	ExecInitResultTypeTL(&scanstate->ss.ps);
+	ExecAssignScanProjectionInfo(&scanstate->ss);
 
 	/*
 	 * initialize child expressions
@@ -147,33 +152,7 @@ ExecInitNamedTuplestoreScan(NamedTuplestoreScan *node, EState *estate, int eflag
 	scanstate->ss.ps.qual =
 		ExecInitQual(node->scan.plan.qual, (PlanState *) scanstate);
 
-	/*
-	 * Initialize projection.
-	 */
-	ExecAssignScanProjectionInfo(&scanstate->ss);
-
 	return scanstate;
-}
-
-/* ----------------------------------------------------------------
- *		ExecEndNamedTuplestoreScan
- *
- *		frees any storage allocated through C routines.
- * ----------------------------------------------------------------
- */
-void
-ExecEndNamedTuplestoreScan(NamedTuplestoreScanState *node)
-{
-	/*
-	 * Free exprcontext
-	 */
-	ExecFreeExprContext(&node->ss.ps);
-
-	/*
-	 * clean out the tuple table
-	 */
-	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
-	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 }
 
 /* ----------------------------------------------------------------
@@ -187,7 +166,8 @@ ExecReScanNamedTuplestoreScan(NamedTuplestoreScanState *node)
 {
 	Tuplestorestate *tuplestorestate = node->relation;
 
-	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+	if (node->ss.ps.ps_ResultTupleSlot)
+		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
 
 	ExecScanReScan(&node->ss);
 

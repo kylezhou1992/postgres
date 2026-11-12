@@ -15,7 +15,7 @@
  * forked backends, but they could not be accessed by exec'd backends.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -29,6 +29,7 @@
 #include <semaphore.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #include "miscadmin.h"
 #include "storage/ipc.h"
@@ -64,7 +65,10 @@ static PGSemaphore sharedSemas; /* array of PGSemaphoreData in shared memory */
 #endif
 static int	numSems;			/* number of semas acquired so far */
 static int	maxSems;			/* allocated size of above arrays */
+
+#ifdef USE_NAMED_POSIX_SEMAPHORES
 static int	nextSemKey;			/* next name to try */
+#endif
 
 
 static void ReleaseSemaphores(int status, Datum arg);
@@ -158,22 +162,24 @@ PosixSemaphoreKill(sem_t *sem)
 
 
 /*
- * Report amount of shared memory needed for semaphores
+ * Request shared memory needed for semaphores
  */
-Size
-PGSemaphoreShmemSize(int maxSemas)
+void
+PGSemaphoreShmemRequest(int maxSemas)
 {
 #ifdef USE_NAMED_POSIX_SEMAPHORES
 	/* No shared memory needed in this case */
-	return 0;
 #else
 	/* Need a PGSemaphoreData per semaphore */
-	return mul_size(maxSemas, sizeof(PGSemaphoreData));
+	ShmemRequestStruct(.name = "Semaphores",
+					   .size = mul_size(maxSemas, sizeof(PGSemaphoreData)),
+					   .ptr = (void **) &sharedSemas,
+		);
 #endif
 }
 
 /*
- * PGReserveSemaphores --- initialize semaphore support
+ * PGSemaphoreInit --- initialize semaphore support
  *
  * This is called during postmaster start or shared memory reinitialization.
  * It should do whatever is needed to be able to support up to maxSemas
@@ -181,41 +187,44 @@ PGSemaphoreShmemSize(int maxSemas)
  * are acquired here or in PGSemaphoreCreate, register an on_shmem_exit
  * callback to release them.
  *
- * The port number is passed for possible use as a key (for Posix, we use
- * it to generate the starting semaphore name).  In a standalone backend,
- * zero will be passed.
- *
  * In the Posix implementation, we acquire semaphores on-demand; the
  * maxSemas parameter is just used to size the arrays.  For unnamed
  * semaphores, there is an array of PGSemaphoreData structs in shared memory.
  * For named semaphores, we keep a postmaster-local array of sem_t pointers,
- * which we use for releasing the semphores when done.
+ * which we use for releasing the semaphores when done.
  * (This design minimizes the dependency of postmaster shutdown on the
  * contents of shared memory, which a failed backend might have clobbered.
  * We can't do much about the possibility of sem_destroy() crashing, but
  * we don't have to expose the counters to other processes.)
  */
 void
-PGReserveSemaphores(int maxSemas, int port)
+PGSemaphoreInit(int maxSemas)
 {
+#ifdef USE_NAMED_POSIX_SEMAPHORES
+	struct stat statbuf;
+
+	/*
+	 * We use the data directory's inode number to seed the search for free
+	 * semaphore keys.  This minimizes the odds of collision with other
+	 * postmasters, while maximizing the odds that we will detect and clean up
+	 * semaphores left over from a crashed postmaster in our own directory.
+	 */
+	if (stat(DataDir, &statbuf) < 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not stat data directory \"%s\": %m",
+						DataDir)));
+	nextSemKey = statbuf.st_ino;
+#endif
+
 #ifdef USE_NAMED_POSIX_SEMAPHORES
 	mySemPointers = (sem_t **) malloc(maxSemas * sizeof(sem_t *));
 	if (mySemPointers == NULL)
 		elog(PANIC, "out of memory");
-#else
-
-	/*
-	 * We must use ShmemAllocUnlocked(), since the spinlock protecting
-	 * ShmemAlloc() won't be ready yet.  (This ordering is necessary when we
-	 * are emulating spinlocks with semaphores.)
-	 */
-	sharedSemas = (PGSemaphore)
-		ShmemAllocUnlocked(PGSemaphoreShmemSize(maxSemas));
 #endif
 
 	numSems = 0;
 	maxSems = maxSemas;
-	nextSemKey = port * 1000;
 
 	on_shmem_exit(ReleaseSemaphores, 0);
 }

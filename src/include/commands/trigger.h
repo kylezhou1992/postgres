@@ -3,7 +3,7 @@
  * trigger.h
  *	  Declarations for trigger handling.
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/commands/trigger.h
@@ -13,6 +13,7 @@
 #ifndef TRIGGER_H
 #define TRIGGER_H
 
+#include "access/tableam.h"
 #include "catalog/objectaddress.h"
 #include "nodes/execnodes.h"
 #include "nodes/parsenodes.h"
@@ -35,17 +36,18 @@ typedef struct TriggerData
 	HeapTuple	tg_trigtuple;
 	HeapTuple	tg_newtuple;
 	Trigger    *tg_trigger;
-	Buffer		tg_trigtuplebuf;
-	Buffer		tg_newtuplebuf;
+	TupleTableSlot *tg_trigslot;
+	TupleTableSlot *tg_newslot;
 	Tuplestorestate *tg_oldtable;
 	Tuplestorestate *tg_newtable;
+	const Bitmapset *tg_updatedcols;
 } TriggerData;
 
 /*
  * The state for capturing old and new tuples into transition tables for a
- * single ModifyTable node (or other operation source, e.g. copy.c).
+ * single ModifyTable node (or other operation source, e.g. copyfrom.c).
  *
- * This is per-caller to avoid conflicts in setting tcs_map or
+ * This is per-caller to avoid conflicts in setting
  * tcs_original_insert_tuple.  Note, however, that the pointed-to
  * private data may be shared across multiple callers.
  */
@@ -65,26 +67,11 @@ typedef struct TransitionCaptureState
 	bool		tcs_insert_new_table;
 
 	/*
-	 * For UPDATE and DELETE, AfterTriggerSaveEvent may need to convert the
-	 * new and old tuples from a child table's format to the format of the
-	 * relation named in a query so that it is compatible with the transition
-	 * tuplestores.  The caller must store the conversion map here if so.
-	 */
-	TupleConversionMap *tcs_map;
-
-	/*
-	 * For INSERT and COPY, it would be wasteful to convert tuples from child
-	 * format to parent format after they have already been converted in the
-	 * opposite direction during routing.  In that case we bypass conversion
-	 * and allow the inserting code (copy.c and nodeModifyTable.c) to provide
-	 * the original tuple directly.
-	 */
-	HeapTuple	tcs_original_insert_tuple;
-
-	/*
 	 * Private data including the tuplestore(s) into which to insert tuples.
 	 */
-	struct AfterTriggersTableData *tcs_private;
+	struct AfterTriggersTableData *tcs_insert_private;
+	struct AfterTriggersTableData *tcs_update_private;
+	struct AfterTriggersTableData *tcs_delete_private;
 } TransitionCaptureState;
 
 /*
@@ -157,18 +144,28 @@ extern PGDLLIMPORT int SessionReplicationRole;
 #define TRIGGER_FIRES_ON_REPLICA			'R'
 #define TRIGGER_DISABLED					'D'
 
-extern ObjectAddress CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
-			  Oid relOid, Oid refRelOid, Oid constraintOid, Oid indexOid,
-			  Oid funcoid, Oid parentTriggerOid, Node *whenClause,
-			  bool isInternal, bool in_partition);
+extern ObjectAddress CreateTrigger(const CreateTrigStmt *stmt, const char *queryString,
+								   Oid relOid, Oid refRelOid, Oid constraintOid, Oid indexOid,
+								   Oid funcoid, Oid parentTriggerOid, Node *whenClause,
+								   bool isInternal, bool in_partition);
+extern ObjectAddress CreateTriggerFiringOn(const CreateTrigStmt *stmt, const char *queryString,
+										   Oid relOid, Oid refRelOid, Oid constraintOid,
+										   Oid indexOid, Oid funcoid, Oid parentTriggerOid,
+										   Node *whenClause, bool isInternal, bool in_partition,
+										   char trigger_fires_when);
 
+extern void TriggerSetParentTrigger(Relation trigRel,
+									Oid childTrigId,
+									Oid parentTrigId,
+									Oid childTableId);
 extern void RemoveTriggerById(Oid trigOid);
-extern Oid	get_trigger_oid(Oid relid, const char *name, bool missing_ok);
+extern Oid	get_trigger_oid(Oid relid, const char *trigname, bool missing_ok);
 
 extern ObjectAddress renametrig(RenameStmt *stmt);
 
-extern void EnableDisableTrigger(Relation rel, const char *tgname,
-					 char fires_when, bool skip_system, LOCKMODE lockmode);
+extern void EnableDisableTrigger(Relation rel, const char *tgname, Oid tgparent,
+								 char fires_when, bool skip_system, bool recurse,
+								 LOCKMODE lockmode);
 
 extern void RelationBuildTriggers(Relation relation);
 
@@ -177,71 +174,83 @@ extern TriggerDesc *CopyTriggerDesc(TriggerDesc *trigdesc);
 extern const char *FindTriggerIncompatibleWithInheritance(TriggerDesc *trigdesc);
 
 extern TransitionCaptureState *MakeTransitionCaptureState(TriggerDesc *trigdesc,
-						   Oid relid, CmdType cmdType);
+														  Oid relid, CmdType cmdType);
 
 extern void FreeTriggerDesc(TriggerDesc *trigdesc);
 
 extern void ExecBSInsertTriggers(EState *estate,
-					 ResultRelInfo *relinfo);
+								 ResultRelInfo *relinfo);
 extern void ExecASInsertTriggers(EState *estate,
-					 ResultRelInfo *relinfo,
-					 TransitionCaptureState *transition_capture);
-extern TupleTableSlot *ExecBRInsertTriggers(EState *estate,
-					 ResultRelInfo *relinfo,
-					 TupleTableSlot *slot);
+								 ResultRelInfo *relinfo,
+								 TransitionCaptureState *transition_capture);
+extern bool ExecBRInsertTriggers(EState *estate,
+								 ResultRelInfo *relinfo,
+								 TupleTableSlot *slot);
 extern void ExecARInsertTriggers(EState *estate,
-					 ResultRelInfo *relinfo,
-					 HeapTuple trigtuple,
-					 List *recheckIndexes,
-					 TransitionCaptureState *transition_capture);
-extern TupleTableSlot *ExecIRInsertTriggers(EState *estate,
-					 ResultRelInfo *relinfo,
-					 TupleTableSlot *slot);
+								 ResultRelInfo *relinfo,
+								 TupleTableSlot *slot,
+								 TupleTableSlot *original_insert_tuple,
+								 List *recheckIndexes,
+								 TransitionCaptureState *transition_capture);
+extern bool ExecIRInsertTriggers(EState *estate,
+								 ResultRelInfo *relinfo,
+								 TupleTableSlot *slot);
 extern void ExecBSDeleteTriggers(EState *estate,
-					 ResultRelInfo *relinfo);
+								 ResultRelInfo *relinfo);
 extern void ExecASDeleteTriggers(EState *estate,
-					 ResultRelInfo *relinfo,
-					 TransitionCaptureState *transition_capture);
+								 ResultRelInfo *relinfo,
+								 TransitionCaptureState *transition_capture);
 extern bool ExecBRDeleteTriggers(EState *estate,
-					 EPQState *epqstate,
-					 ResultRelInfo *relinfo,
-					 ItemPointer tupleid,
-					 HeapTuple fdw_trigtuple,
-					 TupleTableSlot **epqslot);
+								 EPQState *epqstate,
+								 ResultRelInfo *relinfo,
+								 ItemPointer tupleid,
+								 HeapTuple fdw_trigtuple,
+								 TupleTableSlot **epqslot,
+								 TM_Result *tmresult,
+								 TM_FailureData *tmfd,
+								 bool is_merge_delete);
 extern void ExecARDeleteTriggers(EState *estate,
-					 ResultRelInfo *relinfo,
-					 ItemPointer tupleid,
-					 HeapTuple fdw_trigtuple,
-					 TransitionCaptureState *transition_capture);
+								 ResultRelInfo *relinfo,
+								 ItemPointer tupleid,
+								 HeapTuple fdw_trigtuple,
+								 TransitionCaptureState *transition_capture,
+								 bool is_crosspart_update);
 extern bool ExecIRDeleteTriggers(EState *estate,
-					 ResultRelInfo *relinfo,
-					 HeapTuple trigtuple);
+								 ResultRelInfo *relinfo,
+								 HeapTuple trigtuple);
 extern void ExecBSUpdateTriggers(EState *estate,
-					 ResultRelInfo *relinfo);
+								 ResultRelInfo *relinfo);
 extern void ExecASUpdateTriggers(EState *estate,
-					 ResultRelInfo *relinfo,
-					 TransitionCaptureState *transition_capture);
-extern TupleTableSlot *ExecBRUpdateTriggers(EState *estate,
-					 EPQState *epqstate,
-					 ResultRelInfo *relinfo,
-					 ItemPointer tupleid,
-					 HeapTuple fdw_trigtuple,
-					 TupleTableSlot *slot);
+								 ResultRelInfo *relinfo,
+								 TransitionCaptureState *transition_capture);
+extern bool ExecBRUpdateTriggers(EState *estate,
+								 EPQState *epqstate,
+								 ResultRelInfo *relinfo,
+								 ItemPointer tupleid,
+								 HeapTuple fdw_trigtuple,
+								 TupleTableSlot *newslot,
+								 TM_Result *tmresult,
+								 TM_FailureData *tmfd,
+								 bool is_merge_update);
 extern void ExecARUpdateTriggers(EState *estate,
-					 ResultRelInfo *relinfo,
-					 ItemPointer tupleid,
-					 HeapTuple fdw_trigtuple,
-					 HeapTuple newtuple,
-					 List *recheckIndexes,
-					 TransitionCaptureState *transition_capture);
-extern TupleTableSlot *ExecIRUpdateTriggers(EState *estate,
-					 ResultRelInfo *relinfo,
-					 HeapTuple trigtuple,
-					 TupleTableSlot *slot);
+								 ResultRelInfo *relinfo,
+								 ResultRelInfo *src_partinfo,
+								 ResultRelInfo *dst_partinfo,
+								 ItemPointer tupleid,
+								 HeapTuple fdw_trigtuple,
+								 TupleTableSlot *newslot,
+								 TupleTableSlot *original_new_tuple,
+								 List *recheckIndexes,
+								 TransitionCaptureState *transition_capture,
+								 bool is_crosspart_update);
+extern bool ExecIRUpdateTriggers(EState *estate,
+								 ResultRelInfo *relinfo,
+								 HeapTuple trigtuple,
+								 TupleTableSlot *newslot);
 extern void ExecBSTruncateTriggers(EState *estate,
-					   ResultRelInfo *relinfo);
+								   ResultRelInfo *relinfo);
 extern void ExecASTruncateTriggers(EState *estate,
-					   ResultRelInfo *relinfo);
+								   ResultRelInfo *relinfo);
 
 extern void AfterTriggerBeginXact(void);
 extern void AfterTriggerBeginQuery(void);
@@ -258,11 +267,13 @@ extern bool AfterTriggerPendingOnRel(Oid relid);
  * in utils/adt/ri_triggers.c
  */
 extern bool RI_FKey_pk_upd_check_required(Trigger *trigger, Relation pk_rel,
-							  HeapTuple old_row, HeapTuple new_row);
+										  TupleTableSlot *oldslot, TupleTableSlot *newslot);
 extern bool RI_FKey_fk_upd_check_required(Trigger *trigger, Relation fk_rel,
-							  HeapTuple old_row, HeapTuple new_row);
+										  TupleTableSlot *oldslot, TupleTableSlot *newslot);
 extern bool RI_Initial_Check(Trigger *trigger,
-				 Relation fk_rel, Relation pk_rel);
+							 Relation fk_rel, Relation pk_rel);
+extern void RI_PartitionRemove_Check(Trigger *trigger, Relation fk_rel,
+									 Relation pk_rel);
 
 /* result values for RI_FKey_trigger_type: */
 #define RI_TRIGGER_PK	1		/* is a trigger on the PK relation */
@@ -270,5 +281,7 @@ extern bool RI_Initial_Check(Trigger *trigger,
 #define RI_TRIGGER_NONE 0		/* is not an RI trigger function */
 
 extern int	RI_FKey_trigger_type(Oid tgfoid);
+
+extern void AtEOXact_RI(bool isCommit);
 
 #endif							/* TRIGGER_H */

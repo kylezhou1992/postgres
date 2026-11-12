@@ -21,7 +21,10 @@ subdir = src/backend/port
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
-OBJS = atomics.o pg_sema.o pg_shmem.o $(TAS)
+OBJS = \
+	atomics.o \
+	pg_sema.o \
+	pg_shmem.o
 
 ifeq ($(PORTNAME), win32)
 SUBDIRS += win32
@@ -29,16 +32,5 @@ endif
 
 include $(top_srcdir)/src/backend/common.mk
 
-tas.o: tas.s
-ifeq ($(SUN_STUDIO_CC), yes)
-# preprocess assembler file with cpp
-	$(CC) $(CFLAGS) -c -P $<
-	mv $*.i $*_cpp.s
-	$(CC) $(CFLAGS) -c $*_cpp.s -o $@
-else
-	$(CC) $(CFLAGS) -c $<
-endif
-
-distclean clean:
-	rm -f tas_cpp.s
+clean:
 	$(MAKE) -C win32 clean

@@ -4,7 +4,7 @@
  *	  support for foreign-data wrappers, servers and user mappings.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * src/include/foreign/foreign.h
  *
@@ -21,17 +21,6 @@
 	(OidIsValid(userid) ? GetUserNameFromId(userid, false) : "public")
 
 
-/*
- * Generic option types for validation.
- * NB! These are treated as flags, so use only powers of two here.
- */
-typedef enum
-{
-	ServerOpt = 1,				/* options applicable to SERVER */
-	UserMappingOpt = 2,			/* options for USER MAPPING */
-	FdwOpt = 4					/* options for FOREIGN DATA WRAPPER */
-} GenericOptionFlags;
-
 typedef struct ForeignDataWrapper
 {
 	Oid			fdwid;			/* FDW Oid */
@@ -39,6 +28,7 @@ typedef struct ForeignDataWrapper
 	char	   *fdwname;		/* Name of the FDW */
 	Oid			fdwhandler;		/* Oid of handler function, or 0 */
 	Oid			fdwvalidator;	/* Oid of validator function, or 0 */
+	Oid			fdwconnection;	/* Oid of connection string function, or 0 */
 	List	   *options;		/* fdwoptions as DefElem list */
 } ForeignDataWrapper;
 
@@ -68,13 +58,27 @@ typedef struct ForeignTable
 	List	   *options;		/* ftoptions as DefElem list */
 } ForeignTable;
 
+/* Flags for GetForeignServerExtended */
+#define FSV_MISSING_OK	0x01
+
+/* Flags for GetForeignDataWrapperExtended */
+#define FDW_MISSING_OK	0x01
+
 
 extern ForeignServer *GetForeignServer(Oid serverid);
-extern ForeignServer *GetForeignServerByName(const char *name, bool missing_ok);
+extern ForeignServer *GetForeignServerExtended(Oid serverid,
+											   uint16 flags);
+extern ForeignServer *GetForeignServerByName(const char *srvname,
+											 bool missing_ok);
+extern char *ForeignServerConnectionString(Oid userid,
+										   ForeignServer *server);
 extern UserMapping *GetUserMapping(Oid userid, Oid serverid);
+extern UserMapping *GetUserMappingExtended(Oid userid, Oid serverid, int elevel);
 extern ForeignDataWrapper *GetForeignDataWrapper(Oid fdwid);
-extern ForeignDataWrapper *GetForeignDataWrapperByName(const char *name,
-							bool missing_ok);
+extern ForeignDataWrapper *GetForeignDataWrapperExtended(Oid fdwid,
+														 uint16 flags);
+extern ForeignDataWrapper *GetForeignDataWrapperByName(const char *fdwname,
+													   bool missing_ok);
 extern ForeignTable *GetForeignTable(Oid relid);
 
 extern List *GetForeignColumnOptions(Oid relid, AttrNumber attnum);

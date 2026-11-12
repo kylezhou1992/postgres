@@ -31,8 +31,8 @@
 
 #include "postgres.h"
 
-#include "px.h"
 #include "mbuf.h"
+#include "px.h"
 
 #define STEP  (16*1024)
 
@@ -59,20 +59,14 @@ mbuf_size(MBuf *mbuf)
 }
 
 int
-mbuf_tell(MBuf *mbuf)
-{
-	return mbuf->read_pos - mbuf->data;
-}
-
-int
 mbuf_free(MBuf *mbuf)
 {
 	if (mbuf->own_data)
 	{
-		px_memset(mbuf->data, 0, mbuf->buf_end - mbuf->data);
-		px_free(mbuf->data);
+		explicit_bzero(mbuf->data, mbuf->buf_end - mbuf->data);
+		pfree(mbuf->data);
 	}
-	px_free(mbuf);
+	pfree(mbuf);
 	return 0;
 }
 
@@ -88,14 +82,12 @@ prepare_room(MBuf *mbuf, int block_len)
 	newlen = (mbuf->buf_end - mbuf->data)
 		+ ((block_len + STEP + STEP - 1) & -STEP);
 
-	newbuf = px_realloc(mbuf->data, newlen);
+	newbuf = repalloc(mbuf->data, newlen);
 
 	mbuf->buf_end = newbuf + newlen;
 	mbuf->data_end = newbuf + (mbuf->data_end - mbuf->data);
 	mbuf->read_pos = newbuf + (mbuf->read_pos - mbuf->data);
 	mbuf->data = newbuf;
-
-	return;
 }
 
 int
@@ -123,8 +115,8 @@ mbuf_create(int len)
 	if (!len)
 		len = 8192;
 
-	mbuf = px_alloc(sizeof *mbuf);
-	mbuf->data = px_alloc(len);
+	mbuf = palloc_object(MBuf);
+	mbuf->data = palloc(len);
 	mbuf->buf_end = mbuf->data + len;
 	mbuf->data_end = mbuf->data;
 	mbuf->read_pos = mbuf->data;
@@ -140,8 +132,8 @@ mbuf_create_from_data(uint8 *data, int len)
 {
 	MBuf	   *mbuf;
 
-	mbuf = px_alloc(sizeof *mbuf);
-	mbuf->data = (uint8 *) data;
+	mbuf = palloc_object(MBuf);
+	mbuf->data = data;
 	mbuf->buf_end = mbuf->data + len;
 	mbuf->data_end = mbuf->data + len;
 	mbuf->read_pos = mbuf->data;
@@ -164,13 +156,6 @@ mbuf_grab(MBuf *mbuf, int len, uint8 **data_p)
 	*data_p = mbuf->read_pos;
 	mbuf->read_pos += len;
 	return len;
-}
-
-int
-mbuf_rewind(MBuf *mbuf)
-{
-	mbuf->read_pos = mbuf->data;
-	return 0;
 }
 
 int
@@ -221,15 +206,14 @@ pullf_create(PullFilter **pf_p, const PullFilterOps *op, void *init_arg, PullFil
 		res = 0;
 	}
 
-	pf = px_alloc(sizeof(*pf));
-	memset(pf, 0, sizeof(*pf));
+	pf = palloc0_object(PullFilter);
 	pf->buflen = res;
 	pf->op = op;
 	pf->priv = priv;
 	pf->src = src;
 	if (pf->buflen > 0)
 	{
-		pf->buf = px_alloc(pf->buflen);
+		pf->buf = palloc(pf->buflen);
 		pf->pos = 0;
 	}
 	else
@@ -249,12 +233,12 @@ pullf_free(PullFilter *pf)
 
 	if (pf->buf)
 	{
-		px_memset(pf->buf, 0, pf->buflen);
-		px_free(pf->buf);
+		explicit_bzero(pf->buf, pf->buflen);
+		pfree(pf->buf);
 	}
 
-	px_memset(pf, 0, sizeof(*pf));
-	px_free(pf);
+	explicit_bzero(pf, sizeof(*pf));
+	pfree(pf);
 }
 
 /* may return less data than asked, 0 means eof */
@@ -298,7 +282,7 @@ pullf_read_max(PullFilter *pf, int len, uint8 **data_p, uint8 *tmpbuf)
 		if (res < 0)
 		{
 			/* so the caller must clear only on success */
-			px_memset(tmpbuf, 0, total);
+			explicit_bzero(tmpbuf, total);
 			return res;
 		}
 		if (res == 0)
@@ -388,15 +372,14 @@ pushf_create(PushFilter **mp_p, const PushFilterOps *op, void *init_arg, PushFil
 		res = 0;
 	}
 
-	mp = px_alloc(sizeof(*mp));
-	memset(mp, 0, sizeof(*mp));
+	mp = palloc0_object(PushFilter);
 	mp->block_size = res;
 	mp->op = op;
 	mp->priv = priv;
 	mp->next = next;
 	if (mp->block_size > 0)
 	{
-		mp->buf = px_alloc(mp->block_size);
+		mp->buf = palloc(mp->block_size);
 		mp->pos = 0;
 	}
 	else
@@ -416,12 +399,12 @@ pushf_free(PushFilter *mp)
 
 	if (mp->buf)
 	{
-		px_memset(mp->buf, 0, mp->block_size);
-		px_free(mp->buf);
+		explicit_bzero(mp->buf, mp->block_size);
+		pfree(mp->buf);
 	}
 
-	px_memset(mp, 0, sizeof(*mp));
-	px_free(mp);
+	explicit_bzero(mp, sizeof(*mp));
+	pfree(mp);
 }
 
 void

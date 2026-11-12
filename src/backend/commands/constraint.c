@@ -3,7 +3,7 @@
  * constraint.c
  *	  PostgreSQL CONSTRAINT support code.
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -13,12 +13,13 @@
  */
 #include "postgres.h"
 
+#include "access/genam.h"
+#include "access/tableam.h"
 #include "catalog/index.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
-#include "utils/builtins.h"
-#include "utils/rel.h"
-#include "utils/tqual.h"
+#include "utils/fmgrprotos.h"
+#include "utils/snapmgr.h"
 
 
 /*
@@ -37,9 +38,9 @@
 Datum
 unique_key_recheck(PG_FUNCTION_ARGS)
 {
-	TriggerData *trigdata = castNode(TriggerData, fcinfo->context);
+	TriggerData *trigdata = (TriggerData *) fcinfo->context;
 	const char *funcname = "unique_key_recheck";
-	HeapTuple	new_row;
+	ItemPointerData checktid;
 	ItemPointerData tmptid;
 	Relation	indexRel;
 	IndexInfo  *indexInfo;
@@ -71,28 +72,29 @@ unique_key_recheck(PG_FUNCTION_ARGS)
 	 * Get the new data that was inserted/updated.
 	 */
 	if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
-		new_row = trigdata->tg_trigtuple;
+		slot = trigdata->tg_trigslot;
 	else if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
-		new_row = trigdata->tg_newtuple;
+		slot = trigdata->tg_newslot;
 	else
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
 				 errmsg("function \"%s\" must be fired for INSERT or UPDATE",
 						funcname)));
-		new_row = NULL;			/* keep compiler quiet */
+		slot = NULL;			/* keep compiler quiet */
 	}
+	checktid = slot->tts_tid;
 
 	/*
-	 * If the new_row is now dead (ie, inserted and then deleted within our
-	 * transaction), we can skip the check.  However, we have to be careful,
-	 * because this trigger gets queued only in response to index insertions;
-	 * which means it does not get queued for HOT updates.  The row we are
-	 * called for might now be dead, but have a live HOT child, in which case
-	 * we still need to make the check --- effectively, we're applying the
-	 * check against the live child row, although we can use the values from
-	 * this row since by definition all columns of interest to us are the
-	 * same.
+	 * If the row pointed at by checktid is now dead (ie, inserted and then
+	 * deleted within our transaction), we can skip the check.  However, we
+	 * have to be careful, because this trigger gets queued only in response
+	 * to index insertions; which means it does not get queued e.g. for HOT
+	 * updates.  The row we are called for might now be dead, but have a live
+	 * HOT child, in which case we still need to make the check ---
+	 * effectively, we're applying the check against the live child row,
+	 * although we can use the values from this row since by definition all
+	 * columns of interest to us are the same.
 	 *
 	 * This might look like just an optimization, because the index AM will
 	 * make this identical test before throwing an error.  But it's actually
@@ -101,11 +103,11 @@ unique_key_recheck(PG_FUNCTION_ARGS)
 	 * it's possible the index entry has also been marked dead, and even
 	 * removed.
 	 */
-	tmptid = new_row->t_self;
-	if (!heap_hot_search(&tmptid, trigdata->tg_relation, SnapshotSelf, NULL))
+	tmptid = checktid;
+	if (!table_fetch_tid(trigdata->tg_relation, &tmptid, SnapshotSelf, NULL))
 	{
 		/*
-		 * All rows in the HOT chain are dead, so skip the check.
+		 * All rows referenced by the index entry are dead, so skip the check
 		 */
 		return PointerGetDatum(NULL);
 	}
@@ -118,13 +120,6 @@ unique_key_recheck(PG_FUNCTION_ARGS)
 	indexRel = index_open(trigdata->tg_trigger->tgconstrindid,
 						  RowExclusiveLock);
 	indexInfo = BuildIndexInfo(indexRel);
-
-	/*
-	 * The heap tuple must be put into a slot for FormIndexDatum.
-	 */
-	slot = MakeSingleTupleTableSlot(RelationGetDescr(trigdata->tg_relation));
-
-	ExecStoreHeapTuple(new_row, slot, false);
 
 	/*
 	 * Typically the index won't have expressions, but if it does we need an
@@ -160,13 +155,16 @@ unique_key_recheck(PG_FUNCTION_ARGS)
 	{
 		/*
 		 * Note: this is not a real insert; it is a check that the index entry
-		 * that has already been inserted is unique.  Passing t_self is
-		 * correct even if t_self is now dead, because that is the TID the
-		 * index will know about.
+		 * that has already been inserted is unique.  Passing the tuple's tid
+		 * (i.e. unmodified by table_fetch_tid()) is correct even if the row
+		 * is now dead, because that is the TID the index will know about.
 		 */
-		index_insert(indexRel, values, isnull, &(new_row->t_self),
+		index_insert(indexRel, values, isnull, &checktid,
 					 trigdata->tg_relation, UNIQUE_CHECK_EXISTING,
-					 indexInfo);
+					 false, indexInfo);
+
+		/* Cleanup cache possibly initialized by index_insert. */
+		index_insert_cleanup(indexRel, indexInfo);
 	}
 	else
 	{
@@ -187,8 +185,6 @@ unique_key_recheck(PG_FUNCTION_ARGS)
 	 */
 	if (estate != NULL)
 		FreeExecutorState(estate);
-
-	ExecDropSingleTupleTableSlot(slot);
 
 	index_close(indexRel, RowExclusiveLock);
 

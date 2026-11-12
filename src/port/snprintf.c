@@ -2,7 +2,7 @@
  * Copyright (c) 1983, 1995, 1996 Eric P. Allman
  * Copyright (c) 1988, 1993
  *	The Regents of the University of California.  All rights reserved.
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -199,7 +199,7 @@ pg_vsnprintf(char *str, size_t count, const char *fmt, va_list args)
 }
 
 int
-pg_snprintf(char *str, size_t count, const char *fmt,...)
+pg_snprintf(char *str, size_t count, const char *fmt, ...)
 {
 	int			len;
 	va_list		args;
@@ -227,7 +227,7 @@ pg_vsprintf(char *str, const char *fmt, va_list args)
 }
 
 int
-pg_sprintf(char *str, const char *fmt,...)
+pg_sprintf(char *str, const char *fmt, ...)
 {
 	int			len;
 	va_list		args;
@@ -261,7 +261,7 @@ pg_vfprintf(FILE *stream, const char *fmt, va_list args)
 }
 
 int
-pg_fprintf(FILE *stream, const char *fmt,...)
+pg_fprintf(FILE *stream, const char *fmt, ...)
 {
 	int			len;
 	va_list		args;
@@ -279,7 +279,7 @@ pg_vprintf(const char *fmt, va_list args)
 }
 
 int
-pg_printf(const char *fmt,...)
+pg_printf(const char *fmt, ...)
 {
 	int			len;
 	va_list		args;
@@ -317,34 +317,43 @@ flushbuffer(PrintfTarget *target)
 
 
 static bool find_arguments(const char *format, va_list args,
-			   PrintfArgValue *argvalues);
+						   PrintfArgValue *argvalues);
 static void fmtstr(const char *value, int leftjust, int minlen, int maxwidth,
-	   int pointflag, PrintfTarget *target);
-static void fmtptr(void *value, PrintfTarget *target);
+				   int pointflag, PrintfTarget *target);
+static void fmtptr(const void *value, PrintfTarget *target);
 static void fmtint(long long value, char type, int forcesign,
-	   int leftjust, int minlen, int zpad, int precision, int pointflag,
-	   PrintfTarget *target);
+				   int leftjust, int minlen, int zpad, int precision, int pointflag,
+				   PrintfTarget *target);
 static void fmtchar(int value, int leftjust, int minlen, PrintfTarget *target);
 static void fmtfloat(double value, char type, int forcesign,
-		 int leftjust, int minlen, int zpad, int precision, int pointflag,
-		 PrintfTarget *target);
+					 int leftjust, int minlen, int zpad, int precision, int pointflag,
+					 PrintfTarget *target);
 static void dostr(const char *str, int slen, PrintfTarget *target);
 static void dopr_outch(int c, PrintfTarget *target);
 static void dopr_outchmulti(int c, int slen, PrintfTarget *target);
 static int	adjust_sign(int is_negative, int forcesign, int *signvalue);
 static int	compute_padlen(int minlen, int vallen, int leftjust);
 static void leading_pad(int zpad, int signvalue, int *padlen,
-			PrintfTarget *target);
+						PrintfTarget *target);
 static void trailing_pad(int padlen, PrintfTarget *target);
 
 /*
- * If strchrnul exists (it's a glibc-ism), it's a good bit faster than the
- * equivalent manual loop.  If it doesn't exist, provide a replacement.
+ * If strchrnul exists (it's a glibc-ism, but since adopted by some other
+ * platforms), it's a good bit faster than the equivalent manual loop.
+ * Use it if possible, and if it doesn't exist, use this replacement.
  *
  * Note: glibc declares this as returning "char *", but that would require
  * casting away const internally, so we don't follow that detail.
+ *
+ * Note: macOS has this too as of Sequoia 15.4, but it's hidden behind
+ * a deployment-target check that causes compile errors if the deployment
+ * target isn't high enough.  So !HAVE_DECL_STRCHRNUL may mean "yes it's
+ * declared, but it doesn't compile".  To avoid failing in that scenario,
+ * use a macro to avoid matching <string.h>'s name.
  */
-#ifndef HAVE_STRCHRNUL
+#if !HAVE_DECL_STRCHRNUL
+
+#define strchrnul pg_strchrnul
 
 static inline const char *
 strchrnul(const char *s, int c)
@@ -354,19 +363,7 @@ strchrnul(const char *s, int c)
 	return s;
 }
 
-#else
-
-/*
- * glibc's <string.h> declares strchrnul only if _GNU_SOURCE is defined.
- * While we typically use that on glibc platforms, configure will set
- * HAVE_STRCHRNUL whether it's used or not.  Fill in the missing declaration
- * so that this file will compile cleanly with or without _GNU_SOURCE.
- */
-#ifndef _GNU_SOURCE
-extern char *strchrnul(const char *s, int c);
-#endif
-
-#endif							/* HAVE_STRCHRNUL */
+#endif							/* !HAVE_DECL_STRCHRNUL */
 
 
 /*
@@ -394,7 +391,7 @@ dopr(PrintfTarget *target, const char *format, va_list args)
 	int			cvalue;
 	long long	numvalue;
 	double		fvalue;
-	char	   *strvalue;
+	const char *strvalue;
 	PrintfArgValue argvalues[PG_NL_ARGMAX + 1];
 
 	/*
@@ -439,7 +436,8 @@ dopr(PrintfTarget *target, const char *format, va_list args)
 		{
 			format++;
 			strvalue = va_arg(args, char *);
-			Assert(strvalue != NULL);
+			if (strvalue == NULL)
+				strvalue = "(null)";
 			dostr(strvalue, strlen(strvalue), target);
 			if (target->failed)
 				break;
@@ -452,8 +450,6 @@ dopr(PrintfTarget *target, const char *format, va_list args)
 		have_star = afterstar = false;
 nextch2:
 		ch = *format++;
-		if (ch == '\0')
-			break;				/* illegal, but we don't complain */
 		switch (ch)
 		{
 			case '-':
@@ -466,7 +462,7 @@ nextch2:
 				/* set zero padding if no nonzero digits yet */
 				if (accum == 0 && !pointflag)
 					zpad = '0';
-				/* FALL THRU */
+				pg_fallthrough;
 			case '1':
 			case '2':
 			case '3':
@@ -567,17 +563,22 @@ nextch2:
 				else
 					longflag = 1;
 				goto nextch2;
-			case 'z':
-#if SIZEOF_SIZE_T == 8
-#ifdef HAVE_LONG_INT_64
+			case 'j':
+#if SIZEOF_INTMAX_T == SIZEOF_LONG
 				longflag = 1;
-#elif defined(HAVE_LONG_LONG_INT_64)
+#elif SIZEOF_INTMAX_T == SIZEOF_LONG_LONG
 				longlongflag = 1;
 #else
-#error "Don't know how to print 64bit integers"
+#error "cannot find integer type of the same size as intmax_t"
 #endif
+				goto nextch2;
+			case 'z':
+#if SIZEOF_SIZE_T == SIZEOF_LONG
+				longflag = 1;
+#elif SIZEOF_SIZE_T == SIZEOF_LONG_LONG
+				longlongflag = 1;
 #else
-				/* assume size_t is same size as int */
+#error "cannot find integer type of the same size as size_t"
 #endif
 				goto nextch2;
 			case 'h':
@@ -672,8 +673,9 @@ nextch2:
 					strvalue = argvalues[fmtpos].cptr;
 				else
 					strvalue = va_arg(args, char *);
-				/* Whine if someone tries to print a NULL string */
-				Assert(strvalue != NULL);
+				/* If string is NULL, silently substitute "(null)" */
+				if (strvalue == NULL)
+					strvalue = "(null)";
 				fmtstr(strvalue, leftjust, fieldwidth, precision, pointflag,
 					   target);
 				break;
@@ -683,7 +685,7 @@ nextch2:
 					strvalue = argvalues[fmtpos].cptr;
 				else
 					strvalue = va_arg(args, char *);
-				fmtptr((void *) strvalue, target);
+				fmtptr((const void *) strvalue, target);
 				break;
 			case 'e':
 			case 'E':
@@ -718,6 +720,13 @@ nextch2:
 			case '%':
 				dopr_outch('%', target);
 				break;
+			default:
+
+				/*
+				 * Anything else --- in particular, '\0' indicating end of
+				 * format string --- is bogus.
+				 */
+				goto bad_format;
 		}
 
 		/* Check for failure after each conversion spec */
@@ -749,12 +758,8 @@ find_arguments(const char *format, va_list args,
 	int			longflag;
 	int			fmtpos;
 	int			i;
-	int			last_dollar;
-	PrintfArgType argtypes[PG_NL_ARGMAX + 1];
-
-	/* Initialize to "no dollar arguments known" */
-	last_dollar = 0;
-	MemSet(argtypes, 0, sizeof(argtypes));
+	int			last_dollar = 0;	/* Init to "no dollar arguments known" */
+	PrintfArgType argtypes[PG_NL_ARGMAX + 1] = {0};
 
 	/*
 	 * This loop must accept the same format strings as the one in dopr().
@@ -782,8 +787,6 @@ find_arguments(const char *format, va_list args,
 		afterstar = false;
 nextch1:
 		ch = *format++;
-		if (ch == '\0')
-			break;				/* illegal, but we don't complain */
 		switch (ch)
 		{
 			case '-':
@@ -832,17 +835,22 @@ nextch1:
 				else
 					longflag = 1;
 				goto nextch1;
-			case 'z':
-#if SIZEOF_SIZE_T == 8
-#ifdef HAVE_LONG_INT_64
+			case 'j':
+#if SIZEOF_INTMAX_T == SIZEOF_LONG
 				longflag = 1;
-#elif defined(HAVE_LONG_LONG_INT_64)
+#elif SIZEOF_INTMAX_T == SIZEOF_LONG_LONG
 				longlongflag = 1;
 #else
-#error "Don't know how to print 64bit integers"
+#error "cannot find integer type of the same size as intmax_t"
 #endif
+				goto nextch1;
+			case 'z':
+#if SIZEOF_SIZE_T == SIZEOF_LONG
+				longflag = 1;
+#elif SIZEOF_SIZE_T == SIZEOF_LONG_LONG
+				longlongflag = 1;
 #else
-				/* assume size_t is same size as int */
+#error "cannot find integer type of the same size as size_t"
 #endif
 				goto nextch1;
 			case 'h':
@@ -918,6 +926,8 @@ nextch1:
 			case 'm':
 			case '%':
 				break;
+			default:
+				return false;	/* bogus format string */
 		}
 
 		/*
@@ -990,13 +1000,13 @@ fmtstr(const char *value, int leftjust, int minlen, int maxwidth,
 }
 
 static void
-fmtptr(void *value, PrintfTarget *target)
+fmtptr(const void *value, PrintfTarget *target)
 {
 	int			vallen;
 	char		convert[64];
 
-	/* we rely on regular C library's sprintf to do the basic conversion */
-	vallen = sprintf(convert, "%p", value);
+	/* we rely on regular C library's snprintf to do the basic conversion */
+	vallen = snprintf(convert, sizeof(convert), "%p", value);
 	if (vallen < 0)
 		target->failed = true;
 	else
@@ -1008,8 +1018,8 @@ fmtint(long long value, char type, int forcesign, int leftjust,
 	   int minlen, int zpad, int precision, int pointflag,
 	   PrintfTarget *target)
 {
-	unsigned long long base;
 	unsigned long long uvalue;
+	int			base;
 	int			dosign;
 	const char *cvt = "0123456789abcdef";
 	int			signvalue = 0;
@@ -1046,11 +1056,19 @@ fmtint(long long value, char type, int forcesign, int leftjust,
 			return;				/* keep compiler quiet */
 	}
 
+	/* disable MSVC warning about applying unary minus to an unsigned value */
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4146)
+#endif
 	/* Handle +/- */
 	if (dosign && adjust_sign((value < 0), forcesign, &signvalue))
 		uvalue = -(unsigned long long) value;
 	else
 		uvalue = (unsigned long long) value;
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 	/*
 	 * SUS: the result of converting 0 with an explicit precision of 0 is no
@@ -1060,12 +1078,36 @@ fmtint(long long value, char type, int forcesign, int leftjust,
 		vallen = 0;
 	else
 	{
-		/* make integer string */
-		do
+		/*
+		 * Convert integer to string.  We special-case each of the possible
+		 * base values so as to avoid general-purpose divisions.  On most
+		 * machines, division by a fixed constant can be done much more
+		 * cheaply than a general divide.
+		 */
+		if (base == 10)
 		{
-			convert[sizeof(convert) - (++vallen)] = cvt[uvalue % base];
-			uvalue = uvalue / base;
-		} while (uvalue);
+			do
+			{
+				convert[sizeof(convert) - (++vallen)] = cvt[uvalue % 10];
+				uvalue = uvalue / 10;
+			} while (uvalue);
+		}
+		else if (base == 16)
+		{
+			do
+			{
+				convert[sizeof(convert) - (++vallen)] = cvt[uvalue % 16];
+				uvalue = uvalue / 16;
+			} while (uvalue);
+		}
+		else					/* base == 8 */
+		{
+			do
+			{
+				convert[sizeof(convert) - (++vallen)] = cvt[uvalue % 8];
+				uvalue = uvalue / 8;
+			} while (uvalue);
+		}
 	}
 
 	zeropad = Max(0, precision - vallen);
@@ -1114,11 +1156,11 @@ fmtfloat(double value, char type, int forcesign, int leftjust,
 	int			padlen;			/* amount to pad with spaces */
 
 	/*
-	 * We rely on the regular C library's sprintf to do the basic conversion,
+	 * We rely on the regular C library's snprintf to do the basic conversion,
 	 * then handle padding considerations here.
 	 *
 	 * The dynamic range of "double" is about 1E+-308 for IEEE math, and not
-	 * too wildly more than that with other hardware.  In "f" format, sprintf
+	 * too wildly more than that with other hardware.  In "f" format, snprintf
 	 * could therefore generate at most 308 characters to the left of the
 	 * decimal point; while we need to allow the precision to get as high as
 	 * 308+17 to ensure that we don't truncate significant digits from very
@@ -1170,33 +1212,17 @@ fmtfloat(double value, char type, int forcesign, int leftjust,
 			fmt[2] = '*';
 			fmt[3] = type;
 			fmt[4] = '\0';
-			vallen = sprintf(convert, fmt, prec, value);
+			vallen = snprintf(convert, sizeof(convert), fmt, prec, value);
 		}
 		else
 		{
 			fmt[0] = '%';
 			fmt[1] = type;
 			fmt[2] = '\0';
-			vallen = sprintf(convert, fmt, value);
+			vallen = snprintf(convert, sizeof(convert), fmt, value);
 		}
 		if (vallen < 0)
 			goto fail;
-
-		/*
-		 * Windows, alone among our supported platforms, likes to emit
-		 * three-digit exponent fields even when two digits would do.  Hack
-		 * such results to look like the way everyone else does it.
-		 */
-#ifdef WIN32
-		if (vallen >= 6 &&
-			convert[vallen - 5] == 'e' &&
-			convert[vallen - 3] == '0')
-		{
-			convert[vallen - 3] = convert[vallen - 2];
-			convert[vallen - 2] = convert[vallen - 1];
-			vallen--;
-		}
-#endif
 	}
 
 	padlen = compute_padlen(minlen, vallen + zeropadlen, leftjust);
@@ -1214,16 +1240,14 @@ fmtfloat(double value, char type, int forcesign, int leftjust,
 		{
 			/* pad before exponent */
 			dostr(convert, epos - convert, target);
-			if (zeropadlen > 0)
-				dopr_outchmulti('0', zeropadlen, target);
+			dopr_outchmulti('0', zeropadlen, target);
 			dostr(epos, vallen - (epos - convert), target);
 		}
 		else
 		{
 			/* no exponent, pad after the digits */
 			dostr(convert, vallen, target);
-			if (zeropadlen > 0)
-				dopr_outchmulti('0', zeropadlen, target);
+			dopr_outchmulti('0', zeropadlen, target);
 		}
 	}
 	else
@@ -1308,23 +1332,12 @@ pg_strfromd(char *str, size_t count, int precision, double value)
 			fmt[2] = '*';
 			fmt[3] = 'g';
 			fmt[4] = '\0';
-			vallen = sprintf(convert, fmt, precision, value);
+			vallen = snprintf(convert, sizeof(convert), fmt, precision, value);
 			if (vallen < 0)
 			{
 				target.failed = true;
 				goto fail;
 			}
-
-#ifdef WIN32
-			if (vallen >= 6 &&
-				convert[vallen - 5] == 'e' &&
-				convert[vallen - 3] == '0')
-			{
-				convert[vallen - 3] = convert[vallen - 2];
-				convert[vallen - 2] = convert[vallen - 1];
-				vallen--;
-			}
-#endif
 		}
 	}
 

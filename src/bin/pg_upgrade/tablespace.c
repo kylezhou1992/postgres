@@ -3,7 +3,7 @@
  *
  *	tablespace functions
  *
- *	Copyright (c) 2010-2018, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/tablespace.c
  */
 
@@ -23,10 +23,20 @@ init_tablespaces(void)
 	set_tablespace_directory_suffix(&old_cluster);
 	set_tablespace_directory_suffix(&new_cluster);
 
-	if (os_info.num_old_tablespaces > 0 &&
+	if (old_cluster.num_tablespaces > 0 &&
 		strcmp(old_cluster.tablespace_suffix, new_cluster.tablespace_suffix) == 0)
-		pg_fatal("Cannot upgrade to/from the same system catalog version when\n"
-				 "using tablespaces.\n");
+	{
+		for (int i = 0; i < old_cluster.num_tablespaces; i++)
+		{
+			/*
+			 * In-place tablespaces are okay for same-version upgrades because
+			 * their paths will differ between clusters.
+			 */
+			if (strcmp(old_cluster.tablespaces[i], new_cluster.tablespaces[i]) == 0)
+				pg_fatal("Cannot upgrade to/from the same system catalog version when\n"
+						 "using tablespaces.");
+		}
+	}
 }
 
 
@@ -46,30 +56,55 @@ get_tablespace_paths(void)
 	char		query[QUERY_ALLOC];
 
 	snprintf(query, sizeof(query),
-			 "SELECT	%s "
+			 "SELECT pg_catalog.pg_tablespace_location(oid) AS spclocation "
 			 "FROM	pg_catalog.pg_tablespace "
 			 "WHERE	spcname != 'pg_default' AND "
-			 "		spcname != 'pg_global'",
-	/* 9.2 removed the spclocation column */
-			 (GET_MAJOR_VERSION(old_cluster.major_version) <= 901) ?
-			 "spclocation" : "pg_catalog.pg_tablespace_location(oid) AS spclocation");
+			 "		spcname != 'pg_global'");
 
 	res = executeQueryOrDie(conn, "%s", query);
 
-	if ((os_info.num_old_tablespaces = PQntuples(res)) != 0)
-		os_info.old_tablespaces = (char **) pg_malloc(
-													  os_info.num_old_tablespaces * sizeof(char *));
+	old_cluster.num_tablespaces = PQntuples(res);
+	new_cluster.num_tablespaces = PQntuples(res);
+
+	if (PQntuples(res) != 0)
+	{
+		old_cluster.tablespaces =
+			pg_malloc_array(char *, old_cluster.num_tablespaces);
+		new_cluster.tablespaces =
+			pg_malloc_array(char *, new_cluster.num_tablespaces);
+	}
 	else
-		os_info.old_tablespaces = NULL;
+	{
+		old_cluster.tablespaces = NULL;
+		new_cluster.tablespaces = NULL;
+	}
 
 	i_spclocation = PQfnumber(res, "spclocation");
 
-	for (tblnum = 0; tblnum < os_info.num_old_tablespaces; tblnum++)
+	for (tblnum = 0; tblnum < old_cluster.num_tablespaces; tblnum++)
 	{
 		struct stat statBuf;
+		char	   *spcloc = PQgetvalue(res, tblnum, i_spclocation);
 
-		os_info.old_tablespaces[tblnum] = pg_strdup(
-													PQgetvalue(res, tblnum, i_spclocation));
+		/*
+		 * For now, we do not expect non-in-place tablespaces to move during
+		 * upgrade.  If that changes, it will likely become necessary to run
+		 * the above query on the new cluster, too.
+		 *
+		 * pg_tablespace_location() returns absolute paths for non-in-place
+		 * tablespaces and relative paths for in-place ones, so we use
+		 * is_absolute_path() to distinguish between them.
+		 */
+		if (is_absolute_path(PQgetvalue(res, tblnum, i_spclocation)))
+		{
+			old_cluster.tablespaces[tblnum] = pg_strdup(spcloc);
+			new_cluster.tablespaces[tblnum] = old_cluster.tablespaces[tblnum];
+		}
+		else
+		{
+			old_cluster.tablespaces[tblnum] = psprintf("%s/%s", old_cluster.pgdata, spcloc);
+			new_cluster.tablespaces[tblnum] = psprintf("%s/%s", new_cluster.pgdata, spcloc);
+		}
 
 		/*
 		 * Check that the tablespace path exists and is a directory.
@@ -80,43 +115,36 @@ get_tablespace_paths(void)
 		 * that contains user tablespaces is moved as part of pg_upgrade
 		 * preparation and the symbolic links are not updated.
 		 */
-		if (stat(os_info.old_tablespaces[tblnum], &statBuf) != 0)
+		if (stat(old_cluster.tablespaces[tblnum], &statBuf) != 0)
 		{
 			if (errno == ENOENT)
 				report_status(PG_FATAL,
-							  "tablespace directory \"%s\" does not exist\n",
-							  os_info.old_tablespaces[tblnum]);
+							  "tablespace directory \"%s\" does not exist",
+							  old_cluster.tablespaces[tblnum]);
 			else
 				report_status(PG_FATAL,
-							  "could not stat tablespace directory \"%s\": %s\n",
-							  os_info.old_tablespaces[tblnum], strerror(errno));
+							  "could not stat tablespace directory \"%s\": %m",
+							  old_cluster.tablespaces[tblnum]);
 		}
 		if (!S_ISDIR(statBuf.st_mode))
 			report_status(PG_FATAL,
-						  "tablespace path \"%s\" is not a directory\n",
-						  os_info.old_tablespaces[tblnum]);
+						  "tablespace path \"%s\" is not a directory",
+						  old_cluster.tablespaces[tblnum]);
 	}
 
 	PQclear(res);
 
 	PQfinish(conn);
-
-	return;
 }
 
 
 static void
 set_tablespace_directory_suffix(ClusterInfo *cluster)
 {
-	if (GET_MAJOR_VERSION(cluster->major_version) <= 804)
-		cluster->tablespace_suffix = pg_strdup("");
-	else
-	{
-		/* This cluster has a version-specific subdirectory */
+	/* This cluster has a version-specific subdirectory */
 
-		/* The leading slash is needed to start a new directory. */
-		cluster->tablespace_suffix = psprintf("/PG_%s_%d",
-											  cluster->major_version_str,
-											  cluster->controldata.cat_ver);
-	}
+	/* The leading slash is needed to start a new directory. */
+	cluster->tablespace_suffix = psprintf("/PG_%s_%d",
+										  cluster->major_version_str,
+										  cluster->controldata.cat_ver);
 }

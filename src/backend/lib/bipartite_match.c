@@ -7,7 +7,7 @@
  *
  * https://en.wikipedia.org/w/index.php?title=Hopcroft%E2%80%93Karp_algorithm&oldid=593898016
  *
- * Copyright (c) 2015-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2015-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/lib/bipartite_match.c
@@ -38,7 +38,7 @@ static bool hk_depth_search(BipartiteMatchState *state, int u);
 BipartiteMatchState *
 BipartiteMatch(int u_size, int v_size, short **adjacency)
 {
-	BipartiteMatchState *state = palloc(sizeof(BipartiteMatchState));
+	BipartiteMatchState *state = palloc_object(BipartiteMatchState);
 
 	if (u_size < 0 || u_size >= SHRT_MAX ||
 		v_size < 0 || v_size >= SHRT_MAX)
@@ -48,10 +48,10 @@ BipartiteMatch(int u_size, int v_size, short **adjacency)
 	state->v_size = v_size;
 	state->adjacency = adjacency;
 	state->matching = 0;
-	state->pair_uv = (short *) palloc0((u_size + 1) * sizeof(short));
-	state->pair_vu = (short *) palloc0((v_size + 1) * sizeof(short));
-	state->distance = (short *) palloc((u_size + 1) * sizeof(short));
-	state->queue = (short *) palloc((u_size + 2) * sizeof(short));
+	state->pair_uv = palloc0_array(short, u_size + 1);
+	state->pair_vu = palloc0_array(short, v_size + 1);
+	state->distance = palloc_array(short, u_size + 1);
+	state->queue = palloc_array(short, u_size + 2);
 
 	while (hk_breadth_search(state))
 	{

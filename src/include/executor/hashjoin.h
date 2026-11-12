@@ -4,7 +4,7 @@
  *	  internal structures for hash joins
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/hashjoin.h
@@ -19,16 +19,18 @@
 #include "storage/barrier.h"
 #include "storage/buffile.h"
 #include "storage/lwlock.h"
+#include "utils/dsa.h"
+#include "utils/sharedtuplestore.h"
 
 /* ----------------------------------------------------------------
  *				hash-join hash table structures
  *
- * Each active hashjoin has a HashJoinTable control block, which is
- * palloc'd in the executor's per-query context.  All other storage needed
- * for the hashjoin is kept in private memory contexts, two for each hashjoin.
- * This makes it easy and fast to release the storage when we don't need it
- * anymore.  (Exception: data associated with the temp files lives in the
- * per-query context too, since we always call buffile.c in that context.)
+ * Each active hashjoin has a HashJoinTable structure, which is
+ * palloc'd in the executor's per-query context.  Other storage needed for
+ * each hashjoin is kept in child contexts, three for each hashjoin:
+ *   - HashTableContext (hashCxt): the parent hash table storage context
+ *   - HashSpillContext (spillCxt): storage for temp files buffers
+ *   - HashBatchContext (batchCxt): storage for a batch in serial hash join
  *
  * The hashtable contexts are made children of the per-query context, ensuring
  * that they will be discarded at end of statement even if the join is
@@ -36,9 +38,20 @@
  * be cleaned up by the virtual file manager in event of an error.)
  *
  * Storage that should live through the entire join is allocated from the
- * "hashCxt", while storage that is only wanted for the current batch is
- * allocated in the "batchCxt".  By resetting the batchCxt at the end of
- * each batch, we free all the per-batch storage reliably and without tedium.
+ * "hashCxt" (mainly the hashtable's metadata). Also, the "hashCxt" context is
+ * the parent of "spillCxt" and "batchCxt". It makes it easy and fast to
+ * release the storage when we don't need it anymore.
+ *
+ * Data associated with temp files is allocated in the "spillCxt" context
+ * which lives for the duration of the entire join as batch files'
+ * creation and usage may span batch execution. These files are
+ * explicitly destroyed by calling BufFileClose() when the code is done
+ * with them. The aim of this context is to help accounting for the
+ * memory allocated for temp files and their buffers.
+ *
+ * Finally, data used only during a single batch's execution is allocated
+ * in the "batchCxt". By resetting the batchCxt at the end of each batch,
+ * we free all the per-batch storage reliably and without tedium.
  *
  * During first scan of inner relation, we get its tuples from executor.
  * If nbatch > 1 then tuples that don't belong in first batch get saved
@@ -57,6 +70,16 @@
  * inner batch file.  Subsequently, while reading either inner or outer batch
  * files, we might find tuples that no longer belong to the current batch;
  * if so, we just dump them out to the correct batch file.
+ *
+ * If an input tuple has a null join key, then it cannot match anything from
+ * the other side of the join.  Normally we can just discard such a tuple
+ * immediately, but if it comes from the outer side of an outer join then we
+ * must emit it with null-extension of the other side.  For an outer tuple
+ * it's possible to emit it immediately and then discard it.  But for an inner
+ * tuple, or an outer tuple of a multi-batch parallel join, that is not
+ * convenient, so we dump the tuple into a tuplestore and emit it later.
+ * (In the unlikely but supported case of a non-strict join operator, we treat
+ * null keys as normal data.)
  * ----------------------------------------------------------------
  */
 
@@ -88,7 +111,7 @@ typedef struct HashJoinTupleData
  * outer relation tuples with these hash values are matched against that
  * table instead of the main one.  Thus, tuples with these hash values are
  * effectively handled as part of the first batch and will never go to disk.
- * The skew hashtable is limited to SKEW_WORK_MEM_PERCENT of the total memory
+ * The skew hashtable is limited to SKEW_HASH_MEM_PERCENT of the total memory
  * allowed for the join; while building the hashtables, we decrease the number
  * of MCVs being specially treated if needed to stay under this limit.
  *
@@ -107,7 +130,7 @@ typedef struct HashSkewBucket
 
 #define SKEW_BUCKET_OVERHEAD  MAXALIGN(sizeof(HashSkewBucket))
 #define INVALID_SKEW_BUCKET_NO	(-1)
-#define SKEW_WORK_MEM_PERCENT  2
+#define SKEW_HASH_MEM_PERCENT  2
 #define SKEW_MIN_OUTER_FRACTION  0.01
 
 /*
@@ -136,7 +159,7 @@ typedef struct HashMemoryChunkData
 
 typedef struct HashMemoryChunkData *HashMemoryChunk;
 
-#define HASH_CHUNK_SIZE			(32 * 1024L)
+#define HASH_CHUNK_SIZE			((Size) (32 * 1024))
 #define HASH_CHUNK_HEADER_SIZE	MAXALIGN(sizeof(HashMemoryChunkData))
 #define HASH_CHUNK_DATA(hc)		(((char *) (hc)) + HASH_CHUNK_HEADER_SIZE)
 /* tuples exceeding HASH_CHUNK_THRESHOLD bytes are put in their own chunk */
@@ -159,6 +182,7 @@ typedef struct ParallelHashJoinBatch
 	size_t		ntuples;		/* number of tuples loaded */
 	size_t		old_ntuples;	/* number of tuples before repartitioning */
 	bool		space_exhausted;
+	bool		skip_unmatched; /* whether to abandon unmatched scan */
 
 	/*
 	 * Variable-sized SharedTuplestore objects follow this struct in memory.
@@ -203,7 +227,7 @@ typedef struct ParallelHashJoinBatchAccessor
 	size_t		estimated_size; /* size of partition on disk */
 	size_t		old_ntuples;	/* how many tuples before repartitioning? */
 	bool		at_least_one_chunk; /* has this backend allocated a chunk? */
-
+	bool		outer_eof;		/* has this process hit end of batch? */
 	bool		done;			/* flag to remember that a batch is done */
 	SharedTuplestoreAccessor *inner_tuples;
 	SharedTuplestoreAccessor *outer_tuples;
@@ -224,7 +248,7 @@ typedef enum ParallelHashGrowth
 	/* The memory budget would be exhausted, so we need to repartition. */
 	PHJ_GROWTH_NEED_MORE_BATCHES,
 	/* Repartitioning didn't help last time, so don't try to do that again. */
-	PHJ_GROWTH_DISABLED
+	PHJ_GROWTH_DISABLED,
 } ParallelHashGrowth;
 
 /*
@@ -254,31 +278,33 @@ typedef struct ParallelHashJoinState
 } ParallelHashJoinState;
 
 /* The phases for building batches, used by build_barrier. */
-#define PHJ_BUILD_ELECTING				0
-#define PHJ_BUILD_ALLOCATING			1
-#define PHJ_BUILD_HASHING_INNER			2
-#define PHJ_BUILD_HASHING_OUTER			3
-#define PHJ_BUILD_DONE					4
+#define PHJ_BUILD_ELECT					0
+#define PHJ_BUILD_ALLOCATE				1
+#define PHJ_BUILD_HASH_INNER			2
+#define PHJ_BUILD_HASH_OUTER			3
+#define PHJ_BUILD_RUN					4
+#define PHJ_BUILD_FREE					5
 
 /* The phases for probing each batch, used by for batch_barrier. */
-#define PHJ_BATCH_ELECTING				0
-#define PHJ_BATCH_ALLOCATING			1
-#define PHJ_BATCH_LOADING				2
-#define PHJ_BATCH_PROBING				3
-#define PHJ_BATCH_DONE					4
+#define PHJ_BATCH_ELECT					0
+#define PHJ_BATCH_ALLOCATE				1
+#define PHJ_BATCH_LOAD					2
+#define PHJ_BATCH_PROBE					3
+#define PHJ_BATCH_SCAN					4
+#define PHJ_BATCH_FREE					5
 
 /* The phases of batch growth while hashing, for grow_batches_barrier. */
-#define PHJ_GROW_BATCHES_ELECTING		0
-#define PHJ_GROW_BATCHES_ALLOCATING		1
-#define PHJ_GROW_BATCHES_REPARTITIONING 2
-#define PHJ_GROW_BATCHES_DECIDING		3
-#define PHJ_GROW_BATCHES_FINISHING		4
+#define PHJ_GROW_BATCHES_ELECT			0
+#define PHJ_GROW_BATCHES_REALLOCATE		1
+#define PHJ_GROW_BATCHES_REPARTITION	2
+#define PHJ_GROW_BATCHES_DECIDE			3
+#define PHJ_GROW_BATCHES_FINISH			4
 #define PHJ_GROW_BATCHES_PHASE(n)		((n) % 5)	/* circular phases */
 
 /* The phases of bucket growth while hashing, for grow_buckets_barrier. */
-#define PHJ_GROW_BUCKETS_ELECTING		0
-#define PHJ_GROW_BUCKETS_ALLOCATING		1
-#define PHJ_GROW_BUCKETS_REINSERTING	2
+#define PHJ_GROW_BUCKETS_ELECT			0
+#define PHJ_GROW_BUCKETS_REALLOCATE		1
+#define PHJ_GROW_BUCKETS_REINSERT		2
 #define PHJ_GROW_BUCKETS_PHASE(n)		((n) % 3)	/* circular phases */
 
 typedef struct HashJoinTableData
@@ -299,8 +325,6 @@ typedef struct HashJoinTableData
 		dsa_pointer_atomic *shared;
 	}			buckets;
 
-	bool		keepNulls;		/* true to store unmatchable NULL tuples */
-
 	bool		skewEnabled;	/* are we using skew optimization? */
 	HashSkewBucket **skewBucket;	/* hashtable of skew buckets */
 	int			skewBucketLen;	/* size of skewBucket array (a power of 2!) */
@@ -315,9 +339,16 @@ typedef struct HashJoinTableData
 
 	bool		growEnabled;	/* flag to shut off nbatch increases */
 
-	double		totalTuples;	/* # tuples obtained from inner plan */
-	double		partialTuples;	/* # tuples obtained from inner plan by me */
-	double		skewTuples;		/* # tuples inserted into skew tuples */
+	/*
+	 * totalTuples is the running total of tuples inserted into either the
+	 * main or skew hash tables.  reportTuples is the number of tuples that we
+	 * want EXPLAIN to show as output from the Hash node (this includes saved
+	 * null-keyed tuples as well as those inserted into the hash tables).
+	 * skewTuples is the number of tuples present in the skew hash table.
+	 */
+	double		totalTuples;
+	double		reportTuples;
+	double		skewTuples;
 
 	/*
 	 * These arrays are allocated for the life of the hash join, but only if
@@ -329,15 +360,6 @@ typedef struct HashJoinTableData
 	BufFile   **innerBatchFile; /* buffered virtual temp file per batch */
 	BufFile   **outerBatchFile; /* buffered virtual temp file per batch */
 
-	/*
-	 * Info about the datatype-specific hash functions for the datatypes being
-	 * hashed. These are arrays of the same length as the number of hash join
-	 * clauses (hash keys).
-	 */
-	FmgrInfo   *outer_hashfunctions;	/* lookup data for hash functions */
-	FmgrInfo   *inner_hashfunctions;	/* lookup data for hash functions */
-	bool	   *hashStrict;		/* is each hash join operator strict? */
-
 	Size		spaceUsed;		/* memory space currently used by tuples */
 	Size		spaceAllowed;	/* upper limit for space used */
 	Size		spacePeak;		/* peak space used */
@@ -346,6 +368,7 @@ typedef struct HashJoinTableData
 
 	MemoryContext hashCxt;		/* context for whole-hash-join storage */
 	MemoryContext batchCxt;		/* context for this-batch-only storage */
+	MemoryContext spillCxt;		/* context for spilling to temp files */
 
 	/* used for dense allocation of tuples (into linked chunks) */
 	HashMemoryChunk chunks;		/* one list for the whole batch */
@@ -356,6 +379,6 @@ typedef struct HashJoinTableData
 	ParallelHashJoinState *parallel_state;
 	ParallelHashJoinBatchAccessor *batches;
 	dsa_pointer current_chunk_shared;
-}			HashJoinTableData;
+} HashJoinTableData;
 
 #endif							/* HASHJOIN_H */

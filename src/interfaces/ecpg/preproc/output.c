@@ -2,9 +2,9 @@
 
 #include "postgres_fe.h"
 
-#include "extern.h"
+#include "preproc_extern.h"
 
-static void output_escaped_str(char *cmd, bool quoted);
+static void output_escaped_str(const char *str, bool quoted);
 
 void
 output_line_number(void)
@@ -12,15 +12,15 @@ output_line_number(void)
 	char	   *line = hashline_number();
 
 	fprintf(base_yyout, "%s", line);
-	free(line);
 }
 
 void
-output_simple_statement(char *stmt)
+output_simple_statement(const char *stmt, int whenever_mode)
 {
 	output_escaped_str(stmt, false);
+	if (whenever_mode)
+		whenever_action(whenever_mode);
 	output_line_number();
-	free(stmt);
 }
 
 
@@ -99,7 +99,7 @@ hashline_number(void)
 		)
 	{
 		/* "* 2" here is for escaping '\' and '"' below */
-		char	   *line = mm_alloc(strlen("\n#line %d \"%s\"\n") + sizeof(int) * CHAR_BIT * 10 / 3 + strlen(input_filename) * 2);
+		char	   *line = loc_alloc(strlen("\n#line %d \"%s\"\n") + sizeof(int) * CHAR_BIT * 10 / 3 + strlen(input_filename) * 2);
 		char	   *src,
 				   *dest;
 
@@ -118,51 +118,54 @@ hashline_number(void)
 		return line;
 	}
 
-	return EMPTY;
+	return "";
 }
 
 static char *ecpg_statement_type_name[] = {
 	"ECPGst_normal",
 	"ECPGst_execute",
 	"ECPGst_exec_immediate",
-	"ECPGst_prepnormal"
+	"ECPGst_prepnormal",
+	"ECPGst_prepare",
+	"ECPGst_exec_with_exprlist"
 };
 
 void
-output_statement(char *stmt, int whenever_mode, enum ECPG_statement_type st)
+output_statement(const char *stmt, int whenever_mode, enum ECPG_statement_type st)
 {
 	fprintf(base_yyout, "{ ECPGdo(__LINE__, %d, %d, %s, %d, ", compat, force_indicator, connection ? connection : "NULL", questionmarks);
+
+	if (st == ECPGst_prepnormal && !auto_prepare)
+		st = ECPGst_normal;
+
+	/*
+	 * In following cases, stmt is CSTRING or char_variable. They must be
+	 * output directly. - prepared_name of EXECUTE without exprlist -
+	 * execstring of EXECUTE IMMEDIATE
+	 */
+	fprintf(base_yyout, "%s, ", ecpg_statement_type_name[st]);
 	if (st == ECPGst_execute || st == ECPGst_exec_immediate)
-	{
-		fprintf(base_yyout, "%s, %s, ", ecpg_statement_type_name[st], stmt);
-	}
+		fprintf(base_yyout, "%s, ", stmt);
 	else
 	{
-		if (st == ECPGst_prepnormal && auto_prepare)
-			fputs("ECPGst_prepnormal, \"", base_yyout);
-		else
-			fputs("ECPGst_normal, \"", base_yyout);
-
+		fputs("\"", base_yyout);
 		output_escaped_str(stmt, false);
 		fputs("\", ", base_yyout);
 	}
 
 	/* dump variables to C file */
 	dump_variables(argsinsert, 1);
+	argsinsert = NULL;
 	fputs("ECPGt_EOIT, ", base_yyout);
 	dump_variables(argsresult, 1);
+	argsresult = NULL;
 	fputs("ECPGt_EORT);", base_yyout);
-	reset_variables();
 
 	whenever_action(whenever_mode | 2);
-	free(stmt);
-	if (connection != NULL)
-		free(connection);
-	connection = NULL;
 }
 
 void
-output_prepare_statement(char *name, char *stmt)
+output_prepare_statement(const char *name, const char *stmt)
 {
 	fprintf(base_yyout, "{ ECPGprepare(__LINE__, %s, %d, ", connection ? connection : "NULL", questionmarks);
 	output_escaped_str(name, true);
@@ -170,14 +173,10 @@ output_prepare_statement(char *name, char *stmt)
 	output_escaped_str(stmt, true);
 	fputs(");", base_yyout);
 	whenever_action(2);
-	free(name);
-	if (connection != NULL)
-		free(connection);
-	connection = NULL;
 }
 
 void
-output_deallocate_prepare_statement(char *name)
+output_deallocate_prepare_statement(const char *name)
 {
 	const char *con = connection ? connection : "NULL";
 
@@ -191,14 +190,10 @@ output_deallocate_prepare_statement(char *name)
 		fprintf(base_yyout, "{ ECPGdeallocate_all(__LINE__, %d, %s);", compat, con);
 
 	whenever_action(2);
-	free(name);
-	if (connection != NULL)
-		free(connection);
-	connection = NULL;
 }
 
 static void
-output_escaped_str(char *str, bool quoted)
+output_escaped_str(const char *str, bool quoted)
 {
 	int			i = 0;
 	int			len = strlen(str);

@@ -1,15 +1,16 @@
 /*
  * contrib/seg/seg.c
  *
- ******************************************************************************
-  This file contains routines that can be bound to a Postgres backend and
-  called by the backend in the process of processing queries.  The calling
-  format for these routines is dictated by Postgres architecture.
-******************************************************************************/
+ *
+ * This file contains routines that can be bound to a Postgres backend and
+ * called by the backend in the process of processing queries.  The calling
+ * format for these routines is dictated by Postgres architecture.
+ */
 
 #include "postgres.h"
 
 #include <float.h>
+#include <math.h>
 
 #include "access/gist.h"
 #include "access/stratnum.h"
@@ -19,15 +20,18 @@
 
 
 #define DatumGetSegP(X) ((SEG *) DatumGetPointer(X))
-#define PG_GETARG_SEG_P(n) DatumGetSegP(PG_GETARG_POINTER(n))
+#define PG_GETARG_SEG_P(n) DatumGetSegP(PG_GETARG_DATUM(n))
 
 
 /*
-#define GIST_DEBUG
-#define GIST_QUERY_DEBUG
-*/
+ * #define GIST_DEBUG
+ * #define GIST_QUERY_DEBUG
+ */
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "seg",
+					.version = PG_VERSION
+);
 
 /*
  * Auxiliary data structure for picksplit method.
@@ -40,8 +44,8 @@ typedef struct
 } gseg_picksplit_item;
 
 /*
-** Input/Output routines
-*/
+ * Input/Output routines
+ */
 PG_FUNCTION_INFO_V1(seg_in);
 PG_FUNCTION_INFO_V1(seg_out);
 PG_FUNCTION_INFO_V1(seg_size);
@@ -50,8 +54,8 @@ PG_FUNCTION_INFO_V1(seg_upper);
 PG_FUNCTION_INFO_V1(seg_center);
 
 /*
-** GiST support methods
-*/
+ * GiST support methods
+ */
 PG_FUNCTION_INFO_V1(gseg_consistent);
 PG_FUNCTION_INFO_V1(gseg_compress);
 PG_FUNCTION_INFO_V1(gseg_decompress);
@@ -65,8 +69,8 @@ static Datum gseg_binary_union(Datum r1, Datum r2, int *sizep);
 
 
 /*
-** R-tree support functions
-*/
+ * R-tree support functions
+ */
 PG_FUNCTION_INFO_V1(seg_same);
 PG_FUNCTION_INFO_V1(seg_contains);
 PG_FUNCTION_INFO_V1(seg_contained);
@@ -80,8 +84,8 @@ PG_FUNCTION_INFO_V1(seg_inter);
 static void rt_seg_size(SEG *a, float *size);
 
 /*
-** Various operators
-*/
+ * Various operators
+ */
 PG_FUNCTION_INFO_V1(seg_cmp);
 PG_FUNCTION_INFO_V1(seg_lt);
 PG_FUNCTION_INFO_V1(seg_le);
@@ -90,9 +94,9 @@ PG_FUNCTION_INFO_V1(seg_ge);
 PG_FUNCTION_INFO_V1(seg_different);
 
 /*
-** Auxiliary functions
-*/
-static int	restore(char *s, float val, int n);
+ * Auxiliary functions
+ */
+static int	restore(char *result, float val, int n);
 
 
 /*****************************************************************************
@@ -103,14 +107,15 @@ Datum
 seg_in(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
-	SEG		   *result = palloc(sizeof(SEG));
+	SEG		   *result = palloc_object(SEG);
+	yyscan_t	scanner;
 
-	seg_scanner_init(str);
+	seg_scanner_init(str, &scanner);
 
-	if (seg_yyparse(result) != 0)
-		seg_yyerror(result, "bogus input");
+	if (seg_yyparse(result, fcinfo->context, scanner) != 0)
+		seg_yyerror(result, fcinfo->context, scanner, "bogus input");
 
-	seg_scanner_finish();
+	seg_scanner_finish(scanner);
 
 	PG_RETURN_POINTER(result);
 }
@@ -147,7 +152,7 @@ seg_out(PG_FUNCTION_ARGS)
 		{
 			/* print the upper boundary if exists */
 			p += sprintf(p, " ");
-			if (seg->u_ext == '>' || seg->u_ext == '<' || seg->l_ext == '~')
+			if (seg->u_ext == '>' || seg->u_ext == '<' || seg->u_ext == '~')
 				p += sprintf(p, "%c", seg->u_ext);
 			p += restore(p, seg->upper, seg->u_sigd);
 		}
@@ -186,19 +191,20 @@ seg_upper(PG_FUNCTION_ARGS)
  *****************************************************************************/
 
 /*
-** The GiST Consistent method for segments
-** Should return false if for all data items x below entry,
-** the predicate x op query == false, where op is the oper
-** corresponding to strategy in the pg_amop table.
-*/
+ * The GiST Consistent method for segments
+ * Should return false if for all data items x below entry,
+ * the predicate x op query == false, where op is the oper
+ * corresponding to strategy in the pg_amop table.
+ */
 Datum
 gseg_consistent(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	Datum		query = PG_GETARG_DATUM(1);
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
-
-	/* Oid		subtype = PG_GETARG_OID(3); */
+#ifdef NOT_USED
+	Oid			subtype = PG_GETARG_OID(3);
+#endif
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 
 	/* All cases served by this function are exact */
@@ -215,9 +221,9 @@ gseg_consistent(PG_FUNCTION_ARGS)
 }
 
 /*
-** The GiST Union method for segments
-** returns the minimal bounding seg that encloses all the entries in entryvec
-*/
+ * The GiST Union method for segments
+ * returns the minimal bounding seg that encloses all the entries in entryvec
+ */
 Datum
 gseg_union(PG_FUNCTION_ARGS)
 {
@@ -246,9 +252,9 @@ gseg_union(PG_FUNCTION_ARGS)
 }
 
 /*
-** GiST Compress and Decompress methods for segments
-** do not do anything.
-*/
+ * GiST Compress and Decompress methods for segments
+ * do not do anything.
+ */
 Datum
 gseg_compress(PG_FUNCTION_ARGS)
 {
@@ -262,9 +268,9 @@ gseg_decompress(PG_FUNCTION_ARGS)
 }
 
 /*
-** The GiST Penalty method for segments
-** As in the R-tree paper, we use change in area as our penalty metric
-*/
+ * The GiST Penalty method for segments
+ * As in the R-tree paper, we use change in area as our penalty metric
+ */
 Datum
 gseg_penalty(PG_FUNCTION_ARGS)
 {
@@ -339,8 +345,7 @@ gseg_picksplit(PG_FUNCTION_ARGS)
 	/*
 	 * Prepare the auxiliary array and sort it.
 	 */
-	sort_items = (gseg_picksplit_item *)
-		palloc(maxoff * sizeof(gseg_picksplit_item));
+	sort_items = palloc_array(gseg_picksplit_item, maxoff);
 	for (i = 1; i <= maxoff; i++)
 	{
 		seg = DatumGetSegP(entryvec->vector[i].key);
@@ -355,8 +360,8 @@ gseg_picksplit(PG_FUNCTION_ARGS)
 	/* sort items below "firstright" will go into the left side */
 	firstright = maxoff / 2;
 
-	v->spl_left = (OffsetNumber *) palloc(maxoff * sizeof(OffsetNumber));
-	v->spl_right = (OffsetNumber *) palloc(maxoff * sizeof(OffsetNumber));
+	v->spl_left = palloc_array(OffsetNumber, maxoff);
+	v->spl_right = palloc_array(OffsetNumber, maxoff);
 	left = v->spl_left;
 	v->spl_nleft = 0;
 	right = v->spl_right;
@@ -365,7 +370,7 @@ gseg_picksplit(PG_FUNCTION_ARGS)
 	/*
 	 * Emit segments to the left output page, and compute its bounding box.
 	 */
-	seg_l = (SEG *) palloc(sizeof(SEG));
+	seg_l = palloc_object(SEG);
 	memcpy(seg_l, sort_items[0].data, sizeof(SEG));
 	*left++ = sort_items[0].index;
 	v->spl_nleft++;
@@ -383,7 +388,7 @@ gseg_picksplit(PG_FUNCTION_ARGS)
 	/*
 	 * Likewise for the right page.
 	 */
-	seg_r = (SEG *) palloc(sizeof(SEG));
+	seg_r = palloc_object(SEG);
 	memcpy(seg_r, sort_items[firstright].data, sizeof(SEG));
 	*right++ = sort_items[firstright].index;
 	v->spl_nright++;
@@ -405,14 +410,14 @@ gseg_picksplit(PG_FUNCTION_ARGS)
 }
 
 /*
-** Equality methods
-*/
+ * Equality methods
+ */
 Datum
 gseg_same(PG_FUNCTION_ARGS)
 {
 	bool	   *result = (bool *) PG_GETARG_POINTER(2);
 
-	if (DirectFunctionCall2(seg_same, PG_GETARG_DATUM(0), PG_GETARG_DATUM(1)))
+	if (DatumGetBool(DirectFunctionCall2(seg_same, PG_GETARG_DATUM(0), PG_GETARG_DATUM(1))))
 		*result = true;
 	else
 		*result = false;
@@ -425,8 +430,8 @@ gseg_same(PG_FUNCTION_ARGS)
 }
 
 /*
-** SUPPORT ROUTINES
-*/
+ * SUPPORT ROUTINES
+ */
 static Datum
 gseg_leaf_consistent(Datum key, Datum query, StrategyNumber strategy)
 {
@@ -465,7 +470,7 @@ gseg_leaf_consistent(Datum key, Datum query, StrategyNumber strategy)
 			retval = DirectFunctionCall2(seg_contained, key, query);
 			break;
 		default:
-			retval = false;
+			retval = BoolGetDatum(false);
 	}
 
 	PG_RETURN_DATUM(retval);
@@ -557,13 +562,15 @@ seg_contained(PG_FUNCTION_ARGS)
 Datum
 seg_same(PG_FUNCTION_ARGS)
 {
-	int			cmp = DatumGetInt32(
-									DirectFunctionCall2(seg_cmp, PG_GETARG_DATUM(0), PG_GETARG_DATUM(1)));
+	int			cmp = DatumGetInt32(DirectFunctionCall2(seg_cmp,
+														PG_GETARG_DATUM(0),
+														PG_GETARG_DATUM(1)));
 
 	PG_RETURN_BOOL(cmp == 0);
 }
 
-/*	seg_overlap -- does a overlap b?
+/*
+ * seg_overlap -- does a overlap b?
  */
 Datum
 seg_overlap(PG_FUNCTION_ARGS)
@@ -575,7 +582,8 @@ seg_overlap(PG_FUNCTION_ARGS)
 				   ((b->upper >= a->upper) && (b->lower <= a->upper)));
 }
 
-/*	seg_over_left -- is the right edge of (a) located at or left of the right edge of (b)?
+/*
+ * seg_over_left -- is the right edge of (a) located at or left of the right edge of (b)?
  */
 Datum
 seg_over_left(PG_FUNCTION_ARGS)
@@ -586,7 +594,8 @@ seg_over_left(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(a->upper <= b->upper);
 }
 
-/*	seg_left -- is (a) entirely on the left of (b)?
+/*
+ * seg_left -- is (a) entirely on the left of (b)?
  */
 Datum
 seg_left(PG_FUNCTION_ARGS)
@@ -597,7 +606,8 @@ seg_left(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(a->upper < b->lower);
 }
 
-/*	seg_right -- is (a) entirely on the right of (b)?
+/*
+ * seg_right -- is (a) entirely on the right of (b)?
  */
 Datum
 seg_right(PG_FUNCTION_ARGS)
@@ -608,7 +618,8 @@ seg_right(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(a->lower > b->upper);
 }
 
-/*	seg_over_right -- is the left edge of (a) located at or right of the left edge of (b)?
+/*
+ * seg_over_right -- is the left edge of (a) located at or right of the left edge of (b)?
  */
 Datum
 seg_over_right(PG_FUNCTION_ARGS)
@@ -626,7 +637,7 @@ seg_union(PG_FUNCTION_ARGS)
 	SEG		   *b = PG_GETARG_SEG_P(1);
 	SEG		   *n;
 
-	n = (SEG *) palloc(sizeof(*n));
+	n = palloc_object(SEG);
 
 	/* take max of upper endpoints */
 	if (a->upper > b->upper)
@@ -666,7 +677,7 @@ seg_inter(PG_FUNCTION_ARGS)
 	SEG		   *b = PG_GETARG_SEG_P(1);
 	SEG		   *n;
 
-	n = (SEG *) palloc(sizeof(*n));
+	n = palloc_object(SEG);
 
 	/* take min of upper endpoints */
 	if (a->upper < b->upper)
@@ -705,9 +716,7 @@ rt_seg_size(SEG *a, float *size)
 	if (a == (SEG *) NULL || a->upper <= a->lower)
 		*size = 0.0;
 	else
-		*size = (float) Abs(a->upper - a->lower);
-
-	return;
+		*size = fabsf(a->upper - a->lower);
 }
 
 Datum
@@ -715,7 +724,7 @@ seg_size(PG_FUNCTION_ARGS)
 {
 	SEG		   *seg = PG_GETARG_SEG_P(0);
 
-	PG_RETURN_FLOAT4((float) Abs(seg->upper - seg->lower));
+	PG_RETURN_FLOAT4(fabsf(seg->upper - seg->lower));
 }
 
 
@@ -847,8 +856,9 @@ seg_cmp(PG_FUNCTION_ARGS)
 Datum
 seg_lt(PG_FUNCTION_ARGS)
 {
-	int			cmp = DatumGetInt32(
-									DirectFunctionCall2(seg_cmp, PG_GETARG_DATUM(0), PG_GETARG_DATUM(1)));
+	int			cmp = DatumGetInt32(DirectFunctionCall2(seg_cmp,
+														PG_GETARG_DATUM(0),
+														PG_GETARG_DATUM(1)));
 
 	PG_RETURN_BOOL(cmp < 0);
 }
@@ -856,8 +866,9 @@ seg_lt(PG_FUNCTION_ARGS)
 Datum
 seg_le(PG_FUNCTION_ARGS)
 {
-	int			cmp = DatumGetInt32(
-									DirectFunctionCall2(seg_cmp, PG_GETARG_DATUM(0), PG_GETARG_DATUM(1)));
+	int			cmp = DatumGetInt32(DirectFunctionCall2(seg_cmp,
+														PG_GETARG_DATUM(0),
+														PG_GETARG_DATUM(1)));
 
 	PG_RETURN_BOOL(cmp <= 0);
 }
@@ -865,8 +876,9 @@ seg_le(PG_FUNCTION_ARGS)
 Datum
 seg_gt(PG_FUNCTION_ARGS)
 {
-	int			cmp = DatumGetInt32(
-									DirectFunctionCall2(seg_cmp, PG_GETARG_DATUM(0), PG_GETARG_DATUM(1)));
+	int			cmp = DatumGetInt32(DirectFunctionCall2(seg_cmp,
+														PG_GETARG_DATUM(0),
+														PG_GETARG_DATUM(1)));
 
 	PG_RETURN_BOOL(cmp > 0);
 }
@@ -874,8 +886,9 @@ seg_gt(PG_FUNCTION_ARGS)
 Datum
 seg_ge(PG_FUNCTION_ARGS)
 {
-	int			cmp = DatumGetInt32(
-									DirectFunctionCall2(seg_cmp, PG_GETARG_DATUM(0), PG_GETARG_DATUM(1)));
+	int			cmp = DatumGetInt32(DirectFunctionCall2(seg_cmp,
+														PG_GETARG_DATUM(0),
+														PG_GETARG_DATUM(1)));
 
 	PG_RETURN_BOOL(cmp >= 0);
 }
@@ -884,8 +897,9 @@ seg_ge(PG_FUNCTION_ARGS)
 Datum
 seg_different(PG_FUNCTION_ARGS)
 {
-	int			cmp = DatumGetInt32(
-									DirectFunctionCall2(seg_cmp, PG_GETARG_DATUM(0), PG_GETARG_DATUM(1)));
+	int			cmp = DatumGetInt32(DirectFunctionCall2(seg_cmp,
+														PG_GETARG_DATUM(0),
+														PG_GETARG_DATUM(1)));
 
 	PG_RETURN_BOOL(cmp != 0);
 }
@@ -923,9 +937,13 @@ restore(char *result, float val, int n)
 
 	/*
 	 * Put a cap on the number of significant digits to avoid garbage in the
-	 * output and ensure we don't overrun the result buffer.
+	 * output and ensure we don't overrun the result buffer.  (n should not be
+	 * negative, but check to protect ourselves against corrupted data.)
 	 */
-	n = Min(n, FLT_DIG);
+	if (n <= 0)
+		n = FLT_DIG;
+	else
+		n = Min(n, FLT_DIG);
 
 	/* remember the sign */
 	sign = (val < 0 ? 1 : 0);
@@ -948,7 +966,7 @@ restore(char *result, float val, int n)
 	}
 	else
 	{
-		if (Abs(exp) <= 4)
+		if (abs(exp) <= 4)
 		{
 			/*
 			 * remove the decimal point from the mantissa and write the digits
@@ -1035,7 +1053,7 @@ restore(char *result, float val, int n)
 			}
 		}
 
-		/* do nothing for Abs(exp) > 4; %e must be OK */
+		/* do nothing for abs(exp) > 4; %e must be OK */
 		/* just get rid of zeroes after [eE]- and +zeroes after [Ee]. */
 
 		/* ... this is not done yet. */
@@ -1045,10 +1063,11 @@ restore(char *result, float val, int n)
 
 
 /*
-** Miscellany
-*/
+ * Miscellany
+ */
 
-/* find out the number of significant digits in a string representing
+/*
+ * find out the number of significant digits in a string representing
  * a floating point number
  */
 int

@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  *
- * win32_crashdump.c
+ * crashdump.c
  *		   Automatic crash dump creation for PostgreSQL on Windows
  *
  * The crashdump feature traps unhandled win32 exceptions produced by the
@@ -28,7 +28,7 @@
  * be added, though at the cost of a greater chance of the crash dump failing.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/port/win32/crashdump.c
@@ -38,23 +38,7 @@
 
 #include "postgres.h"
 
-#define WIN32_LEAN_AND_MEAN
-
-/*
- * Some versions of the MS SDK contain "typedef enum { ... } ;" which the MS
- * compiler quite sanely complains about. Well done, Microsoft.
- * This pragma disables the warning just while we include the header.
- * The pragma is known to work with all (as at the time of writing) supported
- * versions of MSVC.
- */
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4091)
-#endif
 #include <dbghelp.h>
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
 
 /*
  * Much of the following code is based on CodeProject and MSDN examples,
@@ -122,7 +106,7 @@ crashDumpHandler(struct _EXCEPTION_POINTERS *pExceptionInfo)
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 
-		pDump = (MINIDUMPWRITEDUMP) GetProcAddress(hDll, "MiniDumpWriteDump");
+		pDump = (MINIDUMPWRITEDUMP) (pg_funcptr_t) GetProcAddress(hDll, "MiniDumpWriteDump");
 
 		if (pDump == NULL)
 		{

@@ -3,7 +3,7 @@
  * array_typanalyze.c
  *	  Functions for gathering statistics from array columns
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,12 +14,11 @@
  */
 #include "postgres.h"
 
-#include "access/tuptoaster.h"
-#include "catalog/pg_collation.h"
+#include "access/detoast.h"
 #include "commands/vacuum.h"
 #include "utils/array.h"
-#include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 
@@ -39,6 +38,7 @@ typedef struct
 	/* Information about array element type */
 	Oid			type_id;		/* element type's OID */
 	Oid			eq_opr;			/* default equality operator's OID */
+	Oid			coll_id;		/* collation to use */
 	bool		typbyval;		/* physical properties of element type */
 	int16		typlen;
 	char		typalign;
@@ -81,14 +81,14 @@ typedef struct
 } DECountItem;
 
 static void compute_array_stats(VacAttrStats *stats,
-					AnalyzeAttrFetchFunc fetchfunc, int samplerows, double totalrows);
+								AnalyzeAttrFetchFunc fetchfunc, int samplerows, double totalrows);
 static void prune_element_hashtable(HTAB *elements_tab, int b_current);
 static uint32 element_hash(const void *key, Size keysize);
 static int	element_match(const void *key1, const void *key2, Size keysize);
 static int	element_compare(const void *key1, const void *key2);
-static int	trackitem_compare_frequencies_desc(const void *e1, const void *e2);
-static int	trackitem_compare_element(const void *e1, const void *e2);
-static int	countitem_compare_count(const void *e1, const void *e2);
+static int	trackitem_compare_frequencies_desc(const void *e1, const void *e2, void *arg);
+static int	trackitem_compare_element(const void *e1, const void *e2, void *arg);
+static int	countitem_compare_count(const void *e1, const void *e2, void *arg);
 
 
 /*
@@ -132,9 +132,10 @@ array_typanalyze(PG_FUNCTION_ARGS)
 		PG_RETURN_BOOL(true);
 
 	/* Store our findings for use by compute_array_stats() */
-	extra_data = (ArrayAnalyzeExtraData *) palloc(sizeof(ArrayAnalyzeExtraData));
+	extra_data = palloc_object(ArrayAnalyzeExtraData);
 	extra_data->type_id = typentry->type_id;
 	extra_data->eq_opr = typentry->eq_opr;
+	extra_data->coll_id = stats->attrcollid;	/* collation we should use */
 	extra_data->typbyval = typentry->typbyval;
 	extra_data->typlen = typentry->typlen;
 	extra_data->typalign = typentry->typalign;
@@ -217,7 +218,6 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 {
 	ArrayAnalyzeExtraData *extra_data;
 	int			num_mcelem;
-	int			null_cnt = 0;
 	int			null_elem_cnt = 0;
 	int			analyzed_rows = 0;
 
@@ -263,7 +263,7 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 	 * the number of individual elements tracked in pg_statistic ought to be
 	 * more than the number of values for a simple scalar column.
 	 */
-	num_mcelem = stats->attr->attstattarget * 10;
+	num_mcelem = stats->attstattarget * 10;
 
 	/*
 	 * We set bucket width equal to num_mcelem / 0.007 as per the comment
@@ -276,7 +276,6 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 	 * worry about overflowing the initial size. Also we don't need to pay any
 	 * attention to locking and memory management.
 	 */
-	MemSet(&elem_hash_ctl, 0, sizeof(elem_hash_ctl));
 	elem_hash_ctl.keysize = sizeof(Datum);
 	elem_hash_ctl.entrysize = sizeof(TrackItem);
 	elem_hash_ctl.hash = element_hash;
@@ -288,7 +287,6 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 							   HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
 
 	/* hashtable for array distinct elements counts */
-	MemSet(&count_hash_ctl, 0, sizeof(count_hash_ctl));
 	count_hash_ctl.keysize = sizeof(int);
 	count_hash_ctl.entrysize = sizeof(DECountItem);
 	count_hash_ctl.hcxt = CurrentMemoryContext;
@@ -316,13 +314,12 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 		int			distinct_count;
 		bool		count_item_found;
 
-		vacuum_delay_point();
+		vacuum_delay_point(true);
 
 		value = fetchfunc(stats, array_no, &isnull);
 		if (isnull)
 		{
-			/* array is null, just count that */
-			null_cnt++;
+			/* ignore arrays that are null overall */
 			continue;
 		}
 
@@ -365,7 +362,7 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 			/* Lookup current element in hashtable, adding it if new */
 			elem_value = elem_values[j];
 			item = (TrackItem *) hash_search(elements_tab,
-											 (const void *) &elem_value,
+											 &elem_value,
 											 HASH_ENTER, &found);
 
 			if (found)
@@ -464,7 +461,7 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 		/*
 		 * Construct an array of the interesting hashtable items, that is,
 		 * those meeting the cutoff frequency (s - epsilon)*N.  Also identify
-		 * the minimum and maximum frequencies among these items.
+		 * the maximum frequency among these items.
 		 *
 		 * Since epsilon = s/10 and bucket_width = 1/epsilon, the cutoff
 		 * frequency is 9*N / bucket_width.
@@ -472,18 +469,16 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 		cutoff_freq = 9 * element_no / bucket_width;
 
 		i = hash_get_num_entries(elements_tab); /* surely enough space */
-		sort_table = (TrackItem **) palloc(sizeof(TrackItem *) * i);
+		sort_table = palloc_array(TrackItem *, i);
 
 		hash_seq_init(&scan_status, elements_tab);
 		track_len = 0;
-		minfreq = element_no;
 		maxfreq = 0;
 		while ((item = (TrackItem *) hash_seq_search(&scan_status)) != NULL)
 		{
 			if (item->frequency > cutoff_freq)
 			{
 				sort_table[track_len++] = item;
-				minfreq = Min(minfreq, item->frequency);
 				maxfreq = Max(maxfreq, item->frequency);
 			}
 		}
@@ -500,19 +495,38 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 		 * If we obtained more elements than we really want, get rid of those
 		 * with least frequencies.  The easiest way is to qsort the array into
 		 * descending frequency order and truncate the array.
+		 *
+		 * If we did not find more elements than we want, then it is safe to
+		 * assume that the stored MCE array will contain every element with
+		 * frequency above the cutoff.  In that case, rather than storing the
+		 * smallest frequency we are keeping, we want to store the minimum
+		 * frequency that would have been accepted as a valid MCE.  The
+		 * selectivity functions can assume that that is an upper bound on the
+		 * frequency of elements not present in the array.
+		 *
+		 * If we found no candidate MCEs at all, we still want to record the
+		 * cutoff frequency, since it's still valid to assume that no element
+		 * has frequency more than that.
 		 */
 		if (num_mcelem < track_len)
 		{
-			qsort(sort_table, track_len, sizeof(TrackItem *),
-				  trackitem_compare_frequencies_desc);
-			/* reset minfreq to the smallest frequency we're keeping */
+			qsort_interruptible(sort_table, track_len, sizeof(TrackItem *),
+								trackitem_compare_frequencies_desc, NULL);
+			/* set minfreq to the smallest frequency we're keeping */
 			minfreq = sort_table[num_mcelem - 1]->frequency;
 		}
 		else
+		{
 			num_mcelem = track_len;
+			/* set minfreq to the minimum frequency above the cutoff */
+			minfreq = cutoff_freq + 1;
+			/* ensure maxfreq is nonzero, too */
+			if (track_len == 0)
+				maxfreq = minfreq;
+		}
 
 		/* Generate MCELEM slot entry */
-		if (num_mcelem > 0)
+		if (num_mcelem >= 0)
 		{
 			MemoryContext old_context;
 			Datum	   *mcelem_values;
@@ -523,8 +537,8 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 			 * the element type's default comparison function.  This permits
 			 * fast binary searches in selectivity estimation functions.
 			 */
-			qsort(sort_table, num_mcelem, sizeof(TrackItem *),
-				  trackitem_compare_element);
+			qsort_interruptible(sort_table, num_mcelem, sizeof(TrackItem *),
+								trackitem_compare_element, NULL);
 
 			/* Must copy the target values into anl_context */
 			old_context = MemoryContextSwitchTo(stats->anl_context);
@@ -535,8 +549,8 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 			 * through all the values.  We also want the frequency of null
 			 * elements.  Store these three values at the end of mcelem_freqs.
 			 */
-			mcelem_values = (Datum *) palloc(num_mcelem * sizeof(Datum));
-			mcelem_freqs = (float4 *) palloc((num_mcelem + 3) * sizeof(float4));
+			mcelem_values = palloc_array(Datum, num_mcelem);
+			mcelem_freqs = palloc_array(float4, num_mcelem + 3);
 
 			/*
 			 * See comments above about use of nonnull_cnt as the divisor for
@@ -544,12 +558,12 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 			 */
 			for (i = 0; i < num_mcelem; i++)
 			{
-				TrackItem  *item = sort_table[i];
+				TrackItem  *titem = sort_table[i];
 
-				mcelem_values[i] = datumCopy(item->key,
+				mcelem_values[i] = datumCopy(titem->key,
 											 extra_data->typbyval,
 											 extra_data->typlen);
-				mcelem_freqs[i] = (double) item->frequency /
+				mcelem_freqs[i] = (double) titem->frequency /
 					(double) nonnull_cnt;
 			}
 			mcelem_freqs[i++] = (double) minfreq / (double) nonnull_cnt;
@@ -560,6 +574,7 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 
 			stats->stakind[slot_idx] = STATISTIC_KIND_MCELEM;
 			stats->staop[slot_idx] = extra_data->eq_opr;
+			stats->stacoll[slot_idx] = extra_data->coll_id;
 			stats->stanumbers[slot_idx] = mcelem_freqs;
 			/* See above comment about extra stanumber entries */
 			stats->numnumbers[slot_idx] = num_mcelem + 3;
@@ -577,7 +592,7 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 		count_items_count = hash_get_num_entries(count_tab);
 		if (count_items_count > 0)
 		{
-			int			num_hist = stats->attr->attstattarget;
+			int			num_hist = stats->attstattarget;
 			DECountItem **sorted_count_items;
 			int			j;
 			int			delta;
@@ -591,16 +606,16 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 			 * Create an array of DECountItem pointers, and sort them into
 			 * increasing count order.
 			 */
-			sorted_count_items = (DECountItem **)
-				palloc(sizeof(DECountItem *) * count_items_count);
+			sorted_count_items = palloc_array(DECountItem *, count_items_count);
 			hash_seq_init(&scan_status, count_tab);
 			j = 0;
 			while ((count_item = (DECountItem *) hash_seq_search(&scan_status)) != NULL)
 			{
 				sorted_count_items[j++] = count_item;
 			}
-			qsort(sorted_count_items, count_items_count,
-				  sizeof(DECountItem *), countitem_compare_count);
+			qsort_interruptible(sorted_count_items, count_items_count,
+								sizeof(DECountItem *),
+								countitem_compare_count, NULL);
 
 			/*
 			 * Prepare to fill stanumbers with the histogram, followed by the
@@ -661,6 +676,7 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 
 			stats->stakind[slot_idx] = STATISTIC_KIND_DECHIST;
 			stats->staop[slot_idx] = extra_data->eq_opr;
+			stats->stacoll[slot_idx] = extra_data->coll_id;
 			stats->stanumbers[slot_idx] = hist;
 			stats->numnumbers[slot_idx] = num_hist + 1;
 			slot_idx++;
@@ -690,7 +706,7 @@ prune_element_hashtable(HTAB *elements_tab, int b_current)
 		{
 			Datum		value = item->key;
 
-			if (hash_search(elements_tab, (const void *) &item->key,
+			if (hash_search(elements_tab, &item->key,
 							HASH_REMOVE, NULL) == NULL)
 				elog(ERROR, "hash table corrupted");
 			/* We should free memory if element is not passed by value */
@@ -703,7 +719,7 @@ prune_element_hashtable(HTAB *elements_tab, int b_current)
 /*
  * Hash function for elements.
  *
- * We use the element type's default hash opclass, and the default collation
+ * We use the element type's default hash opclass, and the column collation
  * if the type is collation-sensitive.
  */
 static uint32
@@ -712,7 +728,9 @@ element_hash(const void *key, Size keysize)
 	Datum		d = *((const Datum *) key);
 	Datum		h;
 
-	h = FunctionCall1Coll(array_extra_data->hash, DEFAULT_COLLATION_OID, d);
+	h = FunctionCall1Coll(array_extra_data->hash,
+						  array_extra_data->coll_id,
+						  d);
 	return DatumGetUInt32(h);
 }
 
@@ -729,7 +747,7 @@ element_match(const void *key1, const void *key2, Size keysize)
 /*
  * Comparison function for elements.
  *
- * We use the element type's default btree opclass, and the default collation
+ * We use the element type's default btree opclass, and the column collation
  * if the type is collation-sensitive.
  *
  * XXX consider using SortSupport infrastructure
@@ -741,15 +759,17 @@ element_compare(const void *key1, const void *key2)
 	Datum		d2 = *((const Datum *) key2);
 	Datum		c;
 
-	c = FunctionCall2Coll(array_extra_data->cmp, DEFAULT_COLLATION_OID, d1, d2);
+	c = FunctionCall2Coll(array_extra_data->cmp,
+						  array_extra_data->coll_id,
+						  d1, d2);
 	return DatumGetInt32(c);
 }
 
 /*
- * qsort() comparator for sorting TrackItems by frequencies (descending sort)
+ * Comparator for sorting TrackItems by frequencies (descending sort)
  */
 static int
-trackitem_compare_frequencies_desc(const void *e1, const void *e2)
+trackitem_compare_frequencies_desc(const void *e1, const void *e2, void *arg)
 {
 	const TrackItem *const *t1 = (const TrackItem *const *) e1;
 	const TrackItem *const *t2 = (const TrackItem *const *) e2;
@@ -758,10 +778,10 @@ trackitem_compare_frequencies_desc(const void *e1, const void *e2)
 }
 
 /*
- * qsort() comparator for sorting TrackItems by element values
+ * Comparator for sorting TrackItems by element values
  */
 static int
-trackitem_compare_element(const void *e1, const void *e2)
+trackitem_compare_element(const void *e1, const void *e2, void *arg)
 {
 	const TrackItem *const *t1 = (const TrackItem *const *) e1;
 	const TrackItem *const *t2 = (const TrackItem *const *) e2;
@@ -770,10 +790,10 @@ trackitem_compare_element(const void *e1, const void *e2)
 }
 
 /*
- * qsort() comparator for sorting DECountItems by count
+ * Comparator for sorting DECountItems by count
  */
 static int
-countitem_compare_count(const void *e1, const void *e2)
+countitem_compare_count(const void *e1, const void *e2, void *arg)
 {
 	const DECountItem *const *t1 = (const DECountItem *const *) e1;
 	const DECountItem *const *t2 = (const DECountItem *const *) e2;

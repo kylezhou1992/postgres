@@ -3,7 +3,7 @@
  * wparser_def.c
  *		Default text search parser
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -15,14 +15,16 @@
 #include "postgres.h"
 
 #include <limits.h>
+#include <wctype.h>
 
-#include "catalog/pg_collation.h"
 #include "commands/defrem.h"
-#include "tsearch/ts_locale.h"
+#include "mb/pg_wchar.h"
+#include "miscadmin.h"
 #include "tsearch/ts_public.h"
 #include "tsearch/ts_type.h"
 #include "tsearch/ts_utils.h"
 #include "utils/builtins.h"
+#include "utils/pg_locale.h"
 
 
 /* Define me to enable tracing of parser behavior */
@@ -241,9 +243,7 @@ typedef struct TParser
 	/* string and position information */
 	char	   *str;			/* multibyte string */
 	int			lenstr;			/* length of mbstring */
-	wchar_t    *wstr;			/* wide character string */
 	pg_wchar   *pgwstr;			/* wide character string for C-locale */
-	bool		usewide;
 
 	/* State of parse */
 	int			charmaxlen;
@@ -269,7 +269,7 @@ static bool TParserGet(TParser *prs);
 static TParserPosition *
 newTParserPosition(TParserPosition *prev)
 {
-	TParserPosition *res = (TParserPosition *) palloc(sizeof(TParserPosition));
+	TParserPosition *res = palloc_object(TParserPosition);
 
 	if (prev)
 		memcpy(res, prev, sizeof(TParserPosition));
@@ -286,50 +286,18 @@ newTParserPosition(TParserPosition *prev)
 static TParser *
 TParserInit(char *str, int len)
 {
-	TParser    *prs = (TParser *) palloc0(sizeof(TParser));
+	TParser    *prs = palloc0_object(TParser);
 
 	prs->charmaxlen = pg_database_encoding_max_length();
 	prs->str = str;
 	prs->lenstr = len;
-
-	/*
-	 * Use wide char code only when max encoding length > 1.
-	 */
-	if (prs->charmaxlen > 1)
-	{
-		Oid			collation = DEFAULT_COLLATION_OID;	/* TODO */
-		pg_locale_t mylocale = 0;	/* TODO */
-
-		prs->usewide = true;
-		if (lc_ctype_is_c(collation))
-		{
-			/*
-			 * char2wchar doesn't work for C-locale and sizeof(pg_wchar) could
-			 * be different from sizeof(wchar_t)
-			 */
-			prs->pgwstr = (pg_wchar *) palloc(sizeof(pg_wchar) * (prs->lenstr + 1));
-			pg_mb2wchar_with_len(prs->str, prs->pgwstr, prs->lenstr);
-		}
-		else
-		{
-			prs->wstr = (wchar_t *) palloc(sizeof(wchar_t) * (prs->lenstr + 1));
-			char2wchar(prs->wstr, prs->lenstr + 1, prs->str, prs->lenstr,
-					   mylocale);
-		}
-	}
-	else
-		prs->usewide = false;
+	prs->pgwstr = palloc_array(pg_wchar, prs->lenstr + 1);
+	pg_mb2wchar_with_len(prs->str, prs->pgwstr, prs->lenstr);
 
 	prs->state = newTParserPosition(NULL);
 	prs->state->state = TPS_Base;
 
 #ifdef WPARSER_TRACE
-
-	/*
-	 * Use of %.*s here is a bit risky since it can misbehave if the data is
-	 * not in what libc thinks is the prevailing encoding.  However, since
-	 * this is just a debugging aid, we choose to live with that.
-	 */
 	fprintf(stderr, "parsing \"%.*s\"\n", len, str);
 #endif
 
@@ -350,23 +318,19 @@ TParserInit(char *str, int len)
 static TParser *
 TParserCopyInit(const TParser *orig)
 {
-	TParser    *prs = (TParser *) palloc0(sizeof(TParser));
+	TParser    *prs = palloc0_object(TParser);
 
 	prs->charmaxlen = orig->charmaxlen;
 	prs->str = orig->str + orig->state->posbyte;
 	prs->lenstr = orig->lenstr - orig->state->posbyte;
-	prs->usewide = orig->usewide;
 
 	if (orig->pgwstr)
 		prs->pgwstr = orig->pgwstr + orig->state->poschar;
-	if (orig->wstr)
-		prs->wstr = orig->wstr + orig->state->poschar;
 
 	prs->state = newTParserPosition(NULL);
 	prs->state->state = TPS_Base;
 
 #ifdef WPARSER_TRACE
-	/* See note above about %.*s */
 	fprintf(stderr, "parsing copy of \"%.*s\"\n", prs->lenstr, prs->str);
 #endif
 
@@ -385,8 +349,6 @@ TParserClose(TParser *prs)
 		prs->state = ptr;
 	}
 
-	if (prs->wstr)
-		pfree(prs->wstr);
 	if (prs->pgwstr)
 		pfree(prs->pgwstr);
 
@@ -418,13 +380,9 @@ TParserCopyClose(TParser *prs)
 
 
 /*
- * Character-type support functions, equivalent to is* macros, but
- * working with any possible encodings and locales. Notes:
- *	- with multibyte encoding and C-locale isw* function may fail
- *	  or give wrong result.
- *	- multibyte encoding and C-locale often are used for
- *	  Asian languages.
- *	- if locale is C then we use pgwstr instead of wstr.
+ * Character-type support functions using the database default locale. If the
+ * locale is C, and the input character is non-ascii, the value to be returned
+ * is determined by the 'nonascii' macro argument.
  */
 
 #define p_iswhat(type, nonascii)											\
@@ -432,19 +390,13 @@ TParserCopyClose(TParser *prs)
 static int																	\
 p_is##type(TParser *prs)													\
 {																			\
+	pg_locale_t locale = pg_database_locale();								\
+	pg_wchar	wc;															\
 	Assert(prs->state);														\
-	if (prs->usewide)														\
-	{																		\
-		if (prs->pgwstr)													\
-		{																	\
-			unsigned int c = *(prs->pgwstr + prs->state->poschar);			\
-			if (c > 0x7f)													\
-				return nonascii;											\
-			return is##type(c);												\
-		}																	\
-		return isw##type(*(prs->wstr + prs->state->poschar));				\
-	}																		\
-	return is##type(*(unsigned char *) (prs->str + prs->state->posbyte));	\
+	wc = prs->pgwstr[prs->state->poschar];									\
+	if (prs->charmaxlen > 1 && locale->ctype_is_c && wc > 0x7f)				\
+		return nonascii;													\
+	return pg_isw##type(wc, pg_database_locale());						\
 }																			\
 																			\
 static int																	\
@@ -639,6 +591,12 @@ p_ishost(TParser *prs)
 
 	tmpprs->wanthost = true;
 
+	/*
+	 * Check stack depth before recursing.  (Since TParserGet() doesn't
+	 * normally recurse, we put the cost of checking here not there.)
+	 */
+	check_stack_depth();
+
 	if (TParserGet(tmpprs) && tmpprs->type == HOST)
 	{
 		prs->state->posbyte += tmpprs->lenbytetoken;
@@ -661,6 +619,12 @@ p_isURLPath(TParser *prs)
 
 	tmpprs->state = newTParserPosition(tmpprs->state);
 	tmpprs->state->state = TPS_InURLPathFirst;
+
+	/*
+	 * Check stack depth before recursing.  (Since TParserGet() doesn't
+	 * normally recurse, we put the cost of checking here not there.)
+	 */
+	check_stack_depth();
 
 	if (TParserGet(tmpprs) && tmpprs->type == URLPATH)
 	{
@@ -697,7 +661,7 @@ p_isspecial(TParser *prs)
 	 * Check that only in utf encoding, because other encodings aren't
 	 * supported by postgres or even exists.
 	 */
-	if (GetDatabaseEncoding() == PG_UTF8 && prs->usewide)
+	if (GetDatabaseEncoding() == PG_UTF8)
 	{
 		static const pg_wchar strange_letter[] = {
 			/*
@@ -938,10 +902,7 @@ p_isspecial(TParser *prs)
 				   *StopMiddle;
 		pg_wchar	c;
 
-		if (prs->pgwstr)
-			c = *(prs->pgwstr + prs->state->poschar);
-		else
-			c = (pg_wchar) *(prs->wstr + prs->state->poschar);
+		c = *(prs->pgwstr + prs->state->poschar);
 
 		while (StopLow < StopHigh)
 		{
@@ -1705,6 +1666,8 @@ TParserGet(TParser *prs)
 {
 	const TParserStateActionItem *item = NULL;
 
+	CHECK_FOR_INTERRUPTS();
+
 	Assert(prs->state);
 
 	if (prs->state->posbyte >= prs->lenstr)
@@ -1720,7 +1683,8 @@ TParserGet(TParser *prs)
 			prs->state->charlen = 0;
 		else
 			prs->state->charlen = (prs->charmaxlen == 1) ? prs->charmaxlen :
-				pg_mblen(prs->str + prs->state->posbyte);
+				pg_mblen_range(prs->str + prs->state->posbyte,
+							   prs->str + prs->lenstr);
 
 		Assert(prs->state->posbyte + prs->state->charlen <= prs->lenstr);
 		Assert(prs->state->state >= TPS_Base && prs->state->state < TPS_Null);
@@ -1863,13 +1827,13 @@ TParserGet(TParser *prs)
 		}
 	}
 
-	return (item && (item->flags & A_BINGO)) ? true : false;
+	return (item && (item->flags & A_BINGO));
 }
 
 Datum
 prsd_lextype(PG_FUNCTION_ARGS)
 {
-	LexDescr   *descr = (LexDescr *) palloc(sizeof(LexDescr) * (LASTNUM + 1));
+	LexDescr   *descr = palloc_array(LexDescr, LASTNUM + 1);
 	int			i;
 
 	for (i = 1; i <= LASTNUM; i++)
@@ -1915,10 +1879,12 @@ prsd_end(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-#define LEAVETOKEN(x)	( (x)==SPACE )
-#define COMPLEXTOKEN(x) ( (x)==URL_T || (x)==NUMHWORD || (x)==ASCIIHWORD || (x)==HWORD )
-#define ENDPUNCTOKEN(x) ( (x)==SPACE )
 
+/*
+ * ts_headline support begins here
+ */
+
+/* token type classification macros */
 #define TS_IDIGNORE(x)	( (x)==TAG_T || (x)==PROTOCOL || (x)==SPACE || (x)==XMLENTITY )
 #define HLIDREPLACE(x)	( (x)==TAG_T )
 #define HLIDSKIP(x)		( (x)==URL_T || (x)==NUMHWORD || (x)==ASCIIHWORD || (x)==HWORD )
@@ -1926,29 +1892,65 @@ prsd_end(PG_FUNCTION_ARGS)
 #define NONWORDTOKEN(x) ( (x)==SPACE || HLIDREPLACE(x) || HLIDSKIP(x) )
 #define NOENDTOKEN(x)	( NONWORDTOKEN(x) || (x)==SCIENTIFIC || (x)==VERSIONNUMBER || (x)==DECIMAL_T || (x)==SIGNEDINT || (x)==UNSIGNEDINT || TS_IDIGNORE(x) )
 
+/*
+ * Macros useful in headline selection.  These rely on availability of
+ * "HeadlineParsedText *prs" describing some text, and "int shortword"
+ * describing the "short word" length parameter.
+ */
+
+/* Interesting words are non-repeated search terms */
+#define INTERESTINGWORD(j) \
+	(prs->words[j].item && !prs->words[j].repeated)
+
+/* Don't want to end at a non-word or a short word, unless interesting */
+#define BADENDPOINT(j) \
+	((NOENDTOKEN(prs->words[j].type) || prs->words[j].len <= shortword) && \
+	 !INTERESTINGWORD(j))
+
 typedef struct
 {
+	/* one cover (well, really one fragment) for mark_hl_fragments */
+	int32		startpos;		/* fragment's starting word index */
+	int32		endpos;			/* ending word index (inclusive) */
+	int32		poslen;			/* number of interesting words */
+	int32		curlen;			/* total number of words */
+	bool		chosen;			/* chosen? */
+	bool		excluded;		/* excluded? */
+} CoverPos;
+
+typedef struct
+{
+	/* callback data for checkcondition_HL */
 	HeadlineWordEntry *words;
 	int			len;
 } hlCheck;
 
-static bool
+
+/*
+ * TS_execute callback for matching a tsquery operand to headline words
+ *
+ * Note: it's tempting to report words[] indexes as pos values to save
+ * searching in hlCover; but that would screw up phrase matching, which
+ * expects to measure distances in lexemes not tokens.
+ */
+static TSTernaryValue
 checkcondition_HL(void *opaque, QueryOperand *val, ExecPhraseData *data)
 {
-	int			i;
 	hlCheck    *checkval = (hlCheck *) opaque;
+	int			i;
 
+	/* scan words array for matching items */
 	for (i = 0; i < checkval->len; i++)
 	{
 		if (checkval->words[i].item == val)
 		{
-			/* don't need to find all positions */
+			/* if data == NULL, don't need to report positions */
 			if (!data)
-				return true;
+				return TS_YES;
 
 			if (!data->pos)
 			{
-				data->pos = palloc(sizeof(WordEntryPos) * checkval->len);
+				data->pos = palloc_array(WordEntryPos, checkval->len);
 				data->allocated = true;
 				data->npos = 1;
 				data->pos[0] = checkval->words[i].pos;
@@ -1961,85 +1963,182 @@ checkcondition_HL(void *opaque, QueryOperand *val, ExecPhraseData *data)
 	}
 
 	if (data && data->npos > 0)
-		return true;
+		return TS_YES;
 
-	return false;
+	return TS_NO;
 }
 
-
+/*
+ * hlCover: try to find a substring of prs' word list that satisfies query
+ *
+ * locations is the result of TS_execute_locations() for the query.
+ * We use this to identify plausible subranges of the query.
+ *
+ * *nextpos is the lexeme position (NOT word index) to start the search
+ * at.  Caller should initialize this to zero.  If successful, we'll
+ * advance it to the next place to search at.
+ *
+ * On success, sets *p to first word index and *q to last word index of the
+ * cover substring, and returns true.
+ *
+ * The result is a minimal cover, in the sense that both *p and *q will be
+ * words used in the query.
+ */
 static bool
-hlCover(HeadlineParsedText *prs, TSQuery query, int *p, int *q)
+hlCover(HeadlineParsedText *prs, TSQuery query, List *locations,
+		int *nextpos, int *p, int *q)
 {
-	int			i,
-				j;
-	QueryItem  *item = GETQUERY(query);
-	int			pos = *p;
+	int			pos = *nextpos;
 
-	*q = -1;
-	*p = INT_MAX;
-
-	for (j = 0; j < query->size; j++)
+	/* This loop repeats when our selected word-range fails the query */
+	for (;;)
 	{
-		if (item->type != QI_VAL)
+		int			posb,
+					pose;
+		ListCell   *lc;
+
+		/*
+		 * For each AND'ed query term or phrase, find its first occurrence at
+		 * or after pos; set pose to the maximum of those positions.
+		 *
+		 * We need not consider ORs or NOTs here; see the comments for
+		 * TS_execute_locations().  Rechecking the match with TS_execute(),
+		 * below, will deal with any ensuing imprecision.
+		 */
+		pose = -1;
+		foreach(lc, locations)
 		{
-			item++;
-			continue;
-		}
-		for (i = pos; i < prs->curwords; i++)
-		{
-			if (prs->words[i].item == &item->qoperand)
+			ExecPhraseData *pdata = (ExecPhraseData *) lfirst(lc);
+			int			first = -1;
+
+			for (int i = 0; i < pdata->npos; i++)
 			{
-				if (i > *q)
-					*q = i;
-				break;
+				/* For phrase matches, use the ending lexeme */
+				int			endp = pdata->pos[i];
+
+				if (endp >= pos)
+				{
+					first = endp;
+					break;
+				}
+			}
+			if (first < 0)
+				return false;	/* no more matches for this term */
+			if (first > pose)
+				pose = first;
+		}
+
+		if (pose < 0)
+			return false;		/* we only get here if empty list */
+
+		/*
+		 * Now, for each AND'ed query term or phrase, find its last occurrence
+		 * at or before pose; set posb to the minimum of those positions.
+		 *
+		 * We start posb at INT_MAX - 1 to guarantee no overflow if we compute
+		 * posb + 1 below.
+		 */
+		posb = INT_MAX - 1;
+		foreach(lc, locations)
+		{
+			ExecPhraseData *pdata = (ExecPhraseData *) lfirst(lc);
+			int			last = -1;
+
+			for (int i = pdata->npos - 1; i >= 0; i--)
+			{
+				/* For phrase matches, use the starting lexeme */
+				int			startp = pdata->pos[i] - pdata->width;
+
+				if (startp <= pose)
+				{
+					last = startp;
+					break;
+				}
+			}
+			if (last < posb)
+				posb = last;
+		}
+
+		/*
+		 * We could end up with posb to the left of pos, in case some phrase
+		 * match crosses pos.  Try the match starting at pos anyway, since the
+		 * result of TS_execute_locations is imprecise for phrase matches OR'd
+		 * with plain matches; that is, if the query is "(A <-> B) | C" then C
+		 * could match at pos even though the phrase match would have to
+		 * extend to the left of pos.
+		 */
+		posb = Max(posb, pos);
+
+		/* This test probably always succeeds, but be paranoid */
+		if (posb <= pose)
+		{
+			/*
+			 * posb .. pose is now the shortest, earliest-after-pos range of
+			 * lexeme positions containing all the query terms.  It will
+			 * contain all phrase matches, too, except in the corner case
+			 * described just above.
+			 *
+			 * Now convert these lexeme positions to indexes in prs->words[].
+			 */
+			int			idxb = -1;
+			int			idxe = -1;
+
+			for (int i = 0; i < prs->curwords; i++)
+			{
+				if (prs->words[i].item == NULL)
+					continue;
+				if (idxb < 0 && prs->words[i].pos >= posb)
+					idxb = i;
+				if (prs->words[i].pos <= pose)
+					idxe = i;
+				else
+					break;
+			}
+
+			/* This test probably always succeeds, but be paranoid */
+			if (idxb >= 0 && idxe >= idxb)
+			{
+				/*
+				 * Finally, check that the selected range satisfies the query.
+				 * This should succeed in all simple cases; but odd cases
+				 * involving non-top-level NOT conditions or phrase matches
+				 * OR'd with other things could fail, since the result of
+				 * TS_execute_locations doesn't fully represent such things.
+				 */
+				hlCheck		ch;
+
+				ch.words = &(prs->words[idxb]);
+				ch.len = idxe - idxb + 1;
+				if (TS_execute(GETQUERY(query), &ch,
+							   TS_EXEC_EMPTY, checkcondition_HL))
+				{
+					/* Match!  Advance *nextpos and return the word range. */
+					*nextpos = posb + 1;
+					*p = idxb;
+					*q = idxe;
+					return true;
+				}
 			}
 		}
-		item++;
+
+		/*
+		 * Advance pos and try again.  Any later workable match must start
+		 * beyond posb.
+		 */
+		pos = posb + 1;
 	}
-
-	if (*q < 0)
-		return false;
-
-	item = GETQUERY(query);
-	for (j = 0; j < query->size; j++)
-	{
-		if (item->type != QI_VAL)
-		{
-			item++;
-			continue;
-		}
-		for (i = *q; i >= pos; i--)
-		{
-			if (prs->words[i].item == &item->qoperand)
-			{
-				if (i < *p)
-					*p = i;
-				break;
-			}
-		}
-		item++;
-	}
-
-	if (*p <= *q)
-	{
-		hlCheck		ch;
-
-		ch.words = &(prs->words[*p]);
-		ch.len = *q - *p + 1;
-		if (TS_execute(GETQUERY(query), &ch, TS_EXEC_EMPTY, checkcondition_HL))
-			return true;
-		else
-		{
-			(*p)++;
-			return hlCover(prs, query, p, q);
-		}
-	}
-
+	/* Can't get here, but stupider compilers complain if we leave it off */
 	return false;
 }
 
+/*
+ * Apply suitable highlight marking to words selected by headline selector
+ *
+ * The words from startpos to endpos inclusive are marked per highlightall
+ */
 static void
-mark_fragment(HeadlineParsedText *prs, int highlight, int startpos, int endpos)
+mark_fragment(HeadlineParsedText *prs, bool highlightall,
+			  int startpos, int endpos)
 {
 	int			i;
 
@@ -2047,7 +2146,7 @@ mark_fragment(HeadlineParsedText *prs, int highlight, int startpos, int endpos)
 	{
 		if (prs->words[i].item)
 			prs->words[i].selected = 1;
-		if (highlight == 0)
+		if (!highlightall)
 		{
 			if (HLIDREPLACE(prs->words[i].type))
 				prs->words[i].replace = 1;
@@ -2064,16 +2163,15 @@ mark_fragment(HeadlineParsedText *prs, int highlight, int startpos, int endpos)
 	}
 }
 
-typedef struct
-{
-	int32		startpos;
-	int32		endpos;
-	int32		poslen;
-	int32		curlen;
-	int16		in;
-	int16		excluded;
-} CoverPos;
-
+/*
+ * split a cover substring into fragments not longer than max_words
+ *
+ * At entry, *startpos and *endpos are the (remaining) bounds of the cover
+ * substring.  They are updated to hold the bounds of the next fragment.
+ *
+ * *curlen and *poslen are set to the fragment's length, in words and
+ * interesting words respectively.
+ */
 static void
 get_next_fragment(HeadlineParsedText *prs, int *startpos, int *endpos,
 				  int *curlen, int *poslen, int max_words)
@@ -2081,17 +2179,17 @@ get_next_fragment(HeadlineParsedText *prs, int *startpos, int *endpos,
 	int			i;
 
 	/*
-	 * Objective: Generate a fragment of words between startpos and endpos
-	 * such that it has at most max_words and both ends has query words. If
-	 * the startpos and endpos are the endpoints of the cover and the cover
-	 * has fewer words than max_words, then this function should just return
-	 * the cover
+	 * Objective: select a fragment of words between startpos and endpos such
+	 * that it has at most max_words and both ends have query words. If the
+	 * startpos and endpos are the endpoints of the cover and the cover has
+	 * fewer words than max_words, then this function should just return the
+	 * cover
 	 */
 	/* first move startpos to an item */
 	for (i = *startpos; i <= *endpos; i++)
 	{
 		*startpos = i;
-		if (prs->words[i].item && !prs->words[i].repeated)
+		if (INTERESTINGWORD(i))
 			break;
 	}
 	/* cut endpos to have only max_words */
@@ -2101,7 +2199,7 @@ get_next_fragment(HeadlineParsedText *prs, int *startpos, int *endpos,
 	{
 		if (!NONWORDTOKEN(prs->words[i].type))
 			*curlen += 1;
-		if (prs->words[i].item && !prs->words[i].repeated)
+		if (INTERESTINGWORD(i))
 			*poslen += 1;
 	}
 	/* if the cover was cut then move back endpos to a query item */
@@ -2111,7 +2209,7 @@ get_next_fragment(HeadlineParsedText *prs, int *startpos, int *endpos,
 		for (i = *endpos; i >= *startpos; i--)
 		{
 			*endpos = i;
-			if (prs->words[i].item && !prs->words[i].repeated)
+			if (INTERESTINGWORD(i))
 				break;
 			if (!NONWORDTOKEN(prs->words[i].type))
 				*curlen -= 1;
@@ -2119,8 +2217,15 @@ get_next_fragment(HeadlineParsedText *prs, int *startpos, int *endpos,
 	}
 }
 
+/*
+ * Headline selector used when MaxFragments > 0
+ *
+ * Note: in this mode, highlightall is disregarded for phrase selection;
+ * it only controls presentation details.
+ */
 static void
-mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, int highlight,
+mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, List *locations,
+				  bool highlightall,
 				  int shortword, int min_words,
 				  int max_words, int max_fragments)
 {
@@ -2135,6 +2240,7 @@ mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, int highlight,
 
 	int32		startpos = 0,
 				endpos = 0,
+				nextpos = 0,
 				p = 0,
 				q = 0;
 
@@ -2146,17 +2252,17 @@ mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, int highlight,
 				maxitems;
 	CoverPos   *covers;
 
-	covers = palloc(maxcovers * sizeof(CoverPos));
+	covers = palloc_array(CoverPos, maxcovers);
 
 	/* get all covers */
-	while (hlCover(prs, query, &p, &q))
+	while (hlCover(prs, query, locations, &nextpos, &p, &q))
 	{
 		startpos = p;
 		endpos = q;
 
 		/*
 		 * Break the cover into smaller fragments such that each fragment has
-		 * at most max_words. Also ensure that each end of the fragment is a
+		 * at most max_words. Also ensure that each end of each fragment is a
 		 * query word. This will allow us to stretch the fragment in either
 		 * direction
 		 */
@@ -2167,20 +2273,18 @@ mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, int highlight,
 			if (numcovers >= maxcovers)
 			{
 				maxcovers *= 2;
-				covers = repalloc(covers, sizeof(CoverPos) * maxcovers);
+				covers = repalloc_array(covers, CoverPos, maxcovers);
 			}
 			covers[numcovers].startpos = startpos;
 			covers[numcovers].endpos = endpos;
 			covers[numcovers].curlen = curlen;
 			covers[numcovers].poslen = poslen;
-			covers[numcovers].in = 0;
-			covers[numcovers].excluded = 0;
+			covers[numcovers].chosen = false;
+			covers[numcovers].excluded = false;
 			numcovers++;
 			startpos = endpos + 1;
 			endpos = q;
 		}
-		/* move p to generate the next cover */
-		p++;
 	}
 
 	/* choose best covers */
@@ -2196,9 +2300,10 @@ mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, int highlight,
 		 */
 		for (i = 0; i < numcovers; i++)
 		{
-			if (!covers[i].in && !covers[i].excluded &&
-				(maxitems < covers[i].poslen || (maxitems == covers[i].poslen
-												 && minwords > covers[i].curlen)))
+			if (!covers[i].chosen && !covers[i].excluded &&
+				(maxitems < covers[i].poslen ||
+				 (maxitems == covers[i].poslen &&
+				  minwords > covers[i].curlen)))
 			{
 				maxitems = covers[i].poslen;
 				minwords = covers[i].curlen;
@@ -2208,7 +2313,7 @@ mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, int highlight,
 		/* if a cover was found mark it */
 		if (minI >= 0)
 		{
-			covers[minI].in = 1;
+			covers[minI].chosen = true;
 			/* adjust the size of cover */
 			startpos = covers[minI].startpos;
 			endpos = covers[minI].endpos;
@@ -2235,8 +2340,8 @@ mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, int highlight,
 					}
 					posmarker = i;
 				}
-				/* cut back startpos till we find a non short token */
-				for (i = posmarker; i < startpos && (NOENDTOKEN(prs->words[i].type) || prs->words[i].len <= shortword); i++)
+				/* cut back startpos till we find a good endpoint */
+				for (i = posmarker; i < startpos && BADENDPOINT(i); i++)
 				{
 					if (!NONWORDTOKEN(prs->words[i].type))
 						curlen--;
@@ -2250,8 +2355,8 @@ mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, int highlight,
 						curlen++;
 					posmarker = i;
 				}
-				/* cut back endpos till we find a non-short token */
-				for (i = posmarker; i > endpos && (NOENDTOKEN(prs->words[i].type) || prs->words[i].len <= shortword); i--)
+				/* cut back endpos till we find a good endpoint */
+				for (i = posmarker; i > endpos && BADENDPOINT(i); i--)
 				{
 					if (!NONWORDTOKEN(prs->words[i].type))
 						curlen--;
@@ -2262,103 +2367,124 @@ mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, int highlight,
 			covers[minI].endpos = endpos;
 			covers[minI].curlen = curlen;
 			/* Mark the chosen fragments (covers) */
-			mark_fragment(prs, highlight, startpos, endpos);
+			mark_fragment(prs, highlightall, startpos, endpos);
 			num_f++;
-			/* exclude overlapping covers */
+			/* Exclude covers overlapping this one from future consideration */
 			for (i = 0; i < numcovers; i++)
 			{
-				if (i != minI && ((covers[i].startpos >= covers[minI].startpos && covers[i].startpos <= covers[minI].endpos) || (covers[i].endpos >= covers[minI].startpos && covers[i].endpos <= covers[minI].endpos)))
-					covers[i].excluded = 1;
+				if (i != minI &&
+					((covers[i].startpos >= startpos &&
+					  covers[i].startpos <= endpos) ||
+					 (covers[i].endpos >= startpos &&
+					  covers[i].endpos <= endpos) ||
+					 (covers[i].startpos < startpos &&
+					  covers[i].endpos > endpos)))
+					covers[i].excluded = true;
 			}
 		}
 		else
-			break;
+			break;				/* no selectable covers remain */
 	}
 
-	/* show at least min_words we have not marked anything */
+	/* show the first min_words words if we have not marked anything */
 	if (num_f <= 0)
 	{
-		startpos = endpos = curlen = 0;
+		startpos = curlen = 0;
+		endpos = -1;
 		for (i = 0; i < prs->curwords && curlen < min_words; i++)
 		{
 			if (!NONWORDTOKEN(prs->words[i].type))
 				curlen++;
 			endpos = i;
 		}
-		mark_fragment(prs, highlight, startpos, endpos);
+		mark_fragment(prs, highlightall, startpos, endpos);
 	}
+
 	pfree(covers);
 }
 
+/*
+ * Headline selector used when MaxFragments == 0
+ */
 static void
-mark_hl_words(HeadlineParsedText *prs, TSQuery query, int highlight,
+mark_hl_words(HeadlineParsedText *prs, TSQuery query, List *locations,
+			  bool highlightall,
 			  int shortword, int min_words, int max_words)
 {
-	int			p = 0,
+	int			nextpos = 0,
+				p = 0,
 				q = 0;
 	int			bestb = -1,
 				beste = -1;
 	int			bestlen = -1;
-	int			pose = 0,
+	bool		bestcover = false;
+	int			pose,
 				posb,
 				poslen,
 				curlen;
-
+	bool		poscover;
 	int			i;
 
-	if (highlight == 0)
+	if (!highlightall)
 	{
-		while (hlCover(prs, query, &p, &q))
+		/* examine all covers, select a headline using the best one */
+		while (hlCover(prs, query, locations, &nextpos, &p, &q))
 		{
-			/* find cover len in words */
+			/*
+			 * Count words (curlen) and interesting words (poslen) within
+			 * cover, but stop once we reach max_words.  This step doesn't
+			 * consider whether that's a good stopping point.  posb and pose
+			 * are set to the start and end indexes of the possible headline.
+			 */
 			curlen = 0;
 			poslen = 0;
+			posb = pose = p;
 			for (i = p; i <= q && curlen < max_words; i++)
 			{
 				if (!NONWORDTOKEN(prs->words[i].type))
 					curlen++;
-				if (prs->words[i].item && !prs->words[i].repeated)
+				if (INTERESTINGWORD(i))
 					poslen++;
 				pose = i;
 			}
 
-			if (poslen < bestlen && !(NOENDTOKEN(prs->words[beste].type) || prs->words[beste].len <= shortword))
-			{
-				/* best already found, so try one more cover */
-				p++;
-				continue;
-			}
-
-			posb = p;
 			if (curlen < max_words)
-			{					/* find good end */
+			{
+				/*
+				 * We have room to lengthen the headline, so search forward
+				 * until it's full or we find a good stopping point.  We'll
+				 * reconsider the word at "q", then move forward.
+				 */
 				for (i = i - 1; i < prs->curwords && curlen < max_words; i++)
 				{
-					if (i != q)
+					if (i > q)
 					{
 						if (!NONWORDTOKEN(prs->words[i].type))
 							curlen++;
-						if (prs->words[i].item && !prs->words[i].repeated)
+						if (INTERESTINGWORD(i))
 							poslen++;
 					}
 					pose = i;
-					if (NOENDTOKEN(prs->words[i].type) || prs->words[i].len <= shortword)
+					if (BADENDPOINT(i))
 						continue;
 					if (curlen >= min_words)
 						break;
 				}
-				if (curlen < min_words && i >= prs->curwords)
-				{				/* got end of text and our cover is shorter
-								 * than min_words */
+				if (curlen < min_words)
+				{
+					/*
+					 * Reached end of text and our headline is still shorter
+					 * than min_words, so try to extend it to the left.
+					 */
 					for (i = p - 1; i >= 0; i--)
 					{
 						if (!NONWORDTOKEN(prs->words[i].type))
 							curlen++;
-						if (prs->words[i].item && !prs->words[i].repeated)
+						if (INTERESTINGWORD(i))
 							poslen++;
 						if (curlen >= max_words)
 							break;
-						if (NOENDTOKEN(prs->words[i].type) || prs->words[i].len <= shortword)
+						if (BADENDPOINT(i))
 							continue;
 						if (curlen >= min_words)
 							break;
@@ -2367,37 +2493,58 @@ mark_hl_words(HeadlineParsedText *prs, TSQuery query, int highlight,
 				}
 			}
 			else
-			{					/* shorter cover :((( */
+			{
+				/*
+				 * Can't make headline longer, so consider making it shorter
+				 * if needed to avoid a bad endpoint.
+				 */
 				if (i > q)
 					i = q;
 				for (; curlen > min_words; i--)
 				{
+					if (!BADENDPOINT(i))
+						break;
 					if (!NONWORDTOKEN(prs->words[i].type))
 						curlen--;
-					if (prs->words[i].item && !prs->words[i].repeated)
+					if (INTERESTINGWORD(i))
 						poslen--;
-					pose = i;
-					if (NOENDTOKEN(prs->words[i].type) || prs->words[i].len <= shortword)
-						continue;
-					break;
+					pose = i - 1;
 				}
 			}
 
-			if (bestlen < 0 || (poslen > bestlen && !(NOENDTOKEN(prs->words[pose].type) || prs->words[pose].len <= shortword)) ||
-				(bestlen >= 0 && !(NOENDTOKEN(prs->words[pose].type) || prs->words[pose].len <= shortword) &&
-				 (NOENDTOKEN(prs->words[beste].type) || prs->words[beste].len <= shortword)))
+			/*
+			 * Check whether the proposed headline includes the original
+			 * cover; it might not if we trimmed it due to max_words.
+			 */
+			poscover = (posb <= p && pose >= q);
+
+			/*
+			 * Adopt this headline if it's better than the last one, giving
+			 * highest priority to headlines including the cover, then to
+			 * headlines with more interesting words, then to headlines with
+			 * good stopping points.  (Since bestlen is initially -1, we will
+			 * certainly adopt the first headline.)
+			 */
+			if (poscover > bestcover ||
+				(poscover == bestcover && poslen > bestlen) ||
+				(poscover == bestcover && poslen == bestlen &&
+				 !BADENDPOINT(pose) && BADENDPOINT(beste)))
 			{
 				bestb = posb;
 				beste = pose;
 				bestlen = poslen;
+				bestcover = poscover;
 			}
-
-			p++;
 		}
 
+		/*
+		 * If we found nothing acceptable, select min_words words starting at
+		 * the beginning.
+		 */
 		if (bestlen < 0)
 		{
 			curlen = 0;
+			pose = -1;
 			for (i = 0; i < prs->curwords && curlen < min_words; i++)
 			{
 				if (!NONWORDTOKEN(prs->words[i].type))
@@ -2410,50 +2557,40 @@ mark_hl_words(HeadlineParsedText *prs, TSQuery query, int highlight,
 	}
 	else
 	{
+		/* highlightall mode: headline is whole document */
 		bestb = 0;
 		beste = prs->curwords - 1;
 	}
 
-	for (i = bestb; i <= beste; i++)
-	{
-		if (prs->words[i].item)
-			prs->words[i].selected = 1;
-		if (highlight == 0)
-		{
-			if (HLIDREPLACE(prs->words[i].type))
-				prs->words[i].replace = 1;
-			else if (HLIDSKIP(prs->words[i].type))
-				prs->words[i].skip = 1;
-		}
-		else
-		{
-			if (XMLHLIDSKIP(prs->words[i].type))
-				prs->words[i].skip = 1;
-		}
-
-		prs->words[i].in = (prs->words[i].repeated) ? 0 : 1;
-	}
-
+	mark_fragment(prs, highlightall, bestb, beste);
 }
 
+/*
+ * Default parser's prsheadline function
+ */
 Datum
 prsd_headline(PG_FUNCTION_ARGS)
 {
 	HeadlineParsedText *prs = (HeadlineParsedText *) PG_GETARG_POINTER(0);
 	List	   *prsoptions = (List *) PG_GETARG_POINTER(1);
 	TSQuery		query = PG_GETARG_TSQUERY(2);
+	List	   *locations;
 
-	/* from opt + start and end tag */
+	/* default option values: */
 	int			min_words = 15;
 	int			max_words = 35;
 	int			shortword = 3;
 	int			max_fragments = 0;
-	int			highlight = 0;
+	bool		highlightall = false;
 	ListCell   *l;
+	size_t		startsellen;
+	size_t		stopsellen;
+	size_t		fragdelimlen;
 
-	/* config */
+	/* Extract configuration option values */
 	prs->startsel = NULL;
 	prs->stopsel = NULL;
+	prs->fragdelim = NULL;
 	foreach(l, prsoptions)
 	{
 		DefElem    *defel = (DefElem *) lfirst(l);
@@ -2474,12 +2611,12 @@ prsd_headline(PG_FUNCTION_ARGS)
 		else if (pg_strcasecmp(defel->defname, "FragmentDelimiter") == 0)
 			prs->fragdelim = pstrdup(val);
 		else if (pg_strcasecmp(defel->defname, "HighlightAll") == 0)
-			highlight = (pg_strcasecmp(val, "1") == 0 ||
-						 pg_strcasecmp(val, "on") == 0 ||
-						 pg_strcasecmp(val, "true") == 0 ||
-						 pg_strcasecmp(val, "t") == 0 ||
-						 pg_strcasecmp(val, "y") == 0 ||
-						 pg_strcasecmp(val, "yes") == 0);
+			highlightall = (pg_strcasecmp(val, "1") == 0 ||
+							pg_strcasecmp(val, "on") == 0 ||
+							pg_strcasecmp(val, "true") == 0 ||
+							pg_strcasecmp(val, "t") == 0 ||
+							pg_strcasecmp(val, "y") == 0 ||
+							pg_strcasecmp(val, "yes") == 0);
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -2487,41 +2624,75 @@ prsd_headline(PG_FUNCTION_ARGS)
 							defel->defname)));
 	}
 
-	if (highlight == 0)
+	/* in HighlightAll mode these parameters are ignored */
+	if (!highlightall)
 	{
 		if (min_words >= max_words)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("MinWords should be less than MaxWords")));
+					 errmsg("%s must be less than %s", "MinWords", "MaxWords")));
 		if (min_words <= 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("MinWords should be positive")));
+					 errmsg("%s must be positive", "MinWords")));
 		if (shortword < 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("ShortWord should be >= 0")));
+					 errmsg("%s must be >= 0", "ShortWord")));
 		if (max_fragments < 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("MaxFragments should be >= 0")));
+					 errmsg("%s must be >= 0", "MaxFragments")));
 	}
 
-	if (max_fragments == 0)
-		/* call the default headline generator */
-		mark_hl_words(prs, query, highlight, shortword, min_words, max_words);
-	else
-		mark_hl_fragments(prs, query, highlight, shortword, min_words, max_words, max_fragments);
+	/* Locate words and phrases matching the query */
+	if (query->size > 0)
+	{
+		hlCheck		ch;
 
+		ch.words = prs->words;
+		ch.len = prs->curwords;
+		locations = TS_execute_locations(GETQUERY(query), &ch, TS_EXEC_EMPTY,
+										 checkcondition_HL);
+	}
+	else
+		locations = NIL;		/* empty query matches nothing */
+
+	/* Apply appropriate headline selector */
+	if (max_fragments == 0)
+		mark_hl_words(prs, query, locations, highlightall, shortword,
+					  min_words, max_words);
+	else
+		mark_hl_fragments(prs, query, locations, highlightall, shortword,
+						  min_words, max_words, max_fragments);
+
+	/* Fill in default values for string options */
 	if (!prs->startsel)
 		prs->startsel = pstrdup("<b>");
 	if (!prs->stopsel)
 		prs->stopsel = pstrdup("</b>");
 	if (!prs->fragdelim)
 		prs->fragdelim = pstrdup(" ... ");
-	prs->startsellen = strlen(prs->startsel);
-	prs->stopsellen = strlen(prs->stopsel);
-	prs->fragdelimlen = strlen(prs->fragdelim);
+
+	/* Caller will need these lengths, too */
+	startsellen = strlen(prs->startsel);
+	stopsellen = strlen(prs->stopsel);
+	fragdelimlen = strlen(prs->fragdelim);
+	if (startsellen > PG_INT16_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("value for \"%s\" is too long", "StartSel")));
+	if (stopsellen > PG_INT16_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("value for \"%s\" is too long", "StopSel")));
+	if (fragdelimlen > PG_INT16_MAX)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("value for \"%s\" is too long", "FragmentDelimiter")));
+	prs->startsellen = startsellen;
+	prs->stopsellen = stopsellen;
+	prs->fragdelimlen = fragdelimlen;
 
 	PG_RETURN_POINTER(prs);
 }

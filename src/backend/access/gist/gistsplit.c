@@ -15,7 +15,7 @@
  * gistSplitByKey() is the entry point to this file.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -51,7 +51,7 @@ gistunionsubkeyvec(GISTSTATE *giststate, IndexTuple *itvec,
 	int			i,
 				cleanedLen = 0;
 
-	cleanedItVec = (IndexTuple *) palloc(sizeof(IndexTuple) * gsvp->len);
+	cleanedItVec = palloc_array(IndexTuple, gsvp->len);
 
 	for (i = 0; i < gsvp->len; i++)
 	{
@@ -207,7 +207,7 @@ placeOne(Relation r, GISTSTATE *giststate, GistSplitVector *v,
 	gistDeCompressAtt(giststate, r, itup, NULL, (OffsetNumber) 0,
 					  identry, isnull);
 
-	for (; attno < giststate->tupdesc->natts; attno++)
+	for (; attno < giststate->nonLeafTupdesc->natts; attno++)
 	{
 		float		lpenalty,
 					rpenalty;
@@ -303,9 +303,9 @@ supportSecondarySplit(Relation r, GISTSTATE *giststate, int attno,
 		penalty2 = gistpenalty(giststate, attno, entry1, false, &entrySR, false);
 
 		if (penalty1 < penalty2)
-			leaveOnLeft = (sv->spl_ldatum_exists) ? true : false;
+			leaveOnLeft = sv->spl_ldatum_exists;
 		else
-			leaveOnLeft = (sv->spl_rdatum_exists) ? true : false;
+			leaveOnLeft = sv->spl_rdatum_exists;
 	}
 
 	if (leaveOnLeft == false)
@@ -421,8 +421,8 @@ gistUserPicksplit(Relation r, GistEntryVector *entryvec, int attno, GistSplitVec
 	 * Prepare spl_ldatum/spl_rdatum/spl_ldatum_exists/spl_rdatum_exists in
 	 * case we are doing a secondary split (see comments in gist.h).
 	 */
-	sv->spl_ldatum_exists = (v->spl_lisnull[attno]) ? false : true;
-	sv->spl_rdatum_exists = (v->spl_risnull[attno]) ? false : true;
+	sv->spl_ldatum_exists = !(v->spl_lisnull[attno]);
+	sv->spl_rdatum_exists = !(v->spl_risnull[attno]);
 	sv->spl_ldatum = v->spl_lattr[attno];
 	sv->spl_rdatum = v->spl_rattr[attno];
 
@@ -451,8 +451,8 @@ gistUserPicksplit(Relation r, GistEntryVector *entryvec, int attno, GistSplitVec
 		 * Reinit GIST_SPLITVEC. Although these fields are not used by
 		 * genericPickSplit(), set them up for further processing
 		 */
-		sv->spl_ldatum_exists = (v->spl_lisnull[attno]) ? false : true;
-		sv->spl_rdatum_exists = (v->spl_risnull[attno]) ? false : true;
+		sv->spl_ldatum_exists = !(v->spl_lisnull[attno]);
+		sv->spl_rdatum_exists = !(v->spl_risnull[attno]);
 		sv->spl_ldatum = v->spl_lattr[attno];
 		sv->spl_rdatum = v->spl_rattr[attno];
 
@@ -485,7 +485,7 @@ gistUserPicksplit(Relation r, GistEntryVector *entryvec, int attno, GistSplitVec
 	 */
 	v->spl_dontcare = NULL;
 
-	if (attno + 1 < giststate->tupdesc->natts)
+	if (attno + 1 < giststate->nonLeafTupdesc->natts)
 	{
 		int			NumDontCare;
 
@@ -501,7 +501,7 @@ gistUserPicksplit(Relation r, GistEntryVector *entryvec, int attno, GistSplitVec
 		 * Locate don't-care tuples, if any.  If there are none, the split is
 		 * optimal, so just fall out and return false.
 		 */
-		v->spl_dontcare = (bool *) palloc0(sizeof(bool) * (entryvec->n + 1));
+		v->spl_dontcare = palloc0_array(bool, entryvec->n + 1);
 
 		NumDontCare = findDontCares(r, giststate, entryvec->vector, v, attno);
 
@@ -587,8 +587,8 @@ gistSplitHalf(GIST_SPLITVEC *v, int len)
 	int			i;
 
 	v->spl_nright = v->spl_nleft = 0;
-	v->spl_left = (OffsetNumber *) palloc(len * sizeof(OffsetNumber));
-	v->spl_right = (OffsetNumber *) palloc(len * sizeof(OffsetNumber));
+	v->spl_left = palloc_array(OffsetNumber, len);
+	v->spl_right = palloc_array(OffsetNumber, len);
 	for (i = 1; i <= len; i++)
 		if (i < len / 2)
 			v->spl_right[v->spl_nright++] = i;
@@ -632,14 +632,14 @@ gistSplitByKey(Relation r, Page page, IndexTuple *itup, int len,
 	/* note that entryvec->vector[0] goes unused in this code */
 	entryvec = palloc(GEVHDRSZ + (len + 1) * sizeof(GISTENTRY));
 	entryvec->n = len + 1;
-	offNullTuples = (OffsetNumber *) palloc(len * sizeof(OffsetNumber));
+	offNullTuples = palloc_array(OffsetNumber, len);
 
 	for (i = 1; i <= len; i++)
 	{
 		Datum		datum;
 		bool		IsNull;
 
-		datum = index_getattr(itup[i - 1], attno + 1, giststate->tupdesc,
+		datum = index_getattr(itup[i - 1], attno + 1, giststate->leafTupdesc,
 							  &IsNull);
 		gistdentryinit(giststate, attno, &(entryvec->vector[i]),
 					   datum, r, page, i,
@@ -657,7 +657,7 @@ gistSplitByKey(Relation r, Page page, IndexTuple *itup, int len,
 		 */
 		v->spl_risnull[attno] = v->spl_lisnull[attno] = true;
 
-		if (attno + 1 < giststate->tupdesc->natts)
+		if (attno + 1 < giststate->nonLeafTupdesc->natts)
 			gistSplitByKey(r, page, itup, len, giststate, v, attno + 1);
 		else
 			gistSplitHalf(&v->splitVector, len);
@@ -674,7 +674,7 @@ gistSplitByKey(Relation r, Page page, IndexTuple *itup, int len,
 		v->splitVector.spl_nright = nOffNullTuples;
 		v->spl_risnull[attno] = true;
 
-		v->splitVector.spl_left = (OffsetNumber *) palloc(len * sizeof(OffsetNumber));
+		v->splitVector.spl_left = palloc_array(OffsetNumber, len);
 		v->splitVector.spl_nleft = 0;
 		for (i = 1; i <= len; i++)
 			if (j < v->splitVector.spl_nright && offNullTuples[j] == i)
@@ -683,7 +683,7 @@ gistSplitByKey(Relation r, Page page, IndexTuple *itup, int len,
 				v->splitVector.spl_left[v->splitVector.spl_nleft++] = i;
 
 		/* Compute union keys, unless outer recursion level will handle it */
-		if (attno == 0 && giststate->tupdesc->natts == 1)
+		if (attno == 0 && giststate->nonLeafTupdesc->natts == 1)
 		{
 			v->spl_dontcare = NULL;
 			gistunionsubkey(giststate, itup, v);
@@ -700,7 +700,7 @@ gistSplitByKey(Relation r, Page page, IndexTuple *itup, int len,
 			 * Splitting on attno column is not optimal, so consider
 			 * redistributing don't-care tuples according to the next column
 			 */
-			Assert(attno + 1 < giststate->tupdesc->natts);
+			Assert(attno + 1 < giststate->nonLeafTupdesc->natts);
 
 			if (v->spl_dontcare == NULL)
 			{
@@ -716,8 +716,8 @@ gistSplitByKey(Relation r, Page page, IndexTuple *itup, int len,
 				 * Form an array of just the don't-care tuples to pass to a
 				 * recursive invocation of this function for the next column.
 				 */
-				IndexTuple *newitup = (IndexTuple *) palloc(len * sizeof(IndexTuple));
-				OffsetNumber *map = (OffsetNumber *) palloc(len * sizeof(OffsetNumber));
+				IndexTuple *newitup = palloc_array(IndexTuple, len);
+				OffsetNumber *map = palloc_array(OffsetNumber, len);
 				int			newlen = 0;
 				GIST_SPLITVEC backupSplit;
 
@@ -738,9 +738,9 @@ gistSplitByKey(Relation r, Page page, IndexTuple *itup, int len,
 				 * call will overwrite that with its own result.
 				 */
 				backupSplit = v->splitVector;
-				backupSplit.spl_left = (OffsetNumber *) palloc(sizeof(OffsetNumber) * len);
+				backupSplit.spl_left = palloc_array(OffsetNumber, len);
 				memcpy(backupSplit.spl_left, v->splitVector.spl_left, sizeof(OffsetNumber) * v->splitVector.spl_nleft);
-				backupSplit.spl_right = (OffsetNumber *) palloc(sizeof(OffsetNumber) * len);
+				backupSplit.spl_right = palloc_array(OffsetNumber, len);
 				memcpy(backupSplit.spl_right, v->splitVector.spl_right, sizeof(OffsetNumber) * v->splitVector.spl_nright);
 
 				/* Recursively decide how to split the don't-care tuples */
@@ -771,7 +771,7 @@ gistSplitByKey(Relation r, Page page, IndexTuple *itup, int len,
 	 * that PickSplit (or the special cases above) produced correct union
 	 * datums.
 	 */
-	if (attno == 0 && giststate->tupdesc->natts > 1)
+	if (attno == 0 && giststate->nonLeafTupdesc->natts > 1)
 	{
 		v->spl_dontcare = NULL;
 		gistunionsubkey(giststate, itup, v);

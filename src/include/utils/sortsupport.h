@@ -24,7 +24,7 @@
  * function will have a shim set up by sort support automatically.  However,
  * opclasses that support the optional additional abbreviated key capability
  * must always provide an authoritative comparator used to tie-break
- * inconclusive abbreviated comparisons and also used  when aborting
+ * inconclusive abbreviated comparisons and also used when aborting
  * abbreviation.  Furthermore, a converter and abort/costing function must be
  * provided.
  *
@@ -42,7 +42,7 @@
  * function for such cases, but probably not any other acceleration method.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/sortsupport.h
@@ -184,8 +184,8 @@ typedef struct SortSupportData
 	/*
 	 * Full, authoritative comparator for key that an abbreviated
 	 * representation was generated for, used when an abbreviated comparison
-	 * was inconclusive (by calling ApplySortComparatorFull()), or used to
-	 * replace "comparator" when core system ultimately decides against
+	 * was inconclusive (by calling ApplySortAbbrevFullComparator()), or used
+	 * to replace "comparator" when core system ultimately decides against
 	 * abbreviation.
 	 */
 	int			(*abbrev_full_comparator) (Datum x, Datum y, SortSupport ssup);
@@ -267,10 +267,21 @@ ApplySortAbbrevFullComparator(Datum datum1, bool isNull1,
 	return compare;
 }
 
+/*
+ * Datum comparison functions that we have specialized sort routines for.
+ * Datatypes that install these as their comparator or abbreviated comparator
+ * are eligible for faster sorting.
+ */
+extern int	ssup_datum_uint64_cmp(Datum x, Datum y, SortSupport ssup);
+extern int	ssup_datum_int64_cmp(Datum x, Datum y, SortSupport ssup);
+extern int	ssup_datum_uint32_cmp(Datum x, Datum y, SortSupport ssup);
+extern int	ssup_datum_int32_cmp(Datum x, Datum y, SortSupport ssup);
+
 /* Other functions in utils/sort/sortsupport.c */
 extern void PrepareSortSupportComparisonShim(Oid cmpFunc, SortSupport ssup);
 extern void PrepareSortSupportFromOrderingOp(Oid orderingOp, SortSupport ssup);
-extern void PrepareSortSupportFromIndexRel(Relation indexRel, int16 strategy,
-							   SortSupport ssup);
+extern void PrepareSortSupportFromIndexRel(Relation indexRel, bool reverse,
+										   SortSupport ssup);
+extern void PrepareSortSupportFromGistIndexRel(Relation indexRel, SortSupport ssup);
 
 #endif							/* SORTSUPPORT_H */

@@ -22,8 +22,8 @@ fi
 # PGAC_PATH_BISON
 # ---------------
 # Look for Bison, set the output variable BISON to its path if found.
-# Reject versions before 1.875 (they have bugs or capacity limits).
-# Note we do not accept other implementations of yacc.
+# Reject versions before 2.3 (the earliest version in the buildfarm
+# as of 2022). Note we do not accept other implementations of yacc.
 
 AC_DEFUN([PGAC_PATH_BISON],
 [PGAC_PATH_PROGS(BISON, bison)
@@ -31,12 +31,11 @@ AC_DEFUN([PGAC_PATH_BISON],
 if test "$BISON"; then
   pgac_bison_version=`$BISON --version 2>/dev/null | sed q`
   AC_MSG_NOTICE([using $pgac_bison_version])
-  if echo "$pgac_bison_version" | $AWK '{ if ([$]4 < 1.875) exit 0; else exit 1;}'
+  if echo "$pgac_bison_version" | $AWK '{ if ([$]4 < 2.3) exit 0; else exit 1;}'
   then
-    AC_MSG_WARN([
+    AC_MSG_ERROR([
 *** The installed version of Bison, $BISON, is too old to use with PostgreSQL.
-*** Bison version 1.875 or later is required, but this is $pgac_bison_version.])
-    BISON=""
+*** Bison version 2.3 or later is required, but this is $pgac_bison_version.])
   fi
   # Bison >=3.0 issues warnings about %name-prefix="base_yy", instead
   # of the now preferred %name-prefix "base_yy", but the latter
@@ -49,14 +48,9 @@ if test "$BISON"; then
 fi
 
 if test -z "$BISON"; then
-  AC_MSG_WARN([
-*** Without Bison you will not be able to build PostgreSQL from Git nor
-*** change any of the parser definition files.  You can obtain Bison from
-*** a GNU mirror site.  (If you are using the official distribution of
-*** PostgreSQL then you do not need to worry about this, because the Bison
-*** output is pre-generated.)])
+  AC_MSG_ERROR([bison not found])
 fi
-# We don't need AC_SUBST(BISON) because PGAC_PATH_PROGS did it
+dnl We don't need AC_SUBST(BISON) because PGAC_PATH_PROGS did it
 AC_SUBST(BISONFLAGS)
 ])# PGAC_PATH_BISON
 
@@ -65,65 +59,15 @@ AC_SUBST(BISONFLAGS)
 # PGAC_PATH_FLEX
 # --------------
 # Look for Flex, set the output variable FLEX to its path if found.
-# Reject versions before 2.5.31, as we need a reasonably non-buggy reentrant
-# scanner.  (Note: the well-publicized security problem in 2.5.31 does not
-# affect Postgres, and there are still distros shipping patched 2.5.31,
-# so allow it.)  Also find Flex if its installed under `lex', but do not
-# accept other Lex programs.
 
 AC_DEFUN([PGAC_PATH_FLEX],
-[AC_CACHE_CHECK([for flex], pgac_cv_path_flex,
-[# Let the user override the test
-if test -n "$FLEX"; then
-  pgac_cv_path_flex=$FLEX
-else
-  pgac_save_IFS=$IFS
-  IFS=$PATH_SEPARATOR
-  for pgac_dir in $PATH; do
-    IFS=$pgac_save_IFS
-    if test -z "$pgac_dir" || test x"$pgac_dir" = x"."; then
-      pgac_dir=`pwd`
-    fi
-    for pgac_prog in flex lex; do
-      pgac_candidate="$pgac_dir/$pgac_prog"
-      if test -f "$pgac_candidate" \
-        && $pgac_candidate --version </dev/null >/dev/null 2>&1
-      then
-        echo '%%'  > conftest.l
-        if $pgac_candidate -t conftest.l 2>/dev/null | grep FLEX_SCANNER >/dev/null 2>&1; then
-          pgac_flex_version=`$pgac_candidate --version 2>/dev/null`
-          if echo "$pgac_flex_version" | sed ['s/[.a-z]/ /g'] | $AWK '{ if ([$]1 == 2 && ([$]2 > 5 || ([$]2 == 5 && [$]3 >= 31))) exit 0; else exit 1;}'
-          then
-            pgac_cv_path_flex=$pgac_candidate
-            break 2
-          else
-            AC_MSG_WARN([
-*** The installed version of Flex, $pgac_candidate, is too old to use with PostgreSQL.
-*** Flex version 2.5.31 or later is required, but this is $pgac_flex_version.])
-          fi
-        fi
-      fi
-    done
-  done
-  rm -f conftest.l lex.yy.c
-  : ${pgac_cv_path_flex=no}
+[PGAC_PATH_PROGS(FLEX, flex)
+if test -z "$FLEX"; then
+  AC_MSG_ERROR([flex not found])
 fi
-])[]dnl AC_CACHE_CHECK
 
-if test x"$pgac_cv_path_flex" = x"no"; then
-  AC_MSG_WARN([
-*** Without Flex you will not be able to build PostgreSQL from Git nor
-*** change any of the scanner definition files.  You can obtain Flex from
-*** a GNU mirror site.  (If you are using the official distribution of
-*** PostgreSQL then you do not need to worry about this because the Flex
-*** output is pre-generated.)])
-
-  FLEX=
-else
-  FLEX=$pgac_cv_path_flex
-  pgac_flex_version=`$FLEX --version 2>/dev/null`
-  AC_MSG_NOTICE([using $pgac_flex_version])
-fi
+pgac_flex_version=`$FLEX --version 2>/dev/null`
+AC_MSG_NOTICE([using $pgac_flex_version])
 
 AC_SUBST(FLEX)
 AC_SUBST(FLEXFLAGS)
@@ -179,11 +123,11 @@ for pgac_rllib in $READLINE_ORDER ; do
   for pgac_lib in "" " -ltermcap" " -lncurses" " -lcurses" ; do
     LIBS="${pgac_rllib}${pgac_lib} $pgac_save_LIBS"
     AC_TRY_LINK_FUNC([readline], [[
-      # Older NetBSD, OpenBSD, and Irix have a broken linker that does not
+      # Older NetBSD and OpenBSD have a broken linker that does not
       # recognize dependent libraries; assume curses is needed if we didn't
       # find any dependency.
       case $host_os in
-        netbsd* | openbsd* | irix*)
+        netbsd* | openbsd*)
           if test x"$pgac_lib" = x"" ; then
             pgac_lib=" -lcurses"
           fi ;;
@@ -209,26 +153,64 @@ fi
 
 
 
-# PGAC_VAR_RL_COMPLETION_APPEND_CHARACTER
-# ---------------------------------------
-# Readline versions < 2.1 don't have rl_completion_append_character
+# PGAC_READLINE_VARIABLES
+# -----------------------
+# Some Readline versions lack rl_completion_suppress_quote.
+# Libedit lacks rl_filename_quote_characters and rl_filename_quoting_function
 
-AC_DEFUN([PGAC_VAR_RL_COMPLETION_APPEND_CHARACTER],
-[AC_CACHE_CHECK([for rl_completion_append_character], pgac_cv_var_rl_completion_append_character,
+AC_DEFUN([PGAC_READLINE_VARIABLES],
+[AC_CACHE_CHECK([for rl_completion_suppress_quote], pgac_cv_var_rl_completion_suppress_quote,
 [AC_LINK_IFELSE([AC_LANG_PROGRAM([#include <stdio.h>
-#ifdef HAVE_READLINE_READLINE_H
-# include <readline/readline.h>
+#if defined(HAVE_READLINE_READLINE_H)
+#include <readline/readline.h>
+#elif defined(HAVE_EDITLINE_READLINE_H)
+#include <editline/readline.h>
 #elif defined(HAVE_READLINE_H)
-# include <readline.h>
+#include <readline.h>
 #endif
 ],
-[rl_completion_append_character = 'x';])],
-[pgac_cv_var_rl_completion_append_character=yes],
-[pgac_cv_var_rl_completion_append_character=no])])
-if test x"$pgac_cv_var_rl_completion_append_character" = x"yes"; then
-AC_DEFINE(HAVE_RL_COMPLETION_APPEND_CHARACTER, 1,
-          [Define to 1 if you have the global variable 'rl_completion_append_character'.])
-fi])# PGAC_VAR_RL_COMPLETION_APPEND_CHARACTER
+[rl_completion_suppress_quote = 1;])],
+[pgac_cv_var_rl_completion_suppress_quote=yes],
+[pgac_cv_var_rl_completion_suppress_quote=no])])
+if test x"$pgac_cv_var_rl_completion_suppress_quote" = x"yes"; then
+AC_DEFINE(HAVE_RL_COMPLETION_SUPPRESS_QUOTE, 1,
+          [Define to 1 if you have the global variable 'rl_completion_suppress_quote'.])
+fi
+AC_CACHE_CHECK([for rl_filename_quote_characters], pgac_cv_var_rl_filename_quote_characters,
+[AC_LINK_IFELSE([AC_LANG_PROGRAM([#include <stdio.h>
+#if defined(HAVE_READLINE_READLINE_H)
+#include <readline/readline.h>
+#elif defined(HAVE_EDITLINE_READLINE_H)
+#include <editline/readline.h>
+#elif defined(HAVE_READLINE_H)
+#include <readline.h>
+#endif
+],
+[rl_filename_quote_characters = "x";])],
+[pgac_cv_var_rl_filename_quote_characters=yes],
+[pgac_cv_var_rl_filename_quote_characters=no])])
+if test x"$pgac_cv_var_rl_filename_quote_characters" = x"yes"; then
+AC_DEFINE(HAVE_RL_FILENAME_QUOTE_CHARACTERS, 1,
+          [Define to 1 if you have the global variable 'rl_filename_quote_characters'.])
+fi
+AC_CACHE_CHECK([for rl_filename_quoting_function], pgac_cv_var_rl_filename_quoting_function,
+[AC_LINK_IFELSE([AC_LANG_PROGRAM([#include <stdio.h>
+#if defined(HAVE_READLINE_READLINE_H)
+#include <readline/readline.h>
+#elif defined(HAVE_EDITLINE_READLINE_H)
+#include <editline/readline.h>
+#elif defined(HAVE_READLINE_H)
+#include <readline.h>
+#endif
+],
+[rl_filename_quoting_function = 0;])],
+[pgac_cv_var_rl_filename_quoting_function=yes],
+[pgac_cv_var_rl_filename_quoting_function=no])])
+if test x"$pgac_cv_var_rl_filename_quoting_function" = x"yes"; then
+AC_DEFINE(HAVE_RL_FILENAME_QUOTING_FUNCTION, 1,
+          [Define to 1 if you have the global variable 'rl_filename_quoting_function'.])
+fi
+])# PGAC_READLINE_VARIABLES
 
 
 
@@ -245,6 +227,7 @@ AC_DEFUN([PGAC_CHECK_GETTEXT],
   AC_CHECK_HEADER([libintl.h], [],
                   [AC_MSG_ERROR([header file <libintl.h> is required for NLS])])
   PGAC_PATH_PROGS(MSGFMT, msgfmt)
+  AC_ARG_VAR(MSGFMT, [msgfmt program for NLS])dnl
   if test -z "$MSGFMT"; then
     AC_MSG_ERROR([msgfmt is required for NLS])
   fi
@@ -270,7 +253,7 @@ AC_DEFUN([PGAC_CHECK_STRIP],
 
   AC_MSG_CHECKING([whether it is possible to strip libraries])
   if test x"$STRIP" != x"" && "$STRIP" -V 2>&1 | grep "GNU strip" >/dev/null; then
-    STRIP_STATIC_LIB="$STRIP -x"
+    STRIP_STATIC_LIB="$STRIP --strip-unneeded"
     STRIP_SHARED_LIB="$STRIP --strip-unneeded"
     AC_MSG_RESULT(yes)
   else
@@ -291,3 +274,89 @@ AC_DEFUN([PGAC_CHECK_STRIP],
   AC_SUBST(STRIP_STATIC_LIB)
   AC_SUBST(STRIP_SHARED_LIB)
 ])# PGAC_CHECK_STRIP
+
+
+
+# PGAC_CHECK_LIBCURL
+# ------------------
+# Check for required libraries and headers, and test to see whether the current
+# installation of libcurl is thread-safe.
+
+AC_DEFUN([PGAC_CHECK_LIBCURL],
+[
+  # libcurl compiler/linker flags are kept separate from the global flags, so
+  # they have to be added back temporarily for the following tests.
+  pgac_save_CPPFLAGS=$CPPFLAGS
+  pgac_save_LDFLAGS=$LDFLAGS
+  pgac_save_LIBS=$LIBS
+
+  CPPFLAGS="$CPPFLAGS $LIBCURL_CPPFLAGS"
+  LDFLAGS="$LDFLAGS $LIBCURL_LDFLAGS"
+
+  AC_CHECK_HEADER(curl/curl.h, [],
+				  [AC_MSG_ERROR([header file <curl/curl.h> is required for --with-libcurl])])
+
+  # LIBCURL_LDLIBS is determined here. Like the compiler flags, it should not
+  # pollute the global LIBS setting.
+  AC_CHECK_LIB(curl, curl_multi_init, [
+				 AC_DEFINE([HAVE_LIBCURL], [1], [Define to 1 if you have the `curl' library (-lcurl).])
+				 AC_SUBST(LIBCURL_LDLIBS, -lcurl)
+			   ],
+			   [AC_MSG_ERROR([library 'curl' does not provide curl_multi_init])])
+
+  LIBS="$LIBCURL_LDLIBS $LIBS"
+
+  # Check to see whether the current platform supports threadsafe Curl
+  # initialization.
+  AC_CACHE_CHECK([for curl_global_init thread safety], [pgac_cv__libcurl_threadsafe_init],
+  [AC_RUN_IFELSE([AC_LANG_PROGRAM([
+#include <curl/curl.h>
+],[
+    curl_version_info_data *info;
+
+    if (curl_global_init(CURL_GLOBAL_ALL))
+        return -1;
+
+    info = curl_version_info(CURLVERSION_NOW);
+#ifdef CURL_VERSION_THREADSAFE
+    if (info->features & CURL_VERSION_THREADSAFE)
+        return 0;
+#endif
+
+    return 1;
+])],
+  [pgac_cv__libcurl_threadsafe_init=yes],
+  [pgac_cv__libcurl_threadsafe_init=no],
+  [pgac_cv__libcurl_threadsafe_init=unknown])])
+  if test x"$pgac_cv__libcurl_threadsafe_init" = xyes ; then
+    AC_DEFINE(HAVE_THREADSAFE_CURL_GLOBAL_INIT, 1,
+              [Define to 1 if curl_global_init() is guaranteed to be thread-safe.])
+  fi
+
+  # Fail if a thread-friendly DNS resolver isn't built.
+  AC_CACHE_CHECK([for curl support for asynchronous DNS], [pgac_cv__libcurl_async_dns],
+  [AC_RUN_IFELSE([AC_LANG_PROGRAM([
+#include <curl/curl.h>
+],[
+    curl_version_info_data *info;
+
+    if (curl_global_init(CURL_GLOBAL_ALL))
+        return -1;
+
+    info = curl_version_info(CURLVERSION_NOW);
+    return (info->features & CURL_VERSION_ASYNCHDNS) ? 0 : 1;
+])],
+  [pgac_cv__libcurl_async_dns=yes],
+  [pgac_cv__libcurl_async_dns=no],
+  [pgac_cv__libcurl_async_dns=unknown])])
+  if test x"$pgac_cv__libcurl_async_dns" = xno ; then
+    AC_MSG_ERROR([
+*** The installed version of libcurl does not support asynchronous DNS
+*** lookups. Rebuild libcurl with the AsynchDNS feature enabled in order
+*** to use it with libpq.])
+  fi
+
+  CPPFLAGS=$pgac_save_CPPFLAGS
+  LDFLAGS=$pgac_save_LDFLAGS
+  LIBS=$pgac_save_LIBS
+])# PGAC_CHECK_LIBCURL

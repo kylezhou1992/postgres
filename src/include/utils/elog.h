@@ -4,7 +4,7 @@
  *	  POSTGRES error reporting/logging definitions.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/elog.h
@@ -16,7 +16,14 @@
 
 #include <setjmp.h>
 
+#include "lib/stringinfo.h"
+
+/* We cannot include nodes.h yet, so forward-declare struct Node */
+struct Node;
+
+
 /* Error level codes */
+#define LOG_NEVER	0			/* Never emit this message */
 #define DEBUG5		10			/* Debugging messages, in categories of
 								 * decreasing detail. */
 #define DEBUG4		11
@@ -40,19 +47,22 @@
 #define WARNING		19			/* Warnings.  NOTICE is for expected messages
 								 * like implicit sequence creation by SERIAL.
 								 * WARNING is for unexpected messages. */
-#define ERROR		20			/* user error - abort transaction; return to
+#define PGWARNING	19			/* Must equal WARNING; see NOTE below. */
+#define WARNING_CLIENT_ONLY	20	/* Warnings to be sent to client as usual, but
+								 * never to the server log. */
+#define ERROR		21			/* user error - abort transaction; return to
 								 * known state */
-/* Save ERROR value in PGERROR so it can be restored when Win32 includes
- * modify it.  We have to use a constant rather than ERROR because macros
- * are expanded only when referenced outside macros.
- */
-#ifdef WIN32
-#define PGERROR		20
-#endif
-#define FATAL		21			/* fatal error - abort process */
-#define PANIC		22			/* take down the other backends with me */
+#define PGERROR		21			/* Must equal ERROR; see NOTE below. */
+#define FATAL		22			/* fatal error - abort process */
+#define FATAL_CLIENT_ONLY 23	/* fatal version of WARNING_CLIENT_ONLY */
+#define PANIC		24			/* take down the other backends with me */
 
- /* #define DEBUG DEBUG1 */	/* Backward compatibility with pre-7.3 */
+/*
+ * NOTE: the alternate names PGWARNING and PGERROR are useful for dealing
+ * with third-party headers that make other definitions of WARNING and/or
+ * ERROR.  One can, for example, re-define ERROR as PGERROR after including
+ * such a header.
+ */
 
 
 /* macros for representing SQLSTATE strings compactly */
@@ -63,7 +73,7 @@
 	(PGSIXBIT(ch1) + (PGSIXBIT(ch2) << 6) + (PGSIXBIT(ch3) << 12) + \
 	 (PGSIXBIT(ch4) << 18) + (PGSIXBIT(ch5) << 24))
 
-/* These macros depend on the fact that '0' becomes a zero in SIXBIT */
+/* These macros depend on the fact that '0' becomes a zero in PGSIXBIT */
 #define ERRCODE_TO_CATEGORY(ec)  ((ec) & ((1 << 12) - 1))
 #define ERRCODE_IS_CATEGORY(ec)  (((ec) & ~((1 << 12) - 1)) == 0)
 
@@ -81,7 +91,7 @@
  */
 #if defined(errno) && defined(__linux__)
 #define pg_prevent_errno_in_scope() int __errno_location pg_attribute_unused()
-#elif defined(errno) && (defined(__darwin__) || defined(__freebsd__))
+#elif defined(errno) && (defined(__darwin__) || defined(__FreeBSD__))
 #define pg_prevent_errno_in_scope() int __error pg_attribute_unused()
 #else
 #define pg_prevent_errno_in_scope()
@@ -91,15 +101,18 @@
 /*----------
  * New-style error reporting API: to be used in this way:
  *		ereport(ERROR,
- *				(errcode(ERRCODE_UNDEFINED_CURSOR),
- *				 errmsg("portal \"%s\" not found", stmt->portalname),
- *				 ... other errxxx() fields as needed ...));
+ *				errcode(ERRCODE_UNDEFINED_CURSOR),
+ *				errmsg("portal \"%s\" not found", stmt->portalname),
+ *				... other errxxx() fields as needed ...);
  *
  * The error level is required, and so is a primary error message (errmsg
  * or errmsg_internal).  All else is optional.  errcode() defaults to
  * ERRCODE_INTERNAL_ERROR if elevel is ERROR or more, ERRCODE_WARNING
  * if elevel is WARNING, or ERRCODE_SUCCESSFUL_COMPLETION if elevel is
  * NOTICE or below.
+ *
+ * Before Postgres v12, extra parentheses were required around the
+ * list of auxiliary function calls; that's now optional.
  *
  * ereport_domain() allows a message domain to be specified, for modules that
  * wish to use a different message catalog from the backend's.  To avoid having
@@ -108,69 +121,87 @@
  * ereport_domain() directly, or preferably they can override the TEXTDOMAIN
  * macro.
  *
+ * When pg_integer_constant_p is available and elevel >= ERROR we make
+ * a call to errstart_cold() instead of errstart().  This version of the
+ * function is marked with pg_attribute_cold which will coax supporting
+ * compilers into generating code which is more optimized towards non-ERROR
+ * cases.  Because we use pg_integer_constant_p() in the condition,
+ * when elevel is not a compile-time constant, or if it is, but it's < ERROR,
+ * the compiler has no need to generate any code for this branch.  It can
+ * simply call errstart() unconditionally.
+ *
  * If elevel >= ERROR, the call will not return; we try to inform the compiler
  * of that via pg_unreachable().  However, no useful optimization effect is
  * obtained unless the compiler sees elevel as a compile-time constant, else
- * we're just adding code bloat.  So, if __builtin_constant_p is available,
- * use that to cause the second if() to vanish completely for non-constant
- * cases.  We avoid using a local variable because it's not necessary and
- * prevents gcc from making the unreachability deduction at optlevel -O0.
+ * we're just adding code bloat.  So, if pg_integer_constant_p is
+ * available, use that to cause the second if() to vanish completely for
+ * non-constant cases.  We avoid using a local variable because it's not
+ * necessary and prevents gcc from making the unreachability deduction at
+ * optlevel -O0.
  *----------
  */
-#ifdef HAVE__BUILTIN_CONSTANT_P
-#define ereport_domain(elevel, domain, rest)	\
+#ifdef HAVE_PG_INTEGER_CONSTANT_P
+#define ereport_domain(elevel, domain, ...)	\
 	do { \
 		pg_prevent_errno_in_scope(); \
-		if (errstart(elevel, __FILE__, __LINE__, PG_FUNCNAME_MACRO, domain)) \
-			errfinish rest; \
-		if (__builtin_constant_p(elevel) && (elevel) >= ERROR) \
+		if (pg_integer_constant_p(elevel) && (elevel) >= ERROR ? \
+			errstart_cold(elevel, domain) : \
+			errstart(elevel, domain)) \
+			__VA_ARGS__, errfinish(__FILE__, __LINE__, __func__); \
+		if (pg_integer_constant_p(elevel) && (elevel) >= ERROR) \
 			pg_unreachable(); \
 	} while(0)
-#else							/* !HAVE__BUILTIN_CONSTANT_P */
-#define ereport_domain(elevel, domain, rest)	\
+#else							/* !HAVE_PG_INTEGER_CONSTANT_P */
+#define ereport_domain(elevel, domain, ...)	\
 	do { \
 		const int elevel_ = (elevel); \
 		pg_prevent_errno_in_scope(); \
-		if (errstart(elevel_, __FILE__, __LINE__, PG_FUNCNAME_MACRO, domain)) \
-			errfinish rest; \
+		if (errstart(elevel_, domain)) \
+			__VA_ARGS__, errfinish(__FILE__, __LINE__, __func__); \
 		if (elevel_ >= ERROR) \
 			pg_unreachable(); \
 	} while(0)
-#endif							/* HAVE__BUILTIN_CONSTANT_P */
+#endif							/* HAVE_PG_INTEGER_CONSTANT_P */
 
-#define ereport(elevel, rest)	\
-	ereport_domain(elevel, TEXTDOMAIN, rest)
+#define ereport(elevel, ...)	\
+	ereport_domain(elevel, TEXTDOMAIN, __VA_ARGS__)
 
 #define TEXTDOMAIN NULL
 
-extern bool errstart(int elevel, const char *filename, int lineno,
-		 const char *funcname, const char *domain);
-extern void errfinish(int dummy,...);
+extern bool message_level_is_interesting(int elevel);
+
+extern bool errstart(int elevel, const char *domain);
+extern pg_attribute_cold bool errstart_cold(int elevel, const char *domain);
+extern void errfinish(const char *filename, int lineno, const char *funcname);
 
 extern int	errcode(int sqlerrcode);
 
 extern int	errcode_for_file_access(void);
 extern int	errcode_for_socket_access(void);
 
-extern int	errmsg(const char *fmt,...) pg_attribute_printf(1, 2);
-extern int	errmsg_internal(const char *fmt,...) pg_attribute_printf(1, 2);
+extern int	errmsg(const char *fmt, ...) pg_attribute_printf(1, 2);
+extern int	errmsg_internal(const char *fmt, ...) pg_attribute_printf(1, 2);
 
-extern int errmsg_plural(const char *fmt_singular, const char *fmt_plural,
-			  unsigned long n,...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
+extern int	errmsg_plural(const char *fmt_singular, const char *fmt_plural,
+						  unsigned long n, ...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
 
-extern int	errdetail(const char *fmt,...) pg_attribute_printf(1, 2);
-extern int	errdetail_internal(const char *fmt,...) pg_attribute_printf(1, 2);
+extern int	errdetail(const char *fmt, ...) pg_attribute_printf(1, 2);
+extern int	errdetail_internal(const char *fmt, ...) pg_attribute_printf(1, 2);
 
-extern int	errdetail_log(const char *fmt,...) pg_attribute_printf(1, 2);
+extern int	errdetail_log(const char *fmt, ...) pg_attribute_printf(1, 2);
 
-extern int errdetail_log_plural(const char *fmt_singular,
-					 const char *fmt_plural,
-					 unsigned long n,...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
+extern int	errdetail_log_plural(const char *fmt_singular,
+								 const char *fmt_plural,
+								 unsigned long n, ...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
 
-extern int errdetail_plural(const char *fmt_singular, const char *fmt_plural,
-				 unsigned long n,...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
+extern int	errdetail_plural(const char *fmt_singular, const char *fmt_plural,
+							 unsigned long n, ...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
 
-extern int	errhint(const char *fmt,...) pg_attribute_printf(1, 2);
+extern int	errhint(const char *fmt, ...) pg_attribute_printf(1, 2);
+extern int	errhint_internal(const char *fmt, ...) pg_attribute_printf(1, 2);
+
+extern int	errhint_plural(const char *fmt_singular, const char *fmt_plural,
+						   unsigned long n, ...) pg_attribute_printf(1, 4) pg_attribute_printf(2, 4);
 
 /*
  * errcontext() is typically called in error context callback functions, not
@@ -184,12 +215,13 @@ extern int	errhint(const char *fmt,...) pg_attribute_printf(1, 2);
 
 extern int	set_errcontext_domain(const char *domain);
 
-extern int	errcontext_msg(const char *fmt,...) pg_attribute_printf(1, 2);
+extern int	errcontext_msg(const char *fmt, ...) pg_attribute_printf(1, 2);
 
 extern int	errhidestmt(bool hide_stmt);
 extern int	errhidecontext(bool hide_ctx);
 
-extern int	errfunction(const char *funcname);
+extern int	errbacktrace(void);
+
 extern int	errposition(int cursorpos);
 
 extern int	internalerrposition(int cursorpos);
@@ -207,43 +239,71 @@ extern int	getinternalerrposition(void);
  *		elog(ERROR, "portal \"%s\" not found", stmt->portalname);
  *----------
  */
-/*
- * Using variadic macros, we can give the compiler a hint about the
- * call not returning when elevel >= ERROR.  See comments for ereport().
- * Note that historically elog() has called elog_start (which saves errno)
- * before evaluating "elevel", so we preserve that behavior here.
- */
-#ifdef HAVE__BUILTIN_CONSTANT_P
 #define elog(elevel, ...)  \
-	do { \
-		pg_prevent_errno_in_scope(); \
-		elog_start(__FILE__, __LINE__, PG_FUNCNAME_MACRO); \
-		elog_finish(elevel, __VA_ARGS__); \
-		if (__builtin_constant_p(elevel) && (elevel) >= ERROR) \
-			pg_unreachable(); \
-	} while(0)
-#else							/* !HAVE__BUILTIN_CONSTANT_P */
-#define elog(elevel, ...)  \
-	do { \
-		pg_prevent_errno_in_scope(); \
-		elog_start(__FILE__, __LINE__, PG_FUNCNAME_MACRO); \
-		{ \
-			const int elevel_ = (elevel); \
-			elog_finish(elevel_, __VA_ARGS__); \
-			if (elevel_ >= ERROR) \
-				pg_unreachable(); \
-		} \
-	} while(0)
-#endif							/* HAVE__BUILTIN_CONSTANT_P */
+	ereport(elevel, errmsg_internal(__VA_ARGS__))
 
-extern void elog_start(const char *filename, int lineno, const char *funcname);
-extern void elog_finish(int elevel, const char *fmt,...) pg_attribute_printf(2, 3);
+
+/*----------
+ * Support for reporting "soft" errors that don't require a full transaction
+ * abort to clean up.  This is to be used in this way:
+ *		errsave(context,
+ *				errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+ *				errmsg("invalid input syntax for type %s: \"%s\"",
+ *					   "boolean", in_str),
+ *				... other errxxx() fields as needed ...);
+ *
+ * "context" is a node pointer or NULL, and the remaining auxiliary calls
+ * provide the same error details as in ereport().  If context is not a
+ * pointer to an ErrorSaveContext node, then errsave(context, ...)
+ * behaves identically to ereport(ERROR, ...).  If context is a pointer
+ * to an ErrorSaveContext node, then the information provided by the
+ * auxiliary calls is stored in the context node and control returns
+ * normally.  The caller of errsave() must then do any required cleanup
+ * and return control back to its caller.  That caller must check the
+ * ErrorSaveContext node to see whether an error occurred before
+ * it can trust the function's result to be meaningful.
+ *
+ * errsave_domain() allows a message domain to be specified; it is
+ * precisely analogous to ereport_domain().
+ *----------
+ */
+#define errsave_domain(context, domain, ...)	\
+	do { \
+		struct Node *context_ = (context); \
+		pg_prevent_errno_in_scope(); \
+		if (errsave_start(context_, domain)) \
+			__VA_ARGS__, errsave_finish(context_, __FILE__, __LINE__, __func__); \
+	} while(0)
+
+#define errsave(context, ...)	\
+	errsave_domain(context, TEXTDOMAIN, __VA_ARGS__)
+
+/*
+ * "ereturn(context, dummy_value, ...);" is exactly the same as
+ * "errsave(context, ...); return dummy_value;".  This saves a bit
+ * of typing in the common case where a function has no cleanup
+ * actions to take after reporting a soft error.  "dummy_value"
+ * can be empty if the function returns void.
+ */
+#define ereturn_domain(context, dummy_value, domain, ...)	\
+	do { \
+		errsave_domain(context, domain, __VA_ARGS__); \
+		return dummy_value; \
+	} while(0)
+
+#define ereturn(context, dummy_value, ...)	\
+	ereturn_domain(context, dummy_value, TEXTDOMAIN, __VA_ARGS__)
+
+extern bool errsave_start(struct Node *context, const char *domain);
+extern void errsave_finish(struct Node *context,
+						   const char *filename, int lineno,
+						   const char *funcname);
 
 
 /* Support for constructing error strings separately from ereport() calls */
 
 extern void pre_format_elog_string(int errnumber, const char *domain);
-extern char *format_elog_string(const char *fmt,...) pg_attribute_printf(1, 2);
+extern char *format_elog_string(const char *fmt, ...) pg_attribute_printf(1, 2);
 
 
 /* Support for attaching context information to error reports */
@@ -272,8 +332,29 @@ extern PGDLLIMPORT ErrorContextCallback *error_context_stack;
  *		PG_END_TRY();
  *
  * (The braces are not actually necessary, but are recommended so that
- * pgindent will indent the construct nicely.)	The error recovery code
- * can optionally do PG_RE_THROW() to propagate the same error outwards.
+ * pgindent will indent the construct nicely.)  The error recovery code
+ * can either do PG_RE_THROW to propagate the error outwards, or do a
+ * (sub)transaction abort. Failure to do so may leave the system in an
+ * inconsistent state for further processing.
+ *
+ * For the common case that the error recovery code and the cleanup in the
+ * normal code path are identical, the following can be used instead:
+ *
+ *		PG_TRY();
+ *		{
+ *			... code that might throw ereport(ERROR) ...
+ *		}
+ *		PG_FINALLY();
+ *		{
+ *			... cleanup code ...
+ *		}
+ *      PG_END_TRY();
+ *
+ * The cleanup code will be run in either case, and any error will be rethrown
+ * afterwards.
+ *
+ * You cannot use both PG_CATCH() and PG_FINALLY() in the same
+ * PG_TRY()/PG_END_TRY() block.
  *
  * Note: while the system will correctly propagate any new ereport(ERROR)
  * occurring in the recovery section, there is a small limit on the number
@@ -294,41 +375,54 @@ extern PGDLLIMPORT ErrorContextCallback *error_context_stack;
  * pedantry; we have seen bugs from compilers improperly optimizing code
  * away when such a variable was not marked.  Beware that gcc's -Wclobbered
  * warnings are just about entirely useless for catching such oversights.
+ *
+ * Each of these macros accepts an optional argument which can be specified
+ * to apply a suffix to the variables declared within the macros.  This suffix
+ * can be used to avoid the compiler emitting warnings about shadowed
+ * variables when compiling with -Wshadow in situations where nested PG_TRY()
+ * statements are required.  The optional suffix may contain any character
+ * that's allowed in a variable name.  The suffix, if specified, must be the
+ * same within each component macro of the given PG_TRY() statement.
+ *
+ * If you modify these macros, check whether similar modifications are
+ * needed in plperl's PG_PERL_TRY and friends.
  *----------
  */
-#define PG_TRY()  \
+#define PG_TRY(...)  \
 	do { \
-		sigjmp_buf *save_exception_stack = PG_exception_stack; \
-		ErrorContextCallback *save_context_stack = error_context_stack; \
-		sigjmp_buf local_sigjmp_buf; \
-		if (sigsetjmp(local_sigjmp_buf, 0) == 0) \
+		sigjmp_buf *_save_exception_stack##__VA_ARGS__ = PG_exception_stack; \
+		ErrorContextCallback *_save_context_stack##__VA_ARGS__ = error_context_stack; \
+		sigjmp_buf _local_sigjmp_buf##__VA_ARGS__; \
+		bool _do_rethrow##__VA_ARGS__ = false; \
+		if (sigsetjmp(_local_sigjmp_buf##__VA_ARGS__, 0) == 0) \
 		{ \
-			PG_exception_stack = &local_sigjmp_buf
+			PG_exception_stack = &_local_sigjmp_buf##__VA_ARGS__
 
-#define PG_CATCH()	\
+#define PG_CATCH(...)	\
 		} \
 		else \
 		{ \
-			PG_exception_stack = save_exception_stack; \
-			error_context_stack = save_context_stack
+			PG_exception_stack = _save_exception_stack##__VA_ARGS__; \
+			error_context_stack = _save_context_stack##__VA_ARGS__
 
-#define PG_END_TRY()  \
+#define PG_FINALLY(...) \
 		} \
-		PG_exception_stack = save_exception_stack; \
-		error_context_stack = save_context_stack; \
+		else \
+			_do_rethrow##__VA_ARGS__ = true; \
+		{ \
+			PG_exception_stack = _save_exception_stack##__VA_ARGS__; \
+			error_context_stack = _save_context_stack##__VA_ARGS__
+
+#define PG_END_TRY(...)  \
+		} \
+		if (_do_rethrow##__VA_ARGS__) \
+				PG_RE_THROW(); \
+		PG_exception_stack = _save_exception_stack##__VA_ARGS__; \
+		error_context_stack = _save_context_stack##__VA_ARGS__; \
 	} while (0)
 
-/*
- * Some compilers understand pg_attribute_noreturn(); for other compilers,
- * insert pg_unreachable() so that the compiler gets the point.
- */
-#ifdef HAVE_PG_ATTRIBUTE_NORETURN
 #define PG_RE_THROW()  \
 	pg_re_throw()
-#else
-#define PG_RE_THROW()  \
-	(pg_re_throw(), pg_unreachable())
-#endif
 
 extern PGDLLIMPORT sigjmp_buf *PG_exception_stack;
 
@@ -346,7 +440,6 @@ typedef struct ErrorData
 	int			elevel;			/* error level */
 	bool		output_to_server;	/* will report to server log? */
 	bool		output_to_client;	/* will report to client? */
-	bool		show_funcname;	/* true to force funcname inclusion */
 	bool		hide_stmt;		/* true to prevent STATEMENT: inclusion */
 	bool		hide_ctx;		/* true to prevent CONTEXT: inclusion */
 	const char *filename;		/* __FILE__ of ereport() call */
@@ -360,6 +453,7 @@ typedef struct ErrorData
 	char	   *detail_log;		/* detail error message for server log only */
 	char	   *hint;			/* hint message */
 	char	   *context;		/* context message */
+	char	   *backtrace;		/* backtrace */
 	const char *message_id;		/* primary message's id (original string) */
 	char	   *schema_name;	/* name of schema */
 	char	   *table_name;		/* name of table */
@@ -379,11 +473,12 @@ extern void EmitErrorReport(void);
 extern ErrorData *CopyErrorData(void);
 extern void FreeErrorData(ErrorData *edata);
 extern void FlushErrorState(void);
-extern void ReThrowError(ErrorData *edata) pg_attribute_noreturn();
+pg_noreturn extern void ReThrowError(ErrorData *edata);
 extern void ThrowErrorData(ErrorData *edata);
-extern void pg_re_throw(void) pg_attribute_noreturn();
+pg_noreturn extern void pg_re_throw(void);
 
 extern char *GetErrorContextStack(void);
+extern bool HaveCompleteError(void);
 
 /* Hook for intercepting messages before they are sent to the server log */
 typedef void (*emit_log_hook_type) (ErrorData *edata);
@@ -396,36 +491,49 @@ typedef enum
 {
 	PGERROR_TERSE,				/* single-line error messages */
 	PGERROR_DEFAULT,			/* recommended style */
-	PGERROR_VERBOSE				/* all the facts, ma'am */
+	PGERROR_VERBOSE,			/* all the facts, ma'am */
 }			PGErrorVerbosity;
 
-extern int	Log_error_verbosity;
-extern char *Log_line_prefix;
-extern int	Log_destination;
-extern char *Log_destination_string;
-extern bool syslog_sequence_numbers;
-extern bool syslog_split_messages;
+extern PGDLLIMPORT int Log_error_verbosity;
+extern PGDLLIMPORT char *Log_line_prefix;
+extern PGDLLIMPORT int Log_destination;
+extern PGDLLIMPORT char *Log_destination_string;
+extern PGDLLIMPORT bool syslog_sequence_numbers;
+extern PGDLLIMPORT bool syslog_split_messages;
 
 /* Log destination bitmap */
 #define LOG_DESTINATION_STDERR	 1
 #define LOG_DESTINATION_SYSLOG	 2
 #define LOG_DESTINATION_EVENTLOG 4
 #define LOG_DESTINATION_CSVLOG	 8
+#define LOG_DESTINATION_JSONLOG	16
 
 /* Other exported functions */
+extern void log_status_format(StringInfo buf, const char *format,
+							  ErrorData *edata);
 extern void DebugFileOpen(void);
 extern char *unpack_sql_state(int sql_state);
 extern bool in_error_recursion_trouble(void);
 
-#ifdef HAVE_SYSLOG
-extern void set_syslog_parameters(const char *ident, int facility);
-#endif
+/* Common functions shared across destinations */
+extern void reset_formatted_start_time(void);
+extern char *get_formatted_start_time(void);
+extern char *get_formatted_log_time(void);
+extern const char *get_backend_type_for_log(void);
+extern bool check_log_of_query(ErrorData *edata);
+extern const char *error_severity(int elevel);
+extern void write_pipe_chunks(char *data, int len, int dest);
+
+/* Destination-specific functions */
+extern void write_csvlog(ErrorData *edata);
+extern void write_jsonlog(ErrorData *edata);
 
 /*
  * Write errors to stderr (or by equal means when stderr is
  * not available). Used before ereport/elog can be used
  * safely (memory context, GUC load etc)
  */
-extern void write_stderr(const char *fmt,...) pg_attribute_printf(1, 2);
+extern void write_stderr(const char *fmt, ...) pg_attribute_printf(1, 2);
+extern void vwrite_stderr(const char *fmt, va_list ap) pg_attribute_printf(1, 0);
 
 #endif							/* ELOG_H */

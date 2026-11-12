@@ -31,10 +31,8 @@
 
 #include "postgres.h"
 
-#include "px.h"
 #include "px-crypt.h"
-
-#include "utils/backend_random.h"
+#include "px.h"
 
 static char *
 run_crypt_des(const char *psw, const char *salt,
@@ -69,6 +67,16 @@ run_crypt_bf(const char *psw, const char *salt,
 	return res;
 }
 
+static char *
+run_crypt_sha(const char *psw, const char *salt,
+			  char *buf, unsigned len)
+{
+	char	   *res;
+
+	res = px_crypt_shacrypt(psw, salt, buf, len);
+	return res;
+}
+
 struct px_crypt_algo
 {
 	char	   *id;
@@ -83,6 +91,8 @@ static const struct px_crypt_algo
 	{"$2x$", 4, run_crypt_bf},
 	{"$2$", 3, NULL},			/* N/A */
 	{"$1$", 3, run_crypt_md5},
+	{"$5$", 3, run_crypt_sha},
+	{"$6$", 3, run_crypt_sha},
 	{"_", 1, run_crypt_des},
 	{"", 0, run_crypt_des},
 	{NULL, 0, NULL}
@@ -92,6 +102,8 @@ char *
 px_crypt(const char *psw, const char *salt, char *buf, unsigned len)
 {
 	const struct px_crypt_algo *c;
+
+	CheckBuiltinCryptoMode();
 
 	for (c = px_crypt_list; c->id; c++)
 	{
@@ -127,6 +139,16 @@ static struct generator gen_list[] = {
 	{"md5", _crypt_gensalt_md5_rn, 6, 0, 0, 0},
 	{"xdes", _crypt_gensalt_extended_rn, 3, PX_XDES_ROUNDS, 1, 0xFFFFFF},
 	{"bf", _crypt_gensalt_blowfish_rn, 16, PX_BF_ROUNDS, 4, 31},
+	{
+		"sha256crypt", _crypt_gensalt_sha256_rn,
+		PX_SHACRYPT_SALT_MAX_LEN, PX_SHACRYPT_ROUNDS_DEFAULT,
+		PX_SHACRYPT_ROUNDS_MIN, PX_SHACRYPT_ROUNDS_MAX
+	},
+	{
+		"sha512crypt", _crypt_gensalt_sha512_rn,
+		PX_SHACRYPT_SALT_MAX_LEN, PX_SHACRYPT_ROUNDS_DEFAULT,
+		PX_SHACRYPT_ROUNDS_MIN, PX_SHACRYPT_ROUNDS_MAX
+	},
 	{NULL, NULL, 0, 0, 0, 0}
 };
 
@@ -136,6 +158,8 @@ px_gen_salt(const char *salt_type, char *buf, int rounds)
 	struct generator *g;
 	char	   *p;
 	char		rbuf[16];
+
+	CheckBuiltinCryptoMode();
 
 	for (g = gen_list; g->name; g++)
 		if (pg_strcasecmp(g->name, salt_type) == 0)
@@ -153,11 +177,11 @@ px_gen_salt(const char *salt_type, char *buf, int rounds)
 			return PXE_BAD_SALT_ROUNDS;
 	}
 
-	if (!pg_backend_random(rbuf, g->input_len))
+	if (!pg_strong_random(rbuf, g->input_len))
 		return PXE_NO_RANDOM;
 
 	p = g->gen(rounds, rbuf, g->input_len, buf, PX_MAX_SALT_LEN);
-	px_memset(rbuf, 0, sizeof(rbuf));
+	explicit_bzero(rbuf, sizeof(rbuf));
 
 	if (p == NULL)
 		return PXE_BAD_SALT_ROUNDS;

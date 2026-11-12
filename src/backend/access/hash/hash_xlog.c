@@ -4,7 +4,7 @@
  *	  WAL replay logic for hash index.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,15 +14,11 @@
  */
 #include "postgres.h"
 
-#include "access/heapam_xlog.h"
 #include "access/bufmask.h"
 #include "access/hash.h"
 #include "access/hash_xlog.h"
 #include "access/xlogutils.h"
-#include "access/xlog.h"
-#include "access/transam.h"
-#include "storage/procarray.h"
-#include "miscadmin.h"
+#include "storage/standby.h"
 
 /*
  * replay a hash index meta page
@@ -33,7 +29,6 @@ hash_xlog_init_meta_page(XLogReaderState *record)
 	XLogRecPtr	lsn = record->EndRecPtr;
 	Page		page;
 	Buffer		metabuf;
-	ForkNumber	forknum;
 
 	xl_hash_init_meta_page *xlrec = (xl_hash_init_meta_page *) XLogRecGetData(record);
 
@@ -42,19 +37,10 @@ hash_xlog_init_meta_page(XLogReaderState *record)
 	Assert(BufferIsValid(metabuf));
 	_hash_init_metabuffer(metabuf, xlrec->num_tuples, xlrec->procid,
 						  xlrec->ffactor, true);
-	page = (Page) BufferGetPage(metabuf);
+	page = BufferGetPage(metabuf);
 	PageSetLSN(page, lsn);
 	MarkBufferDirty(metabuf);
-
-	/*
-	 * Force the on-disk state of init forks to always be in sync with the
-	 * state in shared buffers.  See XLogReadBufferForRedoExtended.  We need
-	 * special handling for init forks as create index operations don't log a
-	 * full page image of the metapage.
-	 */
-	XLogRecGetBlockTag(record, 0, NULL, &forknum, NULL);
-	if (forknum == INIT_FORKNUM)
-		FlushOneBuffer(metabuf);
+	XLogFlushBufferForRedoIfInit(record, 0, metabuf);
 
 	/* all done */
 	UnlockReleaseBuffer(metabuf);
@@ -72,7 +58,6 @@ hash_xlog_init_bitmap_page(XLogReaderState *record)
 	Page		page;
 	HashMetaPage metap;
 	uint32		num_buckets;
-	ForkNumber	forknum;
 
 	xl_hash_init_bitmap_page *xlrec = (xl_hash_init_bitmap_page *) XLogRecGetData(record);
 
@@ -83,16 +68,7 @@ hash_xlog_init_bitmap_page(XLogReaderState *record)
 	_hash_initbitmapbuffer(bitmapbuf, xlrec->bmsize, true);
 	PageSetLSN(BufferGetPage(bitmapbuf), lsn);
 	MarkBufferDirty(bitmapbuf);
-
-	/*
-	 * Force the on-disk state of init forks to always be in sync with the
-	 * state in shared buffers.  See XLogReadBufferForRedoExtended.  We need
-	 * special handling for init forks as create index operations don't log a
-	 * full page image of the metapage.
-	 */
-	XLogRecGetBlockTag(record, 0, NULL, &forknum, NULL);
-	if (forknum == INIT_FORKNUM)
-		FlushOneBuffer(bitmapbuf);
+	XLogFlushBufferForRedoIfInit(record, 0, bitmapbuf);
 	UnlockReleaseBuffer(bitmapbuf);
 
 	/* add the new bitmap page to the metapage's list of bitmaps */
@@ -113,10 +89,7 @@ hash_xlog_init_bitmap_page(XLogReaderState *record)
 
 		PageSetLSN(page, lsn);
 		MarkBufferDirty(metabuf);
-
-		XLogRecGetBlockTag(record, 1, NULL, &forknum, NULL);
-		if (forknum == INIT_FORKNUM)
-			FlushOneBuffer(metabuf);
+		XLogFlushBufferForRedoIfInit(record, 1, metabuf);
 	}
 	if (BufferIsValid(metabuf))
 		UnlockReleaseBuffer(metabuf);
@@ -141,8 +114,7 @@ hash_xlog_insert(XLogReaderState *record)
 
 		page = BufferGetPage(buffer);
 
-		if (PageAddItem(page, (Item) datapos, datalen, xlrec->offnum,
-						false, false) == InvalidOffsetNumber)
+		if (PageAddItem(page, datapos, datalen, xlrec->offnum, false, false) == InvalidOffsetNumber)
 			elog(PANIC, "hash_xlog_insert: failed to add item");
 
 		PageSetLSN(page, lsn);
@@ -204,7 +176,7 @@ hash_xlog_add_ovfl_page(XLogReaderState *record)
 				  true);
 	/* update backlink */
 	ovflpage = BufferGetPage(ovflbuf);
-	ovflopaque = (HashPageOpaque) PageGetSpecialPointer(ovflpage);
+	ovflopaque = HashPageGetOpaque(ovflpage);
 	ovflopaque->hasho_prevblkno = leftblk;
 
 	PageSetLSN(ovflpage, lsn);
@@ -216,7 +188,7 @@ hash_xlog_add_ovfl_page(XLogReaderState *record)
 		HashPageOpaque leftopaque;
 
 		leftpage = BufferGetPage(leftbuf);
-		leftopaque = (HashPageOpaque) PageGetSpecialPointer(leftpage);
+		leftopaque = HashPageGetOpaque(leftpage);
 		leftopaque->hasho_nextblkno = rightblk;
 
 		PageSetLSN(leftpage, lsn);
@@ -239,9 +211,8 @@ hash_xlog_add_ovfl_page(XLogReaderState *record)
 
 		if (XLogReadBufferForRedo(record, 2, &mapbuffer) == BLK_NEEDS_REDO)
 		{
-			Page		mappage = (Page) BufferGetPage(mapbuffer);
+			Page		mappage = BufferGetPage(mapbuffer);
 			uint32	   *freep = NULL;
-			char	   *data;
 			uint32	   *bitmap_page_bit;
 
 			freep = HashPageGetBitmap(mappage);
@@ -320,8 +291,6 @@ hash_xlog_split_allocate_page(XLogReaderState *record)
 	Buffer		oldbuf;
 	Buffer		newbuf;
 	Buffer		metabuf;
-	Size		datalen PG_USED_FOR_ASSERTS_ONLY;
-	char	   *data;
 	XLogRedoAction action;
 
 	/*
@@ -343,7 +312,7 @@ hash_xlog_split_allocate_page(XLogReaderState *record)
 		HashPageOpaque oldopaque;
 
 		oldpage = BufferGetPage(oldbuf);
-		oldopaque = (HashPageOpaque) PageGetSpecialPointer(oldpage);
+		oldopaque = HashPageGetOpaque(oldpage);
 
 		oldopaque->hasho_flag = xlrec->old_bucket_flag;
 		oldopaque->hasho_prevblkno = xlrec->new_bucket;
@@ -353,11 +322,10 @@ hash_xlog_split_allocate_page(XLogReaderState *record)
 	}
 
 	/* replay the record for new bucket */
-	newbuf = XLogInitBufferForRedo(record, 1);
+	XLogReadBufferForRedoExtended(record, 1, RBM_ZERO_AND_CLEANUP_LOCK, true,
+								  &newbuf);
 	_hash_initbuf(newbuf, xlrec->new_bucket, xlrec->new_bucket,
 				  xlrec->new_bucket_flag, true);
-	if (!IsBufferCleanupOK(newbuf))
-		elog(PANIC, "hash_xlog_split_allocate_page: failed to acquire cleanup lock");
 	MarkBufferDirty(newbuf);
 	PageSetLSN(BufferGetPage(newbuf), lsn);
 
@@ -382,6 +350,10 @@ hash_xlog_split_allocate_page(XLogReaderState *record)
 	{
 		Page		page;
 		HashMetaPage metap;
+		Size		datalen;
+		char	   *data;
+		uint32	   *uidata;
+		int			uidatacount;
 
 		page = BufferGetPage(metabuf);
 		metap = HashPageGetMeta(page);
@@ -389,34 +361,31 @@ hash_xlog_split_allocate_page(XLogReaderState *record)
 
 		data = XLogRecGetBlockData(record, 2, &datalen);
 
+		/*
+		 * This cast is ok because XLogRecGetBlockData() returns a MAXALIGNed
+		 * buffer.
+		 */
+		uidata = (uint32 *) data;
+		uidatacount = 0;
+
 		if (xlrec->flags & XLH_SPLIT_META_UPDATE_MASKS)
 		{
-			uint32		lowmask;
-			uint32	   *highmask;
-
-			/* extract low and high masks. */
-			memcpy(&lowmask, data, sizeof(uint32));
-			highmask = (uint32 *) ((char *) data + sizeof(uint32));
+			uint32		lowmask = uidata[uidatacount++];
+			uint32		highmask = uidata[uidatacount++];
 
 			/* update metapage */
 			metap->hashm_lowmask = lowmask;
-			metap->hashm_highmask = *highmask;
-
-			data += sizeof(uint32) * 2;
+			metap->hashm_highmask = highmask;
 		}
 
 		if (xlrec->flags & XLH_SPLIT_META_UPDATE_SPLITPOINT)
 		{
-			uint32		ovflpoint;
-			uint32	   *ovflpages;
-
-			/* extract information of overflow pages. */
-			memcpy(&ovflpoint, data, sizeof(uint32));
-			ovflpages = (uint32 *) ((char *) data + sizeof(uint32));
+			uint32		ovflpoint = uidata[uidatacount++];
+			uint32		ovflpages = uidata[uidatacount++];
 
 			/* update metapage */
-			metap->hashm_spares[ovflpoint] = *ovflpages;
 			metap->hashm_ovflpoint = ovflpoint;
+			metap->hashm_spares[ovflpoint] = ovflpages;
 		}
 
 		MarkBufferDirty(metabuf);
@@ -466,7 +435,7 @@ hash_xlog_split_complete(XLogReaderState *record)
 		HashPageOpaque oldopaque;
 
 		oldpage = BufferGetPage(oldbuf);
-		oldopaque = (HashPageOpaque) PageGetSpecialPointer(oldpage);
+		oldopaque = HashPageGetOpaque(oldpage);
 
 		oldopaque->hasho_flag = xlrec->old_bucket_flag;
 
@@ -489,7 +458,7 @@ hash_xlog_split_complete(XLogReaderState *record)
 		HashPageOpaque nopaque;
 
 		newpage = BufferGetPage(newbuf);
-		nopaque = (HashPageOpaque) PageGetSpecialPointer(newpage);
+		nopaque = HashPageGetOpaque(newpage);
 
 		nopaque->hasho_flag = xlrec->new_bucket_flag;
 
@@ -544,7 +513,7 @@ hash_xlog_move_page_contents(XLogReaderState *record)
 
 		data = begin = XLogRecGetBlockData(record, 1, &datalen);
 
-		writepage = (Page) BufferGetPage(writebuf);
+		writepage = BufferGetPage(writebuf);
 
 		if (xldata->ntups > 0)
 		{
@@ -563,10 +532,9 @@ hash_xlog_move_page_contents(XLogReaderState *record)
 
 				data += itemsz;
 
-				l = PageAddItem(writepage, (Item) itup, itemsz, towrite[ninserted], false, false);
+				l = PageAddItem(writepage, itup, itemsz, towrite[ninserted], false, false);
 				if (l == InvalidOffsetNumber)
-					elog(ERROR, "hash_xlog_move_page_contents: failed to add item to hash index page, size %d bytes",
-						 (int) itemsz);
+					elog(ERROR, "hash_xlog_move_page_contents: failed to add item to hash index page, size %zu bytes", itemsz);
 
 				ninserted++;
 			}
@@ -590,7 +558,7 @@ hash_xlog_move_page_contents(XLogReaderState *record)
 
 		ptr = XLogRecGetBlockData(record, 2, &len);
 
-		page = (Page) BufferGetPage(deletebuf);
+		page = BufferGetPage(deletebuf);
 
 		if (len > 0)
 		{
@@ -598,7 +566,7 @@ hash_xlog_move_page_contents(XLogReaderState *record)
 			OffsetNumber *unend;
 
 			unused = (OffsetNumber *) ptr;
-			unend = (OffsetNumber *) ((char *) ptr + len);
+			unend = (OffsetNumber *) (ptr + len);
 
 			if ((unend - unused) > 0)
 				PageIndexMultiDelete(page, unused, unend - unused);
@@ -635,7 +603,7 @@ hash_xlog_squeeze_page(XLogReaderState *record)
 	XLogRecPtr	lsn = record->EndRecPtr;
 	xl_hash_squeeze_page *xldata = (xl_hash_squeeze_page *) XLogRecGetData(record);
 	Buffer		bucketbuf = InvalidBuffer;
-	Buffer		writebuf;
+	Buffer		writebuf = InvalidBuffer;
 	Buffer		ovflbuf;
 	Buffer		prevbuf = InvalidBuffer;
 	Buffer		mapbuf;
@@ -658,7 +626,10 @@ hash_xlog_squeeze_page(XLogReaderState *record)
 		 */
 		(void) XLogReadBufferForRedoExtended(record, 0, RBM_NORMAL, true, &bucketbuf);
 
-		action = XLogReadBufferForRedo(record, 1, &writebuf);
+		if (xldata->ntups > 0 || xldata->is_prev_bucket_same_wrt)
+			action = XLogReadBufferForRedo(record, 1, &writebuf);
+		else
+			action = BLK_NOTFOUND;
 	}
 
 	/* replay the record for adding entries in overflow buffer */
@@ -669,10 +640,11 @@ hash_xlog_squeeze_page(XLogReaderState *record)
 		char	   *data;
 		Size		datalen;
 		uint16		ninserted = 0;
+		bool		mod_wbuf = false;
 
 		data = begin = XLogRecGetBlockData(record, 1, &datalen);
 
-		writepage = (Page) BufferGetPage(writebuf);
+		writepage = BufferGetPage(writebuf);
 
 		if (xldata->ntups > 0)
 		{
@@ -691,13 +663,23 @@ hash_xlog_squeeze_page(XLogReaderState *record)
 
 				data += itemsz;
 
-				l = PageAddItem(writepage, (Item) itup, itemsz, towrite[ninserted], false, false);
+				l = PageAddItem(writepage, itup, itemsz, towrite[ninserted], false, false);
 				if (l == InvalidOffsetNumber)
-					elog(ERROR, "hash_xlog_squeeze_page: failed to add item to hash index page, size %d bytes",
-						 (int) itemsz);
+					elog(ERROR, "hash_xlog_squeeze_page: failed to add item to hash index page, size %zu bytes", itemsz);
 
 				ninserted++;
 			}
+
+			mod_wbuf = true;
+		}
+		else
+		{
+			/*
+			 * Ensure that the required flags are set when there are no
+			 * tuples.  See _hash_freeovflpage().
+			 */
+			Assert(xldata->is_prim_bucket_same_wrt ||
+				   xldata->is_prev_bucket_same_wrt);
 		}
 
 		/*
@@ -707,17 +689,22 @@ hash_xlog_squeeze_page(XLogReaderState *record)
 
 		/*
 		 * if the page on which are adding tuples is a page previous to freed
-		 * overflow page, then update its nextblno.
+		 * overflow page, then update its nextblkno.
 		 */
 		if (xldata->is_prev_bucket_same_wrt)
 		{
-			HashPageOpaque writeopaque = (HashPageOpaque) PageGetSpecialPointer(writepage);
+			HashPageOpaque writeopaque = HashPageGetOpaque(writepage);
 
 			writeopaque->hasho_nextblkno = xldata->nextblkno;
+			mod_wbuf = true;
 		}
 
-		PageSetLSN(writepage, lsn);
-		MarkBufferDirty(writebuf);
+		/* Set LSN and mark writebuf dirty iff it is modified */
+		if (mod_wbuf)
+		{
+			PageSetLSN(writepage, lsn);
+			MarkBufferDirty(writebuf);
+		}
 	}
 
 	/* replay the record for initializing overflow buffer */
@@ -730,11 +717,11 @@ hash_xlog_squeeze_page(XLogReaderState *record)
 
 		_hash_pageinit(ovflpage, BufferGetPageSize(ovflbuf));
 
-		ovflopaque = (HashPageOpaque) PageGetSpecialPointer(ovflpage);
+		ovflopaque = HashPageGetOpaque(ovflpage);
 
 		ovflopaque->hasho_prevblkno = InvalidBlockNumber;
 		ovflopaque->hasho_nextblkno = InvalidBlockNumber;
-		ovflopaque->hasho_bucket = -1;
+		ovflopaque->hasho_bucket = InvalidBucket;
 		ovflopaque->hasho_flag = LH_UNUSED_PAGE;
 		ovflopaque->hasho_page_id = HASHO_PAGE_ID;
 
@@ -749,7 +736,7 @@ hash_xlog_squeeze_page(XLogReaderState *record)
 		XLogReadBufferForRedo(record, 3, &prevbuf) == BLK_NEEDS_REDO)
 	{
 		Page		prevpage = BufferGetPage(prevbuf);
-		HashPageOpaque prevopaque = (HashPageOpaque) PageGetSpecialPointer(prevpage);
+		HashPageOpaque prevopaque = HashPageGetOpaque(prevpage);
 
 		prevopaque->hasho_nextblkno = xldata->nextblkno;
 
@@ -767,7 +754,7 @@ hash_xlog_squeeze_page(XLogReaderState *record)
 		if (XLogReadBufferForRedo(record, 4, &nextbuf) == BLK_NEEDS_REDO)
 		{
 			Page		nextpage = BufferGetPage(nextbuf);
-			HashPageOpaque nextopaque = (HashPageOpaque) PageGetSpecialPointer(nextpage);
+			HashPageOpaque nextopaque = HashPageGetOpaque(nextpage);
 
 			nextopaque->hasho_prevblkno = xldata->prevblkno;
 
@@ -793,7 +780,7 @@ hash_xlog_squeeze_page(XLogReaderState *record)
 	/* replay the record for bitmap page */
 	if (XLogReadBufferForRedo(record, 5, &mapbuf) == BLK_NEEDS_REDO)
 	{
-		Page		mappage = (Page) BufferGetPage(mapbuf);
+		Page		mappage = BufferGetPage(mapbuf);
 		uint32	   *freep = NULL;
 		char	   *data;
 		uint32	   *bitmap_page_bit;
@@ -881,7 +868,7 @@ hash_xlog_delete(XLogReaderState *record)
 
 		ptr = XLogRecGetBlockData(record, 1, &len);
 
-		page = (Page) BufferGetPage(deletebuf);
+		page = BufferGetPage(deletebuf);
 
 		if (len > 0)
 		{
@@ -889,7 +876,7 @@ hash_xlog_delete(XLogReaderState *record)
 			OffsetNumber *unend;
 
 			unused = (OffsetNumber *) ptr;
-			unend = (OffsetNumber *) ((char *) ptr + len);
+			unend = (OffsetNumber *) (ptr + len);
 
 			if ((unend - unused) > 0)
 				PageIndexMultiDelete(page, unused, unend - unused);
@@ -904,7 +891,7 @@ hash_xlog_delete(XLogReaderState *record)
 		{
 			HashPageOpaque pageopaque;
 
-			pageopaque = (HashPageOpaque) PageGetSpecialPointer(page);
+			pageopaque = HashPageGetOpaque(page);
 			pageopaque->hasho_flag &= ~LH_PAGE_HAS_DEAD_TUPLES;
 		}
 
@@ -932,9 +919,9 @@ hash_xlog_split_cleanup(XLogReaderState *record)
 	{
 		HashPageOpaque bucket_opaque;
 
-		page = (Page) BufferGetPage(buffer);
+		page = BufferGetPage(buffer);
 
-		bucket_opaque = (HashPageOpaque) PageGetSpecialPointer(page);
+		bucket_opaque = HashPageGetOpaque(page);
 		bucket_opaque->hasho_flag &= ~LH_BUCKET_NEEDS_SPLIT_CLEANUP;
 		PageSetLSN(page, lsn);
 		MarkBufferDirty(buffer);
@@ -970,155 +957,6 @@ hash_xlog_update_meta_page(XLogReaderState *record)
 }
 
 /*
- * Get the latestRemovedXid from the heap pages pointed at by the index
- * tuples being deleted. See also btree_xlog_delete_get_latestRemovedXid,
- * on which this function is based.
- */
-static TransactionId
-hash_xlog_vacuum_get_latestRemovedXid(XLogReaderState *record)
-{
-	xl_hash_vacuum_one_page *xlrec;
-	OffsetNumber *unused;
-	Buffer		ibuffer,
-				hbuffer;
-	Page		ipage,
-				hpage;
-	RelFileNode rnode;
-	BlockNumber blkno;
-	ItemId		iitemid,
-				hitemid;
-	IndexTuple	itup;
-	HeapTupleHeader htuphdr;
-	BlockNumber hblkno;
-	OffsetNumber hoffnum;
-	TransactionId latestRemovedXid = InvalidTransactionId;
-	int			i;
-
-	xlrec = (xl_hash_vacuum_one_page *) XLogRecGetData(record);
-
-	/*
-	 * If there's nothing running on the standby we don't need to derive a
-	 * full latestRemovedXid value, so use a fast path out of here.  This
-	 * returns InvalidTransactionId, and so will conflict with all HS
-	 * transactions; but since we just worked out that that's zero people,
-	 * it's OK.
-	 *
-	 * XXX There is a race condition here, which is that a new backend might
-	 * start just after we look.  If so, it cannot need to conflict, but this
-	 * coding will result in throwing a conflict anyway.
-	 */
-	if (CountDBBackends(InvalidOid) == 0)
-		return latestRemovedXid;
-
-	/*
-	 * Check if WAL replay has reached a consistent database state. If not, we
-	 * must PANIC. See the definition of
-	 * btree_xlog_delete_get_latestRemovedXid for more details.
-	 */
-	if (!reachedConsistency)
-		elog(PANIC, "hash_xlog_vacuum_get_latestRemovedXid: cannot operate with inconsistent data");
-
-	/*
-	 * Get index page.  If the DB is consistent, this should not fail, nor
-	 * should any of the heap page fetches below.  If one does, we return
-	 * InvalidTransactionId to cancel all HS transactions.  That's probably
-	 * overkill, but it's safe, and certainly better than panicking here.
-	 */
-	XLogRecGetBlockTag(record, 0, &rnode, NULL, &blkno);
-	ibuffer = XLogReadBufferExtended(rnode, MAIN_FORKNUM, blkno, RBM_NORMAL);
-
-	if (!BufferIsValid(ibuffer))
-		return InvalidTransactionId;
-	LockBuffer(ibuffer, HASH_READ);
-	ipage = (Page) BufferGetPage(ibuffer);
-
-	/*
-	 * Loop through the deleted index items to obtain the TransactionId from
-	 * the heap items they point to.
-	 */
-	unused = (OffsetNumber *) ((char *) xlrec + SizeOfHashVacuumOnePage);
-
-	for (i = 0; i < xlrec->ntuples; i++)
-	{
-		/*
-		 * Identify the index tuple about to be deleted.
-		 */
-		iitemid = PageGetItemId(ipage, unused[i]);
-		itup = (IndexTuple) PageGetItem(ipage, iitemid);
-
-		/*
-		 * Locate the heap page that the index tuple points at
-		 */
-		hblkno = ItemPointerGetBlockNumber(&(itup->t_tid));
-		hbuffer = XLogReadBufferExtended(xlrec->hnode, MAIN_FORKNUM,
-										 hblkno, RBM_NORMAL);
-
-		if (!BufferIsValid(hbuffer))
-		{
-			UnlockReleaseBuffer(ibuffer);
-			return InvalidTransactionId;
-		}
-		LockBuffer(hbuffer, HASH_READ);
-		hpage = (Page) BufferGetPage(hbuffer);
-
-		/*
-		 * Look up the heap tuple header that the index tuple points at by
-		 * using the heap node supplied with the xlrec. We can't use
-		 * heap_fetch, since it uses ReadBuffer rather than XLogReadBuffer.
-		 * Note that we are not looking at tuple data here, just headers.
-		 */
-		hoffnum = ItemPointerGetOffsetNumber(&(itup->t_tid));
-		hitemid = PageGetItemId(hpage, hoffnum);
-
-		/*
-		 * Follow any redirections until we find something useful.
-		 */
-		while (ItemIdIsRedirected(hitemid))
-		{
-			hoffnum = ItemIdGetRedirect(hitemid);
-			hitemid = PageGetItemId(hpage, hoffnum);
-			CHECK_FOR_INTERRUPTS();
-		}
-
-		/*
-		 * If the heap item has storage, then read the header and use that to
-		 * set latestRemovedXid.
-		 *
-		 * Some LP_DEAD items may not be accessible, so we ignore them.
-		 */
-		if (ItemIdHasStorage(hitemid))
-		{
-			htuphdr = (HeapTupleHeader) PageGetItem(hpage, hitemid);
-			HeapTupleHeaderAdvanceLatestRemovedXid(htuphdr, &latestRemovedXid);
-		}
-		else if (ItemIdIsDead(hitemid))
-		{
-			/*
-			 * Conjecture: if hitemid is dead then it had xids before the xids
-			 * marked on LP_NORMAL items. So we just ignore this item and move
-			 * onto the next, for the purposes of calculating
-			 * latestRemovedxids.
-			 */
-		}
-		else
-			Assert(!ItemIdIsUsed(hitemid));
-
-		UnlockReleaseBuffer(hbuffer);
-	}
-
-	UnlockReleaseBuffer(ibuffer);
-
-	/*
-	 * If all heap tuples were LP_DEAD then we will be returning
-	 * InvalidTransactionId here, which avoids conflicts. This matches
-	 * existing logic which assumes that LP_DEAD tuples must already be older
-	 * than the latestRemovedXid on the cleanup record that set them as
-	 * LP_DEAD, hence must already have generated a conflict.
-	 */
-	return latestRemovedXid;
-}
-
-/*
  * replay delete operation in hash index to remove
  * tuples marked as DEAD during index tuple insertion.
  */
@@ -1132,8 +970,10 @@ hash_xlog_vacuum_one_page(XLogReaderState *record)
 	Page		page;
 	XLogRedoAction action;
 	HashPageOpaque pageopaque;
+	OffsetNumber *toDelete;
 
 	xldata = (xl_hash_vacuum_one_page *) XLogRecGetData(record);
+	toDelete = xldata->offsets;
 
 	/*
 	 * If we have any conflict processing to do, it must happen before we
@@ -1142,41 +982,35 @@ hash_xlog_vacuum_one_page(XLogReaderState *record)
 	 * Hash index records that are marked as LP_DEAD and being removed during
 	 * hash index tuple insertion can conflict with standby queries. You might
 	 * think that vacuum records would conflict as well, but we've handled
-	 * that already.  XLOG_HEAP2_CLEANUP_INFO records provide the highest xid
-	 * cleaned by the vacuum of the heap and so we can resolve any conflicts
-	 * just once when that arrives.  After that we know that no conflicts
-	 * exist from individual hash index vacuum records on that index.
+	 * that already.  XLOG_HEAP2_PRUNE_VACUUM_SCAN records provide the highest
+	 * xid cleaned by the vacuum of the heap and so we can resolve any
+	 * conflicts just once when that arrives.  After that we know that no
+	 * conflicts exist from individual hash index vacuum records on that
+	 * index.
 	 */
 	if (InHotStandby)
 	{
-		TransactionId latestRemovedXid =
-		hash_xlog_vacuum_get_latestRemovedXid(record);
-		RelFileNode rnode;
+		RelFileLocator rlocator;
 
-		XLogRecGetBlockTag(record, 0, &rnode, NULL, NULL);
-		ResolveRecoveryConflictWithSnapshot(latestRemovedXid, rnode);
+		XLogRecGetBlockTag(record, 0, &rlocator, NULL, NULL);
+		ResolveRecoveryConflictWithSnapshot(xldata->snapshotConflictHorizon,
+											xldata->isCatalogRel,
+											rlocator);
 	}
 
 	action = XLogReadBufferForRedoExtended(record, 0, RBM_NORMAL, true, &buffer);
 
 	if (action == BLK_NEEDS_REDO)
 	{
-		page = (Page) BufferGetPage(buffer);
+		page = BufferGetPage(buffer);
 
-		if (XLogRecGetDataLen(record) > SizeOfHashVacuumOnePage)
-		{
-			OffsetNumber *unused;
-
-			unused = (OffsetNumber *) ((char *) xldata + SizeOfHashVacuumOnePage);
-
-			PageIndexMultiDelete(page, unused, xldata->ntuples);
-		}
+		PageIndexMultiDelete(page, toDelete, xldata->ntuples);
 
 		/*
 		 * Mark the page as not containing any LP_DEAD items. See comments in
 		 * _hash_vacuum_one_page() for details.
 		 */
-		pageopaque = (HashPageOpaque) PageGetSpecialPointer(page);
+		pageopaque = HashPageGetOpaque(page);
 		pageopaque->hasho_flag &= ~LH_PAGE_HAS_DEAD_TUPLES;
 
 		PageSetLSN(page, lsn);
@@ -1268,7 +1102,7 @@ hash_mask(char *pagedata, BlockNumber blkno)
 	mask_page_hint_bits(page);
 	mask_unused_space(page);
 
-	opaque = (HashPageOpaque) PageGetSpecialPointer(page);
+	opaque = HashPageGetOpaque(page);
 
 	pagetype = opaque->hasho_flag & LH_PAGE_TYPE;
 	if (pagetype == LH_UNUSED_PAGE)

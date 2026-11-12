@@ -21,7 +21,7 @@ PostgreSQL documentation
 
  <refsynopsisdiv>
 <synopsis>
-CREATE AGGREGATE <replaceable class="parameter">name</replaceable> ( [ <replaceable class="parameter">argmode</replaceable> ] [ <replaceable class="parameter">argname</replaceable> ] <replaceable class="parameter">arg_data_type</replaceable> [ , ... ] ) (
+CREATE [ OR REPLACE ] AGGREGATE <replaceable class="parameter">name</replaceable> ( [ <replaceable class="parameter">argmode</replaceable> ] [ <replaceable class="parameter">argname</replaceable> ] <replaceable class="parameter">arg_data_type</replaceable> [ , ... ] ) (
     SFUNC = <replaceable class="parameter">sfunc</replaceable>,
     STYPE = <replaceable class="parameter">state_data_type</replaceable>
     [ , SSPACE = <replaceable class="parameter">state_data_size</replaceable> ]
@@ -41,10 +41,11 @@ CREATE AGGREGATE <replaceable class="parameter">name</replaceable> ( [ <replacea
     [ , MFINALFUNC_MODIFY = { READ_ONLY | SHAREABLE | READ_WRITE } ]
     [ , MINITCOND = <replaceable class="parameter">minitial_condition</replaceable> ]
     [ , SORTOP = <replaceable class="parameter">sort_operator</replaceable> ]
+    [ , SUPPORT = <replaceable class="parameter">support_function</replaceable> ]
     [ , PARALLEL = { SAFE | RESTRICTED | UNSAFE } ]
 )
 
-CREATE AGGREGATE <replaceable class="parameter">name</replaceable> ( [ [ <replaceable class="parameter">argmode</replaceable> ] [ <replaceable class="parameter">argname</replaceable> ] <replaceable class="parameter">arg_data_type</replaceable> [ , ... ] ]
+CREATE [ OR REPLACE ] AGGREGATE <replaceable class="parameter">name</replaceable> ( [ [ <replaceable class="parameter">argmode</replaceable> ] [ <replaceable class="parameter">argname</replaceable> ] <replaceable class="parameter">arg_data_type</replaceable> [ , ... ] ]
                         ORDER BY [ <replaceable class="parameter">argmode</replaceable> ] [ <replaceable class="parameter">argname</replaceable> ] <replaceable class="parameter">arg_data_type</replaceable> [ , ... ] ) (
     SFUNC = <replaceable class="parameter">sfunc</replaceable>,
     STYPE = <replaceable class="parameter">state_data_type</replaceable>
@@ -53,13 +54,14 @@ CREATE AGGREGATE <replaceable class="parameter">name</replaceable> ( [ [ <replac
     [ , FINALFUNC_EXTRA ]
     [ , FINALFUNC_MODIFY = { READ_ONLY | SHAREABLE | READ_WRITE } ]
     [ , INITCOND = <replaceable class="parameter">initial_condition</replaceable> ]
+    [ , SUPPORT = <replaceable class="parameter">support_function</replaceable> ]
     [ , PARALLEL = { SAFE | RESTRICTED | UNSAFE } ]
     [ , HYPOTHETICAL ]
 )
 
 <phrase>or the old syntax</phrase>
 
-CREATE AGGREGATE <replaceable class="parameter">name</replaceable> (
+CREATE [ OR REPLACE ] AGGREGATE <replaceable class="parameter">name</replaceable> (
     BASETYPE = <replaceable class="parameter">base_type</replaceable>,
     SFUNC = <replaceable class="parameter">sfunc</replaceable>,
     STYPE = <replaceable class="parameter">state_data_type</replaceable>
@@ -80,6 +82,7 @@ CREATE AGGREGATE <replaceable class="parameter">name</replaceable> (
     [ , MFINALFUNC_MODIFY = { READ_ONLY | SHAREABLE | READ_WRITE } ]
     [ , MINITCOND = <replaceable class="parameter">minitial_condition</replaceable> ]
     [ , SORTOP = <replaceable class="parameter">sort_operator</replaceable> ]
+    [ , SUPPORT = <replaceable class="parameter">support_function</replaceable> ]
 )
 </synopsis>
  </refsynopsisdiv>
@@ -88,12 +91,21 @@ CREATE AGGREGATE <replaceable class="parameter">name</replaceable> (
   <title>Description</title>
 
   <para>
-   <command>CREATE AGGREGATE</command> defines a new aggregate
-   function. Some basic and commonly-used aggregate functions are
-   included with the distribution; they are documented in <xref
-   linkend="functions-aggregate"/>. If one defines new types or needs
-   an aggregate function not already provided, then <command>CREATE
-   AGGREGATE</command> can be used to provide the desired features.
+   <command>CREATE AGGREGATE</command> defines a new aggregate function.
+   <command>CREATE OR REPLACE AGGREGATE</command> will either define a new
+   aggregate function or replace an existing definition. Some basic and
+   commonly-used aggregate functions are included with the distribution; they
+   are documented in <xref linkend="functions-aggregate"/>. If one defines new
+   types or needs an aggregate function not already provided, then
+   <command>CREATE AGGREGATE</command> can be used to provide the desired
+   features.
+  </para>
+
+  <para>
+   When replacing an existing definition, the argument types, result type,
+   and number of direct arguments may not be changed. Also, the new definition
+   must be of the same kind (ordinary aggregate, ordered-set aggregate, or
+   hypothetical-set aggregate) as the old one.
   </para>
 
   <para>
@@ -202,7 +214,7 @@ CREATE AGGREGATE <replaceable class="parameter">name</replaceable> (
    as described in <xref linkend="xaggr-moving-aggregates"/>.  This requires
    specifying the <literal>MSFUNC</literal>, <literal>MINVFUNC</literal>,
    and <literal>MSTYPE</literal> parameters, and optionally
-   the <literal>MSPACE</literal>, <literal>MFINALFUNC</literal>,
+   the <literal>MSSPACE</literal>, <literal>MFINALFUNC</literal>,
    <literal>MFINALFUNC_EXTRA</literal>, <literal>MFINALFUNC_MODIFY</literal>,
    and <literal>MINITCOND</literal> parameters.  Except for <literal>MINVFUNC</literal>,
    these parameters work like the corresponding simple-aggregate parameters
@@ -375,12 +387,13 @@ SELECT col FROM tab ORDER BY col USING sortop LIMIT 1;
      <para>
       The approximate average size (in bytes) of the aggregate's state value.
       If this parameter is omitted or is zero, a default estimate is used
-      based on the <replaceable>state_data_type</replaceable>.
+      based on the <replaceable>state_data_type</replaceable>. If set to a
+      negative value, it indicates the state data can grow unboundedly in
+      size, such as when the aggregate accumulates input rows (e.g.,
+      array_agg, string_agg).
       The planner uses this value to estimate the memory required for a
-      grouped aggregate query.  The planner will consider using hash
-      aggregation for such a query only if the hash table is estimated to fit
-      in <xref linkend="guc-work-mem"/>; therefore, large values of this
-      parameter discourage use of hash aggregation.
+      grouped aggregate query and to avoid optimizations that may cause
+      excessive memory usage.
      </para>
     </listitem>
    </varlistentry>
@@ -425,8 +438,8 @@ SELECT col FROM tab ORDER BY col USING sortop LIMIT 1;
       This option specifies whether the final function is a pure function
       that does not modify its arguments.  <literal>READ_ONLY</literal> indicates
       it does not; the other two values indicate that it may change the
-      transition state value.  See <xref linkend="sql-createaggregate-notes"
-      endterm="sql-createaggregate-notes-title"/> below for more detail.  The
+      transition state value.  See <xref linkend="sql-createaggregate-notes"/>
+      below for more detail.  The
       default is <literal>READ_ONLY</literal>, except for ordered-set aggregates,
       for which the default is <literal>READ_WRITE</literal>.
      </para>
@@ -562,7 +575,8 @@ SELECT col FROM tab ORDER BY col USING sortop LIMIT 1;
      <para>
       The approximate average size (in bytes) of the aggregate's state
       value, when using moving-aggregate mode.  This works the same as
-      <replaceable>state_data_size</replaceable>.
+      <replaceable>state_data_size</replaceable>, except that negative
+      values are not used to indicate unbounded state size.
      </para>
     </listitem>
    </varlistentry>
@@ -618,12 +632,24 @@ SELECT col FROM tab ORDER BY col USING sortop LIMIT 1;
    </varlistentry>
 
    <varlistentry>
+    <term><replaceable class="parameter">support_function</replaceable></term>
+    <listitem>
+     <para>
+      The name (optionally schema-qualified) of a <firstterm>planner support
+      function</firstterm> to use for this aggregate.  See
+      <xref linkend="xfunc-optimization"/> for details.
+      You must be superuser to use this option.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
     <term><literal>PARALLEL =</literal> { <literal>SAFE</literal> | <literal>RESTRICTED</literal> | <literal>UNSAFE</literal> }</term>
     <listitem>
      <para>
       The meanings of <literal>PARALLEL SAFE</literal>, <literal>PARALLEL
       RESTRICTED</literal>, and <literal>PARALLEL UNSAFE</literal> are the same as
-      in <xref linkend="sql-createfunction"/>.  An aggregate will not be
+      in <link linkend="sql-createfunction"><command>CREATE FUNCTION</command></link>.  An aggregate will not be
       considered for parallelization if it is marked <literal>PARALLEL
       UNSAFE</literal> (which is the default!) or <literal>PARALLEL RESTRICTED</literal>.
       Note that the parallel-safety markings of the aggregate's support
@@ -655,8 +681,8 @@ SELECT col FROM tab ORDER BY col USING sortop LIMIT 1;
   </para>
  </refsect1>
 
- <refsect1 id="sql-createaggregate-notes">
-  <title id="sql-createaggregate-notes-title">Notes</title>
+ <refsect1 id="sql-createaggregate-notes" xreflabel="Notes">
+  <title>Notes</title>
 
    <para>
     In parameters that specify support function names, you can write

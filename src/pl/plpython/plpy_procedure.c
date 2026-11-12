@@ -6,44 +6,55 @@
 
 #include "postgres.h"
 
-#include "access/htup_details.h"
-#include "access/transam.h"
-#include "funcapi.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "commands/event_trigger.h"
+#include "commands/trigger.h"
+#include "funcapi.h"
+#include "plpy_elog.h"
+#include "plpy_exec.h"
+#include "plpy_main.h"
+#include "plpy_procedure.h"
+#include "plpy_util.h"
 #include "utils/builtins.h"
+#include "utils/funccache.h"
 #include "utils/hsearch.h"
-#include "utils/inval.h"
-#include "utils/lsyscache.h"
-#include "utils/memutils.h"
 #include "utils/syscache.h"
 
-#include "plpython.h"
-
-#include "plpy_procedure.h"
-
-#include "plpy_elog.h"
-#include "plpy_main.h"
-
-
-static HTAB *PLy_procedure_cache = NULL;
-
-static PLyProcedure *PLy_procedure_create(HeapTuple procTup, Oid fn_oid, bool is_trigger);
-static bool PLy_procedure_valid(PLyProcedure *proc, HeapTuple procTup);
-static char *PLy_procedure_munge_source(const char *name, const char *src);
-
-
-void
-init_procedure_caches(void)
+/*
+ * SD dictionaries, one per function (and per relation, for DML triggers).
+ * funccache.c may build several PLyProcedures for one function, for example
+ * one per input collation, and they must all see the same SD.
+ */
+typedef struct PLyStaticsKey
 {
-	HASHCTL		hash_ctl;
+	Oid			fn_oid;			/* function OID */
+	Oid			fn_rel;			/* triggered-on relation or InvalidOid */
+} PLyStaticsKey;
 
-	memset(&hash_ctl, 0, sizeof(hash_ctl));
-	hash_ctl.keysize = sizeof(PLyProcedureKey);
-	hash_ctl.entrysize = sizeof(PLyProcedureEntry);
-	PLy_procedure_cache = hash_create("PL/Python procedures", 32, &hash_ctl,
-									  HASH_ELEM | HASH_BLOBS);
-}
+typedef struct PLyStaticsEntry
+{
+	PLyStaticsKey key;			/* hash key, must be first */
+	PyObject   *statics;		/* the SD dictionary */
+} PLyStaticsEntry;
+
+static HTAB *PLy_statics_hash = NULL;
+
+static void PLy_procedure_create(PLyProcedure *proc,
+								 HeapTuple procTup,
+								 Oid fn_oid,
+								 Oid fn_rel,
+								 PLyTrigType is_trigger);
+static PyObject *PLy_procedure_get_statics(Oid fn_oid, Oid fn_rel);
+static char *PLy_procedure_munge_source(const char *name, const char *src);
+static void PLy_compile_callback(FunctionCallInfo fcinfo,
+								 HeapTuple procTup,
+								 const CachedFunctionHashKey *hashkey,
+								 CachedFunction *cfunc,
+								 bool forValidator);
+static void PLy_delete_callback(CachedFunction *cfunc);
+static void RemovePLyProcedureCache(void *arg);
+
 
 /*
  * PLy_procedure_name: get the name of the specified procedure.
@@ -59,87 +70,108 @@ PLy_procedure_name(PLyProcedure *proc)
 }
 
 /*
- * PLy_procedure_get: returns a cached PLyProcedure, or creates, stores and
- * returns a new PLyProcedure.
+ * PLy_procedure_get: returns a PLyProcedureCache struct for the function,
+ * making it valid if necessary.
  *
- * fn_oid is the OID of the function requested
- * fn_rel is InvalidOid or the relation this function triggers on
- * is_trigger denotes whether the function is a trigger function
+ * The PLyProcedureCache contains a pointer to the long-lived PLyProcedure
+ * (managed by funccache.c) and execution-specific state like SRF state.
  *
- * The reason that both fn_rel and is_trigger need to be passed is that when
- * trigger functions get validated we don't know which relation(s) they'll
- * be used with, so no sensible fn_rel can be passed.
+ * For SRFs, if we are resuming execution (srfstate->iter != NULL), we skip
+ * revalidation and continue using the same PLyProcedure to ensure consistent
+ * behavior throughout the SRF execution.
  */
-PLyProcedure *
-PLy_procedure_get(Oid fn_oid, Oid fn_rel, bool is_trigger)
+PLyProcedureCache *
+PLy_procedure_get(FunctionCallInfo fcinfo, bool forValidator)
 {
-	bool		use_cache = !(is_trigger && fn_rel == InvalidOid);
-	HeapTuple	procTup;
-	PLyProcedureKey key;
-	PLyProcedureEntry *volatile entry = NULL;
-	PLyProcedure *volatile proc = NULL;
-	bool		found = false;
-
-	procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn_oid));
-	if (!HeapTupleIsValid(procTup))
-		elog(ERROR, "cache lookup failed for function %u", fn_oid);
+	FmgrInfo   *finfo = fcinfo->flinfo;
+	PLyProcedureCache *pcache;
+	PLyProcedure *proc;
 
 	/*
-	 * Look for the function in the cache, unless we don't have the necessary
-	 * information (e.g. during validation). In that case we just don't cache
-	 * anything.
+	 * If this is the first execution for this FmgrInfo, set up a cache struct
+	 * (initially containing null pointers).  The cache must live as long as
+	 * the FmgrInfo, so it goes in fn_mcxt.  Also set up a memory context
+	 * callback that will be invoked when fn_mcxt is reset/deleted.
 	 */
-	if (use_cache)
+	pcache = finfo->fn_extra;
+	if (pcache == NULL)
 	{
-		key.fn_oid = fn_oid;
-		key.fn_rel = fn_rel;
-		entry = hash_search(PLy_procedure_cache, &key, HASH_ENTER, &found);
-		proc = entry->proc;
+		pcache = (PLyProcedureCache *)
+			MemoryContextAllocZero(finfo->fn_mcxt, sizeof(PLyProcedureCache));
+
+		pcache->fcontext = finfo->fn_mcxt;
+		pcache->mcb.func = RemovePLyProcedureCache;
+		pcache->mcb.arg = pcache;
+
+		MemoryContextRegisterResetCallback(finfo->fn_mcxt, &pcache->mcb);
+
+		finfo->fn_extra = pcache;
 	}
 
-	PG_TRY();
+	/*
+	 * If we are resuming execution of a set-returning function, just keep
+	 * using the same cache.  We do not ask funccache.c to re-validate the
+	 * PLyProcedure: we want to run to completion using the function's initial
+	 * definition.
+	 *
+	 * A live iterator (srfstate->iter != NULL) reliably means a genuine
+	 * resume: when an iteration ends for any reason, srfstate->iter is reset
+	 * to NULL (see comments for PLy_function_cleanup_srfstate).
+	 */
+	if (pcache->srfstate != NULL && pcache->srfstate->iter != NULL)
 	{
-		if (!found)
+		Assert(pcache->proc != NULL);
+		return pcache;
+	}
+
+	/*
+	 * Look up, or re-validate, the long-lived hash entry.  Like SQL-language
+	 * functions, make the hash key depend on the result of
+	 * get_call_result_type() when that's composite, so that we can safely
+	 * assume that we'll build a new hash entry if the composite rowtype
+	 * changes.
+	 */
+	proc = (PLyProcedure *)
+		cached_function_compile(fcinfo,
+								(CachedFunction *) pcache->proc,
+								PLy_compile_callback,
+								PLy_delete_callback,
+								sizeof(PLyProcedure),
+								true,
+								forValidator);
+
+	/*
+	 * Install the hash pointer in the PLyProcedureCache, and increment its
+	 * use count to reflect that.  If cached_function_compile gave us back a
+	 * different hash entry than we were using before, we must decrement that
+	 * one's use count.
+	 */
+	if (proc != pcache->proc)
+	{
+		if (pcache->proc != NULL)
 		{
-			/* Haven't found it, create a new procedure */
-			proc = PLy_procedure_create(procTup, fn_oid, is_trigger);
-			if (use_cache)
-				entry->proc = proc;
+			Assert(pcache->proc->cfunc.use_count > 0);
+			pcache->proc->cfunc.use_count--;
 		}
-		else if (!PLy_procedure_valid(proc, procTup))
-		{
-			/* Found it, but it's invalid, free and reuse the cache entry */
-			entry->proc = NULL;
-			if (proc)
-				PLy_procedure_delete(proc);
-			proc = PLy_procedure_create(procTup, fn_oid, is_trigger);
-			entry->proc = proc;
-		}
-		/* Found it and it's valid, it's fine to use it */
+		pcache->proc = proc;
+		proc->cfunc.use_count++;
 	}
-	PG_CATCH();
-	{
-		/* Do not leave an uninitialized entry in the cache */
-		if (use_cache)
-			hash_search(PLy_procedure_cache, &key, HASH_REMOVE, NULL);
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
 
-	ReleaseSysCache(procTup);
-
-	return proc;
+	return pcache;
 }
 
 /*
- * Create a new PLyProcedure structure
+ * Create (well, fill in) a new PLyProcedure structure
  */
-static PLyProcedure *
-PLy_procedure_create(HeapTuple procTup, Oid fn_oid, bool is_trigger)
+static void
+PLy_procedure_create(PLyProcedure *proc,
+					 HeapTuple procTup,
+					 Oid fn_oid,
+					 Oid fn_rel,
+					 PLyTrigType is_trigger)
 {
 	char		procName[NAMEDATALEN + 256];
 	Form_pg_proc procStruct;
-	PLyProcedure *volatile proc;
 	MemoryContext cxt;
 	MemoryContext oldcxt;
 	int			rv;
@@ -169,7 +201,6 @@ PLy_procedure_create(HeapTuple procTup, Oid fn_oid, bool is_trigger)
 
 	oldcxt = MemoryContextSwitchTo(cxt);
 
-	proc = (PLyProcedure *) palloc0(sizeof(PLyProcedure));
 	proc->mcxt = cxt;
 
 	PG_TRY();
@@ -183,11 +214,10 @@ PLy_procedure_create(HeapTuple procTup, Oid fn_oid, bool is_trigger)
 		proc->proname = pstrdup(NameStr(procStruct->proname));
 		MemoryContextSetIdentifier(cxt, proc->proname);
 		proc->pyname = pstrdup(procName);
-		proc->fn_xmin = HeapTupleHeaderGetRawXmin(procTup->t_data);
-		proc->fn_tid = procTup->t_self;
 		proc->fn_readonly = (procStruct->provolatile != PROVOLATILE_VOLATILE);
 		proc->is_setof = procStruct->proretset;
 		proc->is_procedure = (procStruct->prokind == PROKIND_PROCEDURE);
+		proc->is_trigger = is_trigger;
 		proc->src = NULL;
 		proc->argnames = NULL;
 		proc->args = NULL;
@@ -207,39 +237,19 @@ PLy_procedure_create(HeapTuple procTup, Oid fn_oid, bool is_trigger)
 		 * get information required for output conversion of the return value,
 		 * but only if this isn't a trigger.
 		 */
-		if (!is_trigger)
+		if (is_trigger == PLPY_NOT_TRIGGER)
 		{
 			Oid			rettype = procStruct->prorettype;
-			HeapTuple	rvTypeTup;
-			Form_pg_type rvTypeStruct;
 
-			rvTypeTup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(rettype));
-			if (!HeapTupleIsValid(rvTypeTup))
-				elog(ERROR, "cache lookup failed for type %u", rettype);
-			rvTypeStruct = (Form_pg_type) GETSTRUCT(rvTypeTup);
-
-			/* Disallow pseudotype result, except for void or record */
-			if (rvTypeStruct->typtype == TYPTYPE_PSEUDO)
-			{
-				if (rettype == VOIDOID ||
-					rettype == RECORDOID)
-					 /* okay */ ;
-				else if (rettype == TRIGGEROID || rettype == EVTTRIGGEROID)
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("trigger functions can only be called as triggers")));
-				else
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("PL/Python functions cannot return type %s",
-									format_type_be(rettype))));
-			}
+			/* reject if function is in fact a trigger function */
+			if (rettype == TRIGGEROID || rettype == EVENT_TRIGGEROID)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("trigger functions can only be called as triggers")));
 
 			/* set up output function for procedure result */
 			PLy_output_setup_func(&proc->result, proc->mcxt,
 								  rettype, -1, proc);
-
-			ReleaseSysCache(rvTypeTup);
 		}
 		else
 		{
@@ -284,33 +294,17 @@ PLy_procedure_create(HeapTuple procTup, Oid fn_oid, bool is_trigger)
 			}
 
 			/* Allocate arrays for per-input-argument data */
-			proc->argnames = (char **) palloc0(sizeof(char *) * proc->nargs);
-			proc->args = (PLyDatumToOb *) palloc0(sizeof(PLyDatumToOb) * proc->nargs);
+			proc->argnames = palloc0_array(char *, proc->nargs);
+			proc->args = palloc0_array(PLyDatumToOb, proc->nargs);
 
 			for (i = pos = 0; i < total; i++)
 			{
-				HeapTuple	argTypeTup;
-				Form_pg_type argTypeStruct;
-
 				if (modes &&
 					(modes[i] == PROARGMODE_OUT ||
 					 modes[i] == PROARGMODE_TABLE))
 					continue;	/* skip OUT arguments */
 
 				Assert(types[i] == procStruct->proargtypes.values[pos]);
-
-				argTypeTup = SearchSysCache1(TYPEOID,
-											 ObjectIdGetDatum(types[i]));
-				if (!HeapTupleIsValid(argTypeTup))
-					elog(ERROR, "cache lookup failed for type %u", types[i]);
-				argTypeStruct = (Form_pg_type) GETSTRUCT(argTypeTup);
-
-				/* disallow pseudotype arguments */
-				if (argTypeStruct->typtype == TYPTYPE_PSEUDO)
-					ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("PL/Python functions cannot accept type %s",
-									format_type_be(types[i]))));
 
 				/* set up I/O function info */
 				PLy_input_setup_func(&proc->args[pos], proc->mcxt,
@@ -320,8 +314,6 @@ PLy_procedure_create(HeapTuple procTup, Oid fn_oid, bool is_trigger)
 				/* get argument name */
 				proc->argnames[pos] = names ? pstrdup(names[i]) : NULL;
 
-				ReleaseSysCache(argTypeTup);
-
 				pos++;
 			}
 		}
@@ -329,11 +321,12 @@ PLy_procedure_create(HeapTuple procTup, Oid fn_oid, bool is_trigger)
 		/*
 		 * get the text of the function.
 		 */
-		prosrcdatum = SysCacheGetAttr(PROCOID, procTup,
-									  Anum_pg_proc_prosrc, &isnull);
-		if (isnull)
-			elog(ERROR, "null prosrc");
+		prosrcdatum = SysCacheGetAttrNotNull(PROCOID, procTup,
+											 Anum_pg_proc_prosrc);
 		procSource = TextDatumGetCString(prosrcdatum);
+
+		/* SD is shared with other PLyProcedures of the function */
+		proc->statics = PLy_procedure_get_statics(fn_oid, fn_rel);
 
 		PLy_procedure_compile(proc, procSource);
 
@@ -348,7 +341,6 @@ PLy_procedure_create(HeapTuple procTup, Oid fn_oid, bool is_trigger)
 	PG_END_TRY();
 
 	MemoryContextSwitchTo(oldcxt);
-	return proc;
 }
 
 /*
@@ -359,16 +351,15 @@ PLy_procedure_compile(PLyProcedure *proc, const char *src)
 {
 	PyObject   *crv = NULL;
 	char	   *msrc;
+	PyObject   *code0;
 
 	proc->globals = PyDict_Copy(PLy_interp_globals);
 
 	/*
 	 * SD is private preserved data between calls. GD is global data shared by
-	 * all functions
+	 * all functions.  The caller supplies SD.
 	 */
-	proc->statics = PyDict_New();
-	if (!proc->statics)
-		PLy_elog(ERROR, NULL);
+	Assert(proc->statics != NULL);
 	PyDict_SetItemString(proc->globals, "SD", proc->statics);
 
 	/*
@@ -377,7 +368,9 @@ PLy_procedure_compile(PLyProcedure *proc, const char *src)
 	msrc = PLy_procedure_munge_source(proc->pyname, src);
 	/* Save the mangled source for later inclusion in tracebacks */
 	proc->src = MemoryContextStrdup(proc->mcxt, msrc);
-	crv = PyRun_String(msrc, Py_file_input, proc->globals, NULL);
+	code0 = Py_CompileString(msrc, "<string>", Py_file_input);
+	if (code0)
+		crv = PyEval_EvalCode(code0, proc->globals, NULL);
 	pfree(msrc);
 
 	if (crv != NULL)
@@ -412,23 +405,6 @@ PLy_procedure_delete(PLyProcedure *proc)
 	Py_XDECREF(proc->statics);
 	Py_XDECREF(proc->globals);
 	MemoryContextDelete(proc->mcxt);
-}
-
-/*
- * Decide whether a cached PLyProcedure struct is still valid
- */
-static bool
-PLy_procedure_valid(PLyProcedure *proc, HeapTuple procTup)
-{
-	if (proc == NULL)
-		return false;
-
-	/* If the pg_proc tuple has changed, it's not valid */
-	if (!(proc->fn_xmin == HeapTupleHeaderGetRawXmin(procTup->t_data) &&
-		  ItemPointerEquals(&proc->fn_tid, &procTup->t_self)))
-		return false;
-
-	return true;
 }
 
 static char *
@@ -471,7 +447,136 @@ PLy_procedure_munge_source(const char *name, const char *src)
 	*mp = '\0';
 
 	if (mp > (mrc + mlen))
-		elog(FATAL, "buffer overrun in PLy_munge_source");
+		elog(FATAL, "buffer overrun in PLy_procedure_munge_source");
 
 	return mrc;
+}
+
+/*
+ * Compile callback for funccache.c.
+ *
+ * cached_function_compile() calls this when it needs to (re)compile the
+ * long-lived PLyProcedure for a function.  The CachedFunction handed to us is
+ * pre-zeroed workspace of size sizeof(PLyProcedure); we just have to fill in
+ * the PL/Python-specific fields.
+ */
+static void
+PLy_compile_callback(FunctionCallInfo fcinfo,
+					 HeapTuple procTup,
+					 const CachedFunctionHashKey *hashkey,
+					 CachedFunction *cfunc,
+					 bool forValidator)
+{
+	PLyProcedure *proc = (PLyProcedure *) cfunc;
+	Oid			fn_oid = fcinfo->flinfo->fn_oid;
+	Oid			fn_rel = InvalidOid;
+	PLyTrigType is_trigger;
+
+	/*
+	 * Derive the trigger type from the call context, matching what
+	 * plpython3_call_handler dispatches on.  DML triggers get one SD per
+	 * relation.  The validator has no relation.
+	 */
+	if (CALLED_AS_TRIGGER(fcinfo))
+	{
+		is_trigger = PLPY_TRIGGER;
+		if (!forValidator)
+			fn_rel = RelationGetRelid(((TriggerData *) fcinfo->context)->tg_relation);
+	}
+	else if (CALLED_AS_EVENT_TRIGGER(fcinfo))
+		is_trigger = PLPY_EVENT_TRIGGER;
+	else
+		is_trigger = PLPY_NOT_TRIGGER;
+
+	PLy_procedure_create(proc, procTup, fn_oid, fn_rel, is_trigger);
+}
+
+/*
+ * Get the SD dictionary of a function, as a new reference.
+ */
+static PyObject *
+PLy_procedure_get_statics(Oid fn_oid, Oid fn_rel)
+{
+	PLyStaticsKey key;
+	PLyStaticsEntry *entry;
+	bool		found;
+
+	if (PLy_statics_hash == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(PLyStaticsKey);
+		ctl.entrysize = sizeof(PLyStaticsEntry);
+		PLy_statics_hash = hash_create("PL/Python SD dictionaries", 32,
+									   &ctl, HASH_ELEM | HASH_BLOBS);
+	}
+
+	key.fn_oid = fn_oid;
+	key.fn_rel = fn_rel;
+	entry = hash_search(PLy_statics_hash, &key, HASH_ENTER, &found);
+	if (!found)
+		entry->statics = NULL;
+
+	/* A failed PyDict_New leaves the entry empty, so retry it here */
+	if (entry->statics == NULL)
+	{
+		entry->statics = PyDict_New();
+		if (entry->statics == NULL)
+			PLy_elog(ERROR, NULL);
+	}
+
+	Py_INCREF(entry->statics);
+	return entry->statics;
+}
+
+/*
+ * Deletion callback for funccache.c.
+ *
+ * cached_function_compile() calls this when it discards a cache entry, which
+ * only happens once the entry's use count has dropped to zero.  We must free
+ * the subsidiary data but not the CachedFunction struct itself.
+ */
+static void
+PLy_delete_callback(CachedFunction *cfunc)
+{
+	PLyProcedure *proc = (PLyProcedure *) cfunc;
+
+	Assert(proc->cfunc.use_count == 0);
+	Assert(proc->calldepth == 0);
+
+	PLy_procedure_delete(proc);
+}
+
+/*
+ * MemoryContext callback function
+ *
+ * We register this in the memory context that contains a PLyProcedureCache
+ * struct (that is, the FmgrInfo's fn_mcxt).  When the memory context is reset
+ * or deleted, we release the reference count (if any) that the cache holds on
+ * the long-lived hash entry.  Note that this will happen even during error
+ * aborts.
+ *
+ * This is also our opportunity to release the Python references held by an
+ * interrupted set-returning function.  ShutdownPLyFunction() handles that for
+ * routine in-query cancellation cases, but it does not run during an error
+ * abort; this callback does, so it is the backstop that prevents leaking the
+ * SRF's iterator and saved arguments when a query errors out mid-iteration.
+ */
+static void
+RemovePLyProcedureCache(void *arg)
+{
+	PLyProcedureCache *pcache = (PLyProcedureCache *) arg;
+
+	/* Release any Python state left behind by an interrupted SRF */
+	PLy_function_cleanup_srfstate(pcache);
+
+	/* Release reference count on PLyProcedure */
+	if (pcache->proc != NULL)
+	{
+		Assert(pcache->proc->cfunc.use_count > 0);
+		pcache->proc->cfunc.use_count--;
+		pcache->proc = NULL;
+	}
+
+	/* We needn't free the pcache object itself, context cleanup does that */
 }

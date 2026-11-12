@@ -1,5 +1,5 @@
 /*
- * brin_tuples.c
+ * brin_tuple.c
  *		Method implementations for tuples in BRIN indexes.
  *
  * Intended usage is that code outside this file only deals with
@@ -23,7 +23,7 @@
  * Note the size of the null bitmask may not be the same as that of the
  * datum array.
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -31,17 +31,28 @@
  */
 #include "postgres.h"
 
-#include "access/htup_details.h"
 #include "access/brin_tuple.h"
+#include "access/detoast.h"
+#include "access/heaptoast.h"
+#include "access/htup_details.h"
+#include "access/toast_compression.h"
+#include "access/toast_internals.h"
 #include "access/tupdesc.h"
 #include "access/tupmacs.h"
 #include "utils/datum.h"
 #include "utils/memutils.h"
 
 
+/*
+ * This enables de-toasting of index entries.  Needed until VACUUM is
+ * smart enough to rebuild indexes from scratch.
+ */
+#define TOAST_INDEX_HACK
+
+
 static inline void brin_deconstruct_tuple(BrinDesc *brdesc,
-					   char *tp, bits8 *nullbits, bool nulls,
-					   Datum *values, bool *allnulls, bool *hasnulls);
+										  char *tp, uint8 *nullbits, bool nulls,
+										  Datum *values, bool *allnulls, bool *hasnulls);
 
 
 /*
@@ -62,7 +73,7 @@ brtuple_disk_tupdesc(BrinDesc *brdesc)
 		/* make sure it's in the bdesc's context */
 		oldcxt = MemoryContextSwitchTo(brdesc->bd_context);
 
-		tupdesc = CreateTemplateTupleDesc(brdesc->bd_totalstored, false);
+		tupdesc = CreateTemplateTupleDesc(brdesc->bd_totalstored);
 
 		for (i = 0; i < brdesc->bd_tupdesc->natts; i++)
 		{
@@ -74,6 +85,7 @@ brtuple_disk_tupdesc(BrinDesc *brdesc)
 
 		MemoryContextSwitchTo(oldcxt);
 
+		TupleDescFinalize(tupdesc);
 		brdesc->bd_disktdesc = tupdesc;
 	}
 
@@ -96,17 +108,26 @@ brin_form_tuple(BrinDesc *brdesc, BlockNumber blkno, BrinMemTuple *tuple,
 	int			keyno;
 	int			idxattno;
 	uint16		phony_infomask = 0;
-	bits8	   *phony_nullbitmap;
+	uint8	   *phony_nullbitmap;
 	Size		len,
 				hoff,
 				data_len;
+	int			i;
+
+#ifdef TOAST_INDEX_HACK
+	Datum	   *untoasted_values;
+	int			nuntoasted = 0;
+#endif
 
 	Assert(brdesc->bd_totalstored > 0);
 
-	values = (Datum *) palloc(sizeof(Datum) * brdesc->bd_totalstored);
-	nulls = (bool *) palloc0(sizeof(bool) * brdesc->bd_totalstored);
-	phony_nullbitmap = (bits8 *)
-		palloc(sizeof(bits8) * BITMAPLEN(brdesc->bd_totalstored));
+	values = palloc_array(Datum, brdesc->bd_totalstored);
+	nulls = palloc0_array(bool, brdesc->bd_totalstored);
+	phony_nullbitmap = palloc_array(uint8, BITMAPLEN(brdesc->bd_totalstored));
+
+#ifdef TOAST_INDEX_HACK
+	untoasted_values = palloc_array(Datum, brdesc->bd_totalstored);
+#endif
 
 	/*
 	 * Set up the values/nulls arrays for heap_fill_tuple
@@ -139,10 +160,108 @@ brin_form_tuple(BrinDesc *brdesc, BlockNumber blkno, BrinMemTuple *tuple,
 		if (tuple->bt_columns[keyno].bv_hasnulls)
 			anynulls = true;
 
+		/* If needed, serialize the values before forming the on-disk tuple. */
+		if (tuple->bt_columns[keyno].bv_serialize)
+		{
+			tuple->bt_columns[keyno].bv_serialize(brdesc,
+												  tuple->bt_columns[keyno].bv_mem_value,
+												  tuple->bt_columns[keyno].bv_values);
+		}
+
+		/*
+		 * Now obtain the values of each stored datum.  Note that some values
+		 * might be toasted, and we cannot rely on the original heap values
+		 * sticking around forever, so we must detoast them.  Also try to
+		 * compress them.
+		 */
 		for (datumno = 0;
 			 datumno < brdesc->bd_info[keyno]->oi_nstored;
 			 datumno++)
-			values[idxattno++] = tuple->bt_columns[keyno].bv_values[datumno];
+		{
+			Datum		value = tuple->bt_columns[keyno].bv_values[datumno];
+
+#ifdef TOAST_INDEX_HACK
+
+			/* We must look at the stored type, not at the index descriptor. */
+			TypeCacheEntry *atttype = brdesc->bd_info[keyno]->oi_typcache[datumno];
+
+			/* Do we need to free the value at the end? */
+			bool		free_value = false;
+
+			/* For non-varlena types we don't need to do anything special */
+			if (atttype->typlen != -1)
+			{
+				values[idxattno++] = value;
+				continue;
+			}
+
+			/*
+			 * Do nothing if value is not of varlena type. We don't need to
+			 * care about NULL values here, thanks to bv_allnulls above.
+			 *
+			 * If value is stored EXTERNAL, must fetch it so we are not
+			 * depending on outside storage.
+			 *
+			 * XXX Is this actually true? Could it be that the summary is NULL
+			 * even for range with non-NULL data? E.g. degenerate bloom filter
+			 * may be thrown away, etc.
+			 */
+			if (VARATT_IS_EXTERNAL(DatumGetPointer(value)))
+			{
+				value = PointerGetDatum(detoast_external_attr((varlena *)
+															  DatumGetPointer(value)));
+				free_value = true;
+			}
+
+			/*
+			 * If value is above size target, and is of a compressible
+			 * datatype, try to compress it in-line.
+			 */
+			if (!VARATT_IS_EXTENDED(DatumGetPointer(value)) &&
+				VARSIZE(DatumGetPointer(value)) > TOAST_INDEX_TARGET &&
+				(atttype->typstorage == TYPSTORAGE_EXTENDED ||
+				 atttype->typstorage == TYPSTORAGE_MAIN))
+			{
+				Datum		cvalue;
+				char		compression;
+				Form_pg_attribute att = TupleDescAttr(brdesc->bd_tupdesc,
+													  keyno);
+
+				/*
+				 * If the BRIN summary and indexed attribute use the same data
+				 * type and it has a valid compression method, we can use the
+				 * same compression method. Otherwise we have to use the
+				 * default method.
+				 */
+				if (att->atttypid == atttype->type_id)
+					compression = att->attcompression;
+				else
+					compression = InvalidCompressionMethod;
+
+				cvalue = toast_compress_datum(value, compression);
+
+				if (DatumGetPointer(cvalue) != NULL)
+				{
+					/* successful compression */
+					if (free_value)
+						pfree(DatumGetPointer(value));
+
+					value = cvalue;
+					free_value = true;
+				}
+			}
+
+			/*
+			 * If we untoasted / compressed the value, we need to free it
+			 * after forming the index tuple.
+			 */
+			if (free_value)
+				untoasted_values[nuntoasted++] = value;
+
+#endif
+
+			values[idxattno++] = value;
+		}
 	}
 
 	/* Assert we did not overrun temp arrays */
@@ -163,7 +282,7 @@ brin_form_tuple(BrinDesc *brdesc, BlockNumber blkno, BrinMemTuple *tuple,
 	len = hoff = MAXALIGN(len);
 
 	data_len = heap_compute_data_size(brtuple_disk_tupdesc(brdesc),
-									  values, nulls);
+									  values, nulls, false);
 	len += data_len;
 
 	len = MAXALIGN(len);
@@ -194,12 +313,17 @@ brin_form_tuple(BrinDesc *brdesc, BlockNumber blkno, BrinMemTuple *tuple,
 	pfree(nulls);
 	pfree(phony_nullbitmap);
 
+#ifdef TOAST_INDEX_HACK
+	for (i = 0; i < nuntoasted; i++)
+		pfree(DatumGetPointer(untoasted_values[i]));
+#endif
+
 	/*
 	 * Now fill in the real null bitmasks.  allnulls first.
 	 */
 	if (anynulls)
 	{
-		bits8	   *bitP;
+		uint8	   *bitP;
 		int			bitmask;
 
 		rettuple->bt_info |= BRIN_NULLS_MASK;
@@ -207,9 +331,9 @@ brin_form_tuple(BrinDesc *brdesc, BlockNumber blkno, BrinMemTuple *tuple,
 		/*
 		 * Note that we reverse the sense of null bits in this module: we
 		 * store a 1 for a null attribute rather than a 0.  So we must reverse
-		 * the sense of the att_isnull test in br_deconstruct_tuple as well.
+		 * the sense of the att_isnull test in brin_deconstruct_tuple as well.
 		 */
-		bitP = ((bits8 *) ((char *) rettuple + SizeOfBrinTuple)) - 1;
+		bitP = ((uint8 *) ((char *) rettuple + SizeOfBrinTuple)) - 1;
 		bitmask = HIGHBIT;
 		for (keyno = 0; keyno < brdesc->bd_tupdesc->natts; keyno++)
 		{
@@ -244,11 +368,13 @@ brin_form_tuple(BrinDesc *brdesc, BlockNumber blkno, BrinMemTuple *tuple,
 
 			*bitP |= bitmask;
 		}
-		bitP = ((bits8 *) (rettuple + SizeOfBrinTuple)) - 1;
 	}
 
 	if (tuple->bt_placeholder)
 		rettuple->bt_info |= BRIN_PLACEHOLDER_MASK;
+
+	if (tuple->bt_empty_range)
+		rettuple->bt_info |= BRIN_EMPTY_RANGE_MASK;
 
 	*size = len;
 	return rettuple;
@@ -266,7 +392,7 @@ brin_form_placeholder_tuple(BrinDesc *brdesc, BlockNumber blkno, Size *size)
 	Size		hoff;
 	BrinTuple  *rettuple;
 	int			keyno;
-	bits8	   *bitP;
+	uint8	   *bitP;
 	int			bitmask;
 
 	/* compute total space needed: always add nulls */
@@ -277,9 +403,9 @@ brin_form_placeholder_tuple(BrinDesc *brdesc, BlockNumber blkno, Size *size)
 	rettuple = palloc0(len);
 	rettuple->bt_blkno = blkno;
 	rettuple->bt_info = hoff;
-	rettuple->bt_info |= BRIN_NULLS_MASK | BRIN_PLACEHOLDER_MASK;
+	rettuple->bt_info |= BRIN_NULLS_MASK | BRIN_PLACEHOLDER_MASK | BRIN_EMPTY_RANGE_MASK;
 
-	bitP = ((bits8 *) ((char *) rettuple + SizeOfBrinTuple)) - 1;
+	bitP = ((uint8 *) ((char *) rettuple + SizeOfBrinTuple)) - 1;
 	bitmask = HIGHBIT;
 	/* set allnulls true for all attributes */
 	for (keyno = 0; keyno < brdesc->bd_tupdesc->natts; keyno++)
@@ -363,9 +489,11 @@ brin_new_memtuple(BrinDesc *brdesc)
 						sizeof(BrinValues) * brdesc->bd_tupdesc->natts);
 	dtup = palloc0(basesize + sizeof(Datum) * brdesc->bd_totalstored);
 
-	dtup->bt_values = palloc(sizeof(Datum) * brdesc->bd_totalstored);
-	dtup->bt_allnulls = palloc(sizeof(bool) * brdesc->bd_tupdesc->natts);
-	dtup->bt_hasnulls = palloc(sizeof(bool) * brdesc->bd_tupdesc->natts);
+	dtup->bt_values = palloc_array(Datum, brdesc->bd_totalstored);
+	dtup->bt_allnulls = palloc_array(bool, brdesc->bd_tupdesc->natts);
+	dtup->bt_hasnulls = palloc_array(bool, brdesc->bd_tupdesc->natts);
+
+	dtup->bt_empty_range = true;
 
 	dtup->bt_context = AllocSetContextCreate(CurrentMemoryContext,
 											 "brin dtuple",
@@ -393,15 +521,19 @@ brin_memtuple_initialize(BrinMemTuple *dtuple, BrinDesc *brdesc)
 				 sizeof(BrinValues) * brdesc->bd_tupdesc->natts);
 	for (i = 0; i < brdesc->bd_tupdesc->natts; i++)
 	{
-		dtuple->bt_columns[i].bv_allnulls = true;
-		dtuple->bt_columns[i].bv_hasnulls = false;
-
 		dtuple->bt_columns[i].bv_attno = i + 1;
 		dtuple->bt_columns[i].bv_allnulls = true;
 		dtuple->bt_columns[i].bv_hasnulls = false;
 		dtuple->bt_columns[i].bv_values = (Datum *) currdatum;
+
+		dtuple->bt_columns[i].bv_mem_value = PointerGetDatum(NULL);
+		dtuple->bt_columns[i].bv_serialize = NULL;
+		dtuple->bt_columns[i].bv_context = dtuple->bt_context;
+
 		currdatum += sizeof(Datum) * brdesc->bd_info[i]->oi_nstored;
 	}
+
+	dtuple->bt_empty_range = true;
 
 	return dtuple;
 }
@@ -426,7 +558,7 @@ brin_deform_tuple(BrinDesc *brdesc, BrinTuple *tuple, BrinMemTuple *dMemtuple)
 	bool	   *allnulls;
 	bool	   *hasnulls;
 	char	   *tp;
-	bits8	   *nullbits;
+	uint8	   *nullbits;
 	int			keyno;
 	int			valueno;
 	MemoryContext oldcxt;
@@ -436,6 +568,11 @@ brin_deform_tuple(BrinDesc *brdesc, BrinTuple *tuple, BrinMemTuple *dMemtuple)
 
 	if (BrinTupleIsPlaceholder(tuple))
 		dtup->bt_placeholder = true;
+
+	/* ranges start as empty, depends on the BrinTuple */
+	if (!BrinTupleIsEmptyRange(tuple))
+		dtup->bt_empty_range = false;
+
 	dtup->bt_blkno = tuple->bt_blkno;
 
 	values = dtup->bt_values;
@@ -445,7 +582,7 @@ brin_deform_tuple(BrinDesc *brdesc, BrinTuple *tuple, BrinMemTuple *dMemtuple)
 	tp = (char *) tuple + BrinTupleDataOffset(tuple);
 
 	if (BrinTupleHasNulls(tuple))
-		nullbits = (bits8 *) ((char *) tuple + SizeOfBrinTuple);
+		nullbits = (uint8 *) ((char *) tuple + SizeOfBrinTuple);
 	else
 		nullbits = NULL;
 	brin_deconstruct_tuple(brdesc,
@@ -479,6 +616,10 @@ brin_deform_tuple(BrinDesc *brdesc, BrinTuple *tuple, BrinMemTuple *dMemtuple)
 
 		dtup->bt_columns[keyno].bv_hasnulls = hasnulls[keyno];
 		dtup->bt_columns[keyno].bv_allnulls = false;
+
+		dtup->bt_columns[keyno].bv_mem_value = PointerGetDatum(NULL);
+		dtup->bt_columns[keyno].bv_serialize = NULL;
+		dtup->bt_columns[keyno].bv_context = dtup->bt_context;
 	}
 
 	MemoryContextSwitchTo(oldcxt);
@@ -503,7 +644,7 @@ brin_deform_tuple(BrinDesc *brdesc, BrinTuple *tuple, BrinMemTuple *dMemtuple)
  */
 static inline void
 brin_deconstruct_tuple(BrinDesc *brdesc,
-					   char *tp, bits8 *nullbits, bool nulls,
+					   char *tp, uint8 *nullbits, bool nulls,
 					   Datum *values, bool *allnulls, bool *hasnulls)
 {
 	int			attnum;
@@ -559,17 +700,19 @@ brin_deconstruct_tuple(BrinDesc *brdesc,
 			 datumno < brdesc->bd_info[attnum]->oi_nstored;
 			 datumno++)
 		{
-			Form_pg_attribute thisatt = TupleDescAttr(diskdsc, stored);
+			CompactAttribute *thisatt = TupleDescCompactAttr(diskdsc, stored);
 
 			if (thisatt->attlen == -1)
 			{
-				off = att_align_pointer(off, thisatt->attalign, -1,
-										tp + off);
+				off = att_pointer_alignby(off,
+										  thisatt->attalignby,
+										  -1,
+										  tp + off);
 			}
 			else
 			{
-				/* not varlena, so safe to use att_align_nominal */
-				off = att_align_nominal(off, thisatt->attalign);
+				/* not varlena, so safe to use att_nominal_alignby */
+				off = att_nominal_alignby(off, thisatt->attalignby);
 			}
 
 			values[stored++] = fetchatt(thisatt, tp + off);

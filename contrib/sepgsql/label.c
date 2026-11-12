@@ -4,7 +4,7 @@
  *
  * Routines to support SELinux labels (security context)
  *
- * Copyright (c) 2010-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *
  * -------------------------------------------------------------------------
  */
@@ -12,32 +12,28 @@
 
 #include <selinux/label.h>
 
-#include "access/heapam.h"
-#include "access/htup_details.h"
 #include "access/genam.h"
+#include "access/htup_details.h"
+#include "access/table.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
-#include "catalog/indexing.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
-#include "commands/dbcommands.h"
 #include "commands/seclabel.h"
 #include "libpq/auth.h"
 #include "libpq/libpq-be.h"
 #include "miscadmin.h"
+#include "sepgsql.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
-#include "utils/tqual.h"
-
-#include "sepgsql.h"
 
 /*
  * Saved hook entries (if stacked)
@@ -70,7 +66,7 @@ typedef struct
 {
 	SubTransactionId subid;
 	char	   *label;
-}			pending_label;
+} pending_label;
 
 /*
  * sepgsql_get_client_label
@@ -122,7 +118,7 @@ sepgsql_set_client_label(const char *new_label)
 		tcontext = client_label_peer;
 	else
 	{
-		if (security_check_context_raw((security_context_t) new_label) < 0)
+		if (security_check_context_raw(new_label) < 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_NAME),
 					 errmsg("SELinux: invalid security label: \"%s\"",
@@ -149,7 +145,7 @@ sepgsql_set_client_label(const char *new_label)
 	 */
 	oldcxt = MemoryContextSwitchTo(CurTransactionContext);
 
-	plabel = palloc0(sizeof(pending_label));
+	plabel = palloc0_object(pending_label);
 	plabel->subid = GetCurrentSubTransactionId();
 	if (new_label)
 		plabel->label = pstrdup(new_label);
@@ -208,23 +204,16 @@ sepgsql_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						 SubTransactionId parentSubid, void *arg)
 {
 	ListCell   *cell;
-	ListCell   *prev;
-	ListCell   *next;
 
 	if (event == SUBXACT_EVENT_ABORT_SUB)
 	{
-		prev = NULL;
-		for (cell = list_head(client_label_pending); cell; cell = next)
+		foreach(cell, client_label_pending)
 		{
 			pending_label *plabel = lfirst(cell);
 
-			next = lnext(cell);
-
 			if (plabel->subid == mySubid)
 				client_label_pending
-					= list_delete_cell(client_label_pending, cell, prev);
-			else
-				prev = cell;
+					= foreach_delete_current(client_label_pending, cell);
 		}
 	}
 }
@@ -364,7 +353,7 @@ sepgsql_fmgr_hook(FmgrHookEventType event,
 					sepgsql_avc_check_perms(&object,
 											SEPG_CLASS_DB_PROCEDURE,
 											SEPG_DB_PROCEDURE__ENTRYPOINT,
-											getObjectDescription(&object),
+											getObjectDescription(&object, false),
 											true);
 
 					sepgsql_avc_check_perms_label(stack->new_label,
@@ -462,9 +451,9 @@ sepgsql_get_label(Oid classId, Oid objectId, int32 subId)
 	object.objectSubId = subId;
 
 	label = GetSecurityLabel(&object, SEPGSQL_LABEL_TAG);
-	if (!label || security_check_context_raw((security_context_t) label))
+	if (!label || security_check_context_raw(label))
 	{
-		security_context_t unlabeled;
+		char	   *unlabeled;
 
 		if (security_get_initial_context_raw("unlabeled", &unlabeled) < 0)
 			ereport(ERROR,
@@ -474,14 +463,11 @@ sepgsql_get_label(Oid classId, Oid objectId, int32 subId)
 		{
 			label = pstrdup(unlabeled);
 		}
-		PG_CATCH();
+		PG_FINALLY();
 		{
 			freecon(unlabeled);
-			PG_RE_THROW();
 		}
 		PG_END_TRY();
-
-		freecon(unlabeled);
 	}
 	return label;
 }
@@ -499,7 +485,7 @@ sepgsql_object_relabel(const ObjectAddress *object, const char *seclabel)
 	 * context of selinux.
 	 */
 	if (seclabel &&
-		security_check_context_raw((security_context_t) seclabel) < 0)
+		security_check_context_raw(seclabel) < 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_NAME),
 				 errmsg("SELinux: invalid security label: \"%s\"", seclabel)));
@@ -535,7 +521,7 @@ sepgsql_object_relabel(const ObjectAddress *object, const char *seclabel)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("sepgsql provider does not support labels on %s",
-							getObjectTypeDescription(object))));
+							getObjectTypeDescription(object, false))));
 			break;
 	}
 }
@@ -609,13 +595,11 @@ sepgsql_mcstrans_in(PG_FUNCTION_ARGS)
 	{
 		result = pstrdup(raw_label);
 	}
-	PG_CATCH();
+	PG_FINALLY();
 	{
 		freecon(raw_label);
-		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	freecon(raw_label);
 
 	PG_RETURN_TEXT_P(cstring_to_text(result));
 }
@@ -649,59 +633,36 @@ sepgsql_mcstrans_out(PG_FUNCTION_ARGS)
 	{
 		result = pstrdup(qual_label);
 	}
-	PG_CATCH();
+	PG_FINALLY();
 	{
 		freecon(qual_label);
-		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	freecon(qual_label);
 
 	PG_RETURN_TEXT_P(cstring_to_text(result));
 }
 
 /*
- * quote_object_names
+ * quote_object_name
  *
- * It tries to quote the supplied identifiers
+ * Concatenate as many of the given strings as aren't NULL, with dots between.
+ * Quote any of the strings that wouldn't be valid identifiers otherwise.
  */
 static char *
 quote_object_name(const char *src1, const char *src2,
 				  const char *src3, const char *src4)
 {
 	StringInfoData result;
-	const char *temp;
 
 	initStringInfo(&result);
-
 	if (src1)
-	{
-		temp = quote_identifier(src1);
-		appendStringInfo(&result, "%s", temp);
-		if (src1 != temp)
-			pfree((void *) temp);
-	}
+		appendStringInfoString(&result, quote_identifier(src1));
 	if (src2)
-	{
-		temp = quote_identifier(src2);
-		appendStringInfo(&result, ".%s", temp);
-		if (src2 != temp)
-			pfree((void *) temp);
-	}
+		appendStringInfo(&result, ".%s", quote_identifier(src2));
 	if (src3)
-	{
-		temp = quote_identifier(src3);
-		appendStringInfo(&result, ".%s", temp);
-		if (src3 != temp)
-			pfree((void *) temp);
-	}
+		appendStringInfo(&result, ".%s", quote_identifier(src3));
 	if (src4)
-	{
-		temp = quote_identifier(src4);
-		appendStringInfo(&result, ".%s", temp);
-		if (src4 != temp)
-			pfree((void *) temp);
-	}
+		appendStringInfo(&result, ".%s", quote_identifier(src4));
 	return result.data;
 }
 
@@ -727,7 +688,7 @@ exec_object_restorecon(struct selabel_handle *sehnd, Oid catalogId)
 	 * Open the target catalog. We don't want to allow writable accesses by
 	 * other session during initial labeling.
 	 */
-	rel = heap_open(catalogId, AccessShareLock);
+	rel = table_open(catalogId, AccessShareLock);
 
 	sscan = systable_beginscan(rel, InvalidOid, false,
 							   NULL, 0, NULL);
@@ -741,7 +702,7 @@ exec_object_restorecon(struct selabel_handle *sehnd, Oid catalogId)
 		char	   *objname;
 		int			objtype = 1234;
 		ObjectAddress object;
-		security_context_t context;
+		char	   *context;
 
 		/*
 		 * The way to determine object name depends on object classes. So, any
@@ -758,7 +719,7 @@ exec_object_restorecon(struct selabel_handle *sehnd, Oid catalogId)
 											NULL, NULL, NULL);
 
 				object.classId = DatabaseRelationId;
-				object.objectId = HeapTupleGetOid(tuple);
+				object.objectId = datForm->oid;
 				object.objectSubId = 0;
 				break;
 
@@ -772,7 +733,7 @@ exec_object_restorecon(struct selabel_handle *sehnd, Oid catalogId)
 											NULL, NULL);
 
 				object.classId = NamespaceRelationId;
-				object.objectId = HeapTupleGetOid(tuple);
+				object.objectId = nspForm->oid;
 				object.objectSubId = 0;
 				break;
 
@@ -797,7 +758,7 @@ exec_object_restorecon(struct selabel_handle *sehnd, Oid catalogId)
 				pfree(namespace_name);
 
 				object.classId = RelationRelationId;
-				object.objectId = HeapTupleGetOid(tuple);
+				object.objectId = relForm->oid;
 				object.objectSubId = 0;
 				break;
 
@@ -838,7 +799,7 @@ exec_object_restorecon(struct selabel_handle *sehnd, Oid catalogId)
 				pfree(namespace_name);
 
 				object.classId = ProcedureRelationId;
-				object.objectId = HeapTupleGetOid(tuple);
+				object.objectId = proForm->oid;
 				object.objectSubId = 0;
 				break;
 
@@ -860,13 +821,11 @@ exec_object_restorecon(struct selabel_handle *sehnd, Oid catalogId)
 
 				SetSecurityLabel(&object, SEPGSQL_LABEL_TAG, context);
 			}
-			PG_CATCH();
+			PG_FINALLY();
 			{
 				freecon(context);
-				PG_RE_THROW();
 			}
 			PG_END_TRY();
-			freecon(context);
 		}
 		else if (errno == ENOENT)
 			ereport(WARNING,
@@ -881,7 +840,7 @@ exec_object_restorecon(struct selabel_handle *sehnd, Oid catalogId)
 	}
 	systable_endscan(sscan);
 
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 }
 
 /*
@@ -946,14 +905,11 @@ sepgsql_restorecon(PG_FUNCTION_ARGS)
 		exec_object_restorecon(sehnd, AttributeRelationId);
 		exec_object_restorecon(sehnd, ProcedureRelationId);
 	}
-	PG_CATCH();
+	PG_FINALLY();
 	{
 		selabel_close(sehnd);
-		PG_RE_THROW();
 	}
 	PG_END_TRY();
-
-	selabel_close(sehnd);
 
 	PG_RETURN_BOOL(true);
 }

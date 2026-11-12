@@ -3,7 +3,7 @@
  * pg_subscription.c
  *		replication subscriptions
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,34 +14,72 @@
 
 #include "postgres.h"
 
-#include "miscadmin.h"
-
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
-#include "access/xact.h"
-
+#include "access/tableam.h"
 #include "catalog/indexing.h"
-#include "catalog/pg_type.h"
+#include "catalog/pg_foreign_server.h"
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_subscription_rel.h"
-
-#include "nodes/makefuncs.h"
-
+#include "catalog/pg_type.h"
+#include "foreign/foreign.h"
+#include "miscadmin.h"
 #include "storage/lmgr.h"
-
+#include "storage/lock.h"
+#include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
-
 static List *textarray_to_stringlist(ArrayType *textarray);
 
 /*
+ * Add a comma-separated list of publication names to the 'dest' string.
+ *
+ * If quote_literal is true, the returned list can be used to construct an SQL
+ * command, thus no translation is applied.  Otherwise, the string can be used
+ * to create a user-facing message, so translatable quote marks are added.
+ */
+void
+GetPublicationsStr(List *publications, StringInfo dest, bool quote_literal)
+{
+	ListCell   *lc;
+	bool		first = true;
+
+	Assert(publications != NIL);
+
+	foreach(lc, publications)
+	{
+		char	   *pubname = strVal(lfirst(lc));
+
+		if (quote_literal)
+		{
+			if (!first)
+				appendStringInfoString(dest, ", ");
+			appendStringInfoString(dest, quote_literal_cstr(pubname));
+		}
+		else
+		{
+			if (first)
+				appendStringInfo(dest, _("\"%s\""), pubname);
+			else
+				appendStringInfo(dest, _(", \"%s\""), pubname);
+		}
+
+		first = false;
+	}
+}
+
+/*
  * Fetch the subscription from the syscache.
+ *
+ * Callers that need conninfo must call SubscriptionConninfo().
  */
 Subscription *
 GetSubscription(Oid subid, bool missing_ok)
@@ -51,6 +89,8 @@ GetSubscription(Oid subid, bool missing_ok)
 	Form_pg_subscription subform;
 	Datum		datum;
 	bool		isnull;
+	MemoryContext cxt;
+	MemoryContext oldcxt;
 
 	tup = SearchSysCache1(SUBSCRIPTIONOID, ObjectIdGetDatum(subid));
 
@@ -62,22 +102,37 @@ GetSubscription(Oid subid, bool missing_ok)
 		elog(ERROR, "cache lookup failed for subscription %u", subid);
 	}
 
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "subscription",
+								ALLOCSET_SMALL_SIZES);
+	oldcxt = MemoryContextSwitchTo(cxt);
+
 	subform = (Form_pg_subscription) GETSTRUCT(tup);
 
-	sub = (Subscription *) palloc(sizeof(Subscription));
+	/*
+	 * It's only safe to access subscriptions from another database from the
+	 * launcher process, which does not call GetSubscription().
+	 */
+	Assert(subform->subdbid == MyDatabaseId);
+
+	sub = palloc0_object(Subscription);
+	sub->cxt = cxt;
 	sub->oid = subid;
 	sub->dbid = subform->subdbid;
+	sub->skiplsn = subform->subskiplsn;
 	sub->name = pstrdup(NameStr(subform->subname));
 	sub->owner = subform->subowner;
 	sub->enabled = subform->subenabled;
-
-	/* Get conninfo */
-	datum = SysCacheGetAttr(SUBSCRIPTIONOID,
-							tup,
-							Anum_pg_subscription_subconninfo,
-							&isnull);
-	Assert(!isnull);
-	sub->conninfo = TextDatumGetCString(datum);
+	sub->binary = subform->subbinary;
+	sub->stream = subform->substream;
+	sub->twophasestate = subform->subtwophasestate;
+	sub->disableonerr = subform->subdisableonerr;
+	sub->passwordrequired = subform->subpasswordrequired;
+	sub->runasowner = subform->subrunasowner;
+	sub->failover = subform->subfailover;
+	sub->retaindeadtuples = subform->subretaindeadtuples;
+	sub->maxretention = subform->submaxretention;
+	sub->retentionactive = subform->subretentionactive;
+	sub->conflictlogrelid = subform->subconflictlogrelid;
 
 	/* Get slotname */
 	datum = SysCacheGetAttr(SUBSCRIPTIONOID,
@@ -90,24 +145,99 @@ GetSubscription(Oid subid, bool missing_ok)
 		sub->slotname = NULL;
 
 	/* Get synccommit */
-	datum = SysCacheGetAttr(SUBSCRIPTIONOID,
-							tup,
-							Anum_pg_subscription_subsynccommit,
-							&isnull);
-	Assert(!isnull);
+	datum = SysCacheGetAttrNotNull(SUBSCRIPTIONOID,
+								   tup,
+								   Anum_pg_subscription_subsynccommit);
 	sub->synccommit = TextDatumGetCString(datum);
 
+	/* Get walrcvtimeout */
+	datum = SysCacheGetAttrNotNull(SUBSCRIPTIONOID,
+								   tup,
+								   Anum_pg_subscription_subwalrcvtimeout);
+	sub->walrcvtimeout = TextDatumGetCString(datum);
+
 	/* Get publications */
-	datum = SysCacheGetAttr(SUBSCRIPTIONOID,
-							tup,
-							Anum_pg_subscription_subpublications,
-							&isnull);
-	Assert(!isnull);
+	datum = SysCacheGetAttrNotNull(SUBSCRIPTIONOID,
+								   tup,
+								   Anum_pg_subscription_subpublications);
 	sub->publications = textarray_to_stringlist(DatumGetArrayTypeP(datum));
+
+	/* Get origin */
+	datum = SysCacheGetAttrNotNull(SUBSCRIPTIONOID,
+								   tup,
+								   Anum_pg_subscription_suborigin);
+	sub->origin = TextDatumGetCString(datum);
+
+	/* Get conflict log destination */
+	datum = SysCacheGetAttrNotNull(SUBSCRIPTIONOID,
+								   tup,
+								   Anum_pg_subscription_subconflictlogdest);
+	sub->conflictlogdest = TextDatumGetCString(datum);
+
+	/* Is the subscription owner a superuser? */
+	sub->ownersuperuser = superuser_arg(sub->owner);
 
 	ReleaseSysCache(tup);
 
+	MemoryContextSwitchTo(oldcxt);
+
 	return sub;
+}
+
+/*
+ * Generate the connection string for a subscription.
+ *
+ * This is deliberately separate from GetSubscription() because resolving
+ * conninfo for a server-based subscription has its own error paths (foreign
+ * server USAGE, user mapping, ForeignServerConnectionString()).  Keeping it
+ * separate lets a caller load the subscription and decide whether a
+ * connection is actually needed, and check things such as whether the
+ * subscription is enabled, before risking those errors.  Callers that never
+ * connect thus never hit them, which matters during restore.
+ */
+char *
+SubscriptionConninfo(Subscription *sub)
+{
+	HeapTuple	tup;
+	Form_pg_subscription subform;
+	Datum		datum;
+	char	   *conninfo;
+
+	tup = SearchSysCache1(SUBSCRIPTIONOID, ObjectIdGetDatum(sub->oid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for subscription %u", sub->oid);
+
+	subform = (Form_pg_subscription) GETSTRUCT(tup);
+
+	if (OidIsValid(subform->subserver))
+	{
+		ForeignServer *server;
+		AclResult	aclresult;
+
+		server = GetForeignServer(subform->subserver);
+
+		aclresult = object_aclcheck(ForeignServerRelationId,
+									subform->subserver,
+									sub->owner, ACL_USAGE);
+		if (aclresult != ACLCHECK_OK)
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("subscription owner \"%s\" does not have permission on foreign server \"%s\"",
+							GetUserNameFromId(sub->owner, false),
+							server->servername)));
+
+		conninfo = ForeignServerConnectionString(sub->owner, server);
+	}
+	else
+	{
+		datum = SysCacheGetAttrNotNull(SUBSCRIPTIONOID, tup,
+									   Anum_pg_subscription_subconninfo);
+		conninfo = TextDatumGetCString(datum);
+	}
+
+	ReleaseSysCache(tup);
+
+	return conninfo;
 }
 
 /*
@@ -123,7 +253,7 @@ CountDBSubscriptions(Oid dbid)
 	SysScanDesc scan;
 	HeapTuple	tup;
 
-	rel = heap_open(SubscriptionRelationId, RowExclusiveLock);
+	rel = table_open(SubscriptionRelationId, RowExclusiveLock);
 
 	ScanKeyInit(&scankey,
 				Anum_pg_subscription_subdbid,
@@ -138,73 +268,51 @@ CountDBSubscriptions(Oid dbid)
 
 	systable_endscan(scan);
 
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 
 	return nsubs;
 }
 
 /*
- * Free memory allocated by subscription struct.
+ * Disable the given subscription.
  */
 void
-FreeSubscription(Subscription *sub)
+DisableSubscription(Oid subid)
 {
-	pfree(sub->name);
-	pfree(sub->conninfo);
-	if (sub->slotname)
-		pfree(sub->slotname);
-	list_free_deep(sub->publications);
-	pfree(sub);
-}
-
-/*
- * get_subscription_oid - given a subscription name, look up the OID
- *
- * If missing_ok is false, throw an error if name not found.  If true, just
- * return InvalidOid.
- */
-Oid
-get_subscription_oid(const char *subname, bool missing_ok)
-{
-	Oid			oid;
-
-	oid = GetSysCacheOid2(SUBSCRIPTIONNAME, MyDatabaseId,
-						  CStringGetDatum(subname));
-	if (!OidIsValid(oid) && !missing_ok)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("subscription \"%s\" does not exist", subname)));
-	return oid;
-}
-
-/*
- * get_subscription_name - given a subscription OID, look up the name
- *
- * If missing_ok is false, throw an error if name not found.  If true, just
- * return NULL.
- */
-char *
-get_subscription_name(Oid subid, bool missing_ok)
-{
+	Relation	rel;
+	bool		nulls[Natts_pg_subscription];
+	bool		replaces[Natts_pg_subscription];
+	Datum		values[Natts_pg_subscription];
 	HeapTuple	tup;
-	char	   *subname;
-	Form_pg_subscription subform;
 
-	tup = SearchSysCache1(SUBSCRIPTIONOID, ObjectIdGetDatum(subid));
+	/* Look up the subscription in the catalog */
+	rel = table_open(SubscriptionRelationId, RowExclusiveLock);
+	tup = SearchSysCacheCopy1(SUBSCRIPTIONOID, ObjectIdGetDatum(subid));
 
 	if (!HeapTupleIsValid(tup))
-	{
-		if (!missing_ok)
-			elog(ERROR, "cache lookup failed for subscription %u", subid);
-		return NULL;
-	}
+		elog(ERROR, "cache lookup failed for subscription %u", subid);
 
-	subform = (Form_pg_subscription) GETSTRUCT(tup);
-	subname = pstrdup(NameStr(subform->subname));
+	/* Must only modify subscriptions belonging to the current database. */
+	Assert(((Form_pg_subscription) GETSTRUCT(tup))->subdbid == MyDatabaseId);
 
-	ReleaseSysCache(tup);
+	LockSharedObject(SubscriptionRelationId, subid, 0, AccessShareLock);
 
-	return subname;
+	/* Form a new tuple. */
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+	memset(replaces, false, sizeof(replaces));
+
+	/* Set the subscription to disabled. */
+	values[Anum_pg_subscription_subenabled - 1] = BoolGetDatum(false);
+	replaces[Anum_pg_subscription_subenabled - 1] = true;
+
+	/* Update the catalog */
+	tup = heap_modify_tuple(tup, RelationGetDescr(rel), values, nulls,
+							replaces);
+	CatalogTupleUpdate(rel, &tup->t_self, tup);
+	heap_freetuple(tup);
+
+	table_close(rel, NoLock);
 }
 
 /*
@@ -220,9 +328,7 @@ textarray_to_stringlist(ArrayType *textarray)
 				i;
 	List	   *res = NIL;
 
-	deconstruct_array(textarray,
-					  TEXTOID, -1, false, 'i',
-					  &elems, NULL, &nelems);
+	deconstruct_array_builtin(textarray, TEXTOID, &elems, NULL, &nelems);
 
 	if (nelems == 0)
 		return NIL;
@@ -235,27 +341,30 @@ textarray_to_stringlist(ArrayType *textarray)
 
 /*
  * Add new state record for a subscription table.
+ *
+ * If retain_lock is true, then don't release the locks taken in this function.
+ * We normally release the locks at the end of transaction but in binary-upgrade
+ * mode, we expect to release those immediately.
  */
-Oid
+void
 AddSubscriptionRelState(Oid subid, Oid relid, char state,
-						XLogRecPtr sublsn)
+						XLogRecPtr sublsn, bool retain_lock)
 {
 	Relation	rel;
 	HeapTuple	tup;
-	Oid			subrelid;
 	bool		nulls[Natts_pg_subscription_rel];
 	Datum		values[Natts_pg_subscription_rel];
 
 	LockSharedObject(SubscriptionRelationId, subid, 0, AccessShareLock);
 
-	rel = heap_open(SubscriptionRelRelationId, RowExclusiveLock);
+	rel = table_open(SubscriptionRelRelationId, RowExclusiveLock);
 
 	/* Try finding existing mapping. */
 	tup = SearchSysCacheCopy2(SUBSCRIPTIONRELMAP,
 							  ObjectIdGetDatum(relid),
 							  ObjectIdGetDatum(subid));
 	if (HeapTupleIsValid(tup))
-		elog(ERROR, "subscription table %u in subscription %u already exists",
+		elog(ERROR, "subscription relation %u in subscription %u already exists",
 			 relid, subid);
 
 	/* Form the tuple. */
@@ -264,7 +373,7 @@ AddSubscriptionRelState(Oid subid, Oid relid, char state,
 	values[Anum_pg_subscription_rel_srsubid - 1] = ObjectIdGetDatum(subid);
 	values[Anum_pg_subscription_rel_srrelid - 1] = ObjectIdGetDatum(relid);
 	values[Anum_pg_subscription_rel_srsubstate - 1] = CharGetDatum(state);
-	if (sublsn != InvalidXLogRecPtr)
+	if (XLogRecPtrIsValid(sublsn))
 		values[Anum_pg_subscription_rel_srsublsn - 1] = LSNGetDatum(sublsn);
 	else
 		nulls[Anum_pg_subscription_rel_srsublsn - 1] = true;
@@ -272,40 +381,60 @@ AddSubscriptionRelState(Oid subid, Oid relid, char state,
 	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
 
 	/* Insert tuple into catalog. */
-	subrelid = CatalogTupleInsert(rel, tup);
+	CatalogTupleInsert(rel, tup);
 
 	heap_freetuple(tup);
 
 	/* Cleanup. */
-	heap_close(rel, NoLock);
-
-	return subrelid;
+	if (retain_lock)
+	{
+		table_close(rel, NoLock);
+	}
+	else
+	{
+		table_close(rel, RowExclusiveLock);
+		UnlockSharedObject(SubscriptionRelationId, subid, 0, AccessShareLock);
+	}
 }
 
 /*
  * Update the state of a subscription table.
  */
-Oid
+void
 UpdateSubscriptionRelState(Oid subid, Oid relid, char state,
-						   XLogRecPtr sublsn)
+						   XLogRecPtr sublsn, bool already_locked)
 {
 	Relation	rel;
 	HeapTuple	tup;
-	Oid			subrelid;
 	bool		nulls[Natts_pg_subscription_rel];
 	Datum		values[Natts_pg_subscription_rel];
 	bool		replaces[Natts_pg_subscription_rel];
 
-	LockSharedObject(SubscriptionRelationId, subid, 0, AccessShareLock);
+	if (already_locked)
+	{
+#ifdef USE_ASSERT_CHECKING
+		LOCKTAG		tag;
 
-	rel = heap_open(SubscriptionRelRelationId, RowExclusiveLock);
+		Assert(CheckRelationOidLockedByMe(SubscriptionRelRelationId,
+										  RowExclusiveLock, true));
+		SET_LOCKTAG_OBJECT(tag, InvalidOid, SubscriptionRelationId, subid, 0);
+		Assert(LockHeldByMe(&tag, AccessShareLock, true));
+#endif
+
+		rel = table_open(SubscriptionRelRelationId, NoLock);
+	}
+	else
+	{
+		LockSharedObject(SubscriptionRelationId, subid, 0, AccessShareLock);
+		rel = table_open(SubscriptionRelRelationId, RowExclusiveLock);
+	}
 
 	/* Try finding existing mapping. */
 	tup = SearchSysCacheCopy2(SUBSCRIPTIONRELMAP,
 							  ObjectIdGetDatum(relid),
 							  ObjectIdGetDatum(subid));
 	if (!HeapTupleIsValid(tup))
-		elog(ERROR, "subscription table %u in subscription %u does not exist",
+		elog(ERROR, "subscription relation %u in subscription %u does not exist",
 			 relid, subid);
 
 	/* Update the tuple. */
@@ -317,7 +446,7 @@ UpdateSubscriptionRelState(Oid subid, Oid relid, char state,
 	values[Anum_pg_subscription_rel_srsubstate - 1] = CharGetDatum(state);
 
 	replaces[Anum_pg_subscription_rel_srsublsn - 1] = true;
-	if (sublsn != InvalidXLogRecPtr)
+	if (XLogRecPtrIsValid(sublsn))
 		values[Anum_pg_subscription_rel_srsublsn - 1] = LSNGetDatum(sublsn);
 	else
 		nulls[Anum_pg_subscription_rel_srsublsn - 1] = true;
@@ -328,30 +457,29 @@ UpdateSubscriptionRelState(Oid subid, Oid relid, char state,
 	/* Update the catalog. */
 	CatalogTupleUpdate(rel, &tup->t_self, tup);
 
-	subrelid = HeapTupleGetOid(tup);
-
 	/* Cleanup. */
-	heap_close(rel, NoLock);
-
-	return subrelid;
+	table_close(rel, NoLock);
 }
 
 /*
  * Get state of subscription table.
  *
- * Returns SUBREL_STATE_UNKNOWN when not found and missing_ok is true.
+ * Returns SUBREL_STATE_UNKNOWN when the table is not in the subscription.
  */
 char
-GetSubscriptionRelState(Oid subid, Oid relid, XLogRecPtr *sublsn,
-						bool missing_ok)
+GetSubscriptionRelState(Oid subid, Oid relid, XLogRecPtr *sublsn)
 {
-	Relation	rel;
 	HeapTuple	tup;
 	char		substate;
 	bool		isnull;
 	Datum		d;
+	Relation	rel;
 
-	rel = heap_open(SubscriptionRelRelationId, AccessShareLock);
+	/*
+	 * This is to avoid the race condition with AlterSubscription which tries
+	 * to remove this relstate.
+	 */
+	rel = table_open(SubscriptionRelRelationId, AccessShareLock);
 
 	/* Try finding the mapping. */
 	tup = SearchSysCache2(SUBSCRIPTIONRELMAP,
@@ -360,22 +488,15 @@ GetSubscriptionRelState(Oid subid, Oid relid, XLogRecPtr *sublsn,
 
 	if (!HeapTupleIsValid(tup))
 	{
-		if (missing_ok)
-		{
-			heap_close(rel, AccessShareLock);
-			*sublsn = InvalidXLogRecPtr;
-			return SUBREL_STATE_UNKNOWN;
-		}
-
-		elog(ERROR, "subscription table %u in subscription %u does not exist",
-			 relid, subid);
+		table_close(rel, AccessShareLock);
+		*sublsn = InvalidXLogRecPtr;
+		return SUBREL_STATE_UNKNOWN;
 	}
 
 	/* Get the state. */
-	d = SysCacheGetAttr(SUBSCRIPTIONRELMAP, tup,
-						Anum_pg_subscription_rel_srsubstate, &isnull);
-	Assert(!isnull);
-	substate = DatumGetChar(d);
+	substate = ((Form_pg_subscription_rel) GETSTRUCT(tup))->srsubstate;
+
+	/* Get the LSN */
 	d = SysCacheGetAttr(SUBSCRIPTIONRELMAP, tup,
 						Anum_pg_subscription_rel_srsublsn, &isnull);
 	if (isnull)
@@ -385,7 +506,8 @@ GetSubscriptionRelState(Oid subid, Oid relid, XLogRecPtr *sublsn,
 
 	/* Cleanup */
 	ReleaseSysCache(tup);
-	heap_close(rel, AccessShareLock);
+
+	table_close(rel, AccessShareLock);
 
 	return substate;
 }
@@ -398,12 +520,12 @@ void
 RemoveSubscriptionRel(Oid subid, Oid relid)
 {
 	Relation	rel;
-	HeapScanDesc scan;
+	TableScanDesc scan;
 	ScanKeyData skey[2];
 	HeapTuple	tup;
 	int			nkeys = 0;
 
-	rel = heap_open(SubscriptionRelRelationId, RowExclusiveLock);
+	rel = table_open(SubscriptionRelRelationId, RowExclusiveLock);
 
 	if (OidIsValid(subid))
 	{
@@ -424,24 +546,107 @@ RemoveSubscriptionRel(Oid subid, Oid relid)
 	}
 
 	/* Do the search and delete what we found. */
-	scan = heap_beginscan_catalog(rel, nkeys, skey);
+	scan = table_beginscan_catalog(rel, nkeys, skey);
 	while (HeapTupleIsValid(tup = heap_getnext(scan, ForwardScanDirection)))
 	{
+		Form_pg_subscription_rel subrel;
+
+		subrel = (Form_pg_subscription_rel) GETSTRUCT(tup);
+
+		/*
+		 * We don't allow to drop the relation mapping when the table
+		 * synchronization is in progress unless the caller updates the
+		 * corresponding subscription as well. This is to ensure that we don't
+		 * leave tablesync slots or origins in the system when the
+		 * corresponding table is dropped. For sequences, however, it's ok to
+		 * drop them since no separate slots or origins are created during
+		 * synchronization.
+		 */
+		if (!OidIsValid(subid) &&
+			subrel->srsubstate != SUBREL_STATE_READY &&
+			get_rel_relkind(subrel->srrelid) != RELKIND_SEQUENCE)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("could not drop relation mapping for subscription \"%s\"",
+							get_subscription_name(subrel->srsubid, false)),
+					 errdetail("Table synchronization for relation \"%s\" is in progress and is in state \"%c\".",
+							   get_rel_name(relid), subrel->srsubstate),
+
+			/*
+			 * translator: first %s is a SQL ALTER command and second %s is a
+			 * SQL DROP command
+			 */
+					 errhint("Use %s to enable subscription if not already enabled or use %s to drop the subscription.",
+							 "ALTER SUBSCRIPTION ... ENABLE",
+							 "DROP SUBSCRIPTION ...")));
+		}
+
 		CatalogTupleDelete(rel, &tup->t_self);
 	}
-	heap_endscan(scan);
+	table_endscan(scan);
 
-	heap_close(rel, RowExclusiveLock);
+	table_close(rel, RowExclusiveLock);
 }
 
+/*
+ * Does the subscription have any tables?
+ *
+ * Use this function only to know true/false, and when you have no need for the
+ * List returned by GetSubscriptionRelations.
+ */
+bool
+HasSubscriptionTables(Oid subid)
+{
+	Relation	rel;
+	ScanKeyData skey[1];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	bool		has_subtables = false;
+
+	rel = table_open(SubscriptionRelRelationId, AccessShareLock);
+
+	ScanKeyInit(&skey[0],
+				Anum_pg_subscription_rel_srsubid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(subid));
+
+	scan = systable_beginscan(rel, InvalidOid, false,
+							  NULL, 1, skey);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_subscription_rel subrel;
+		char		relkind;
+
+		subrel = (Form_pg_subscription_rel) GETSTRUCT(tup);
+		relkind = get_rel_relkind(subrel->srrelid);
+
+		if (relkind == RELKIND_RELATION ||
+			relkind == RELKIND_PARTITIONED_TABLE)
+		{
+			has_subtables = true;
+			break;
+		}
+	}
+
+	/* Cleanup */
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return has_subtables;
+}
 
 /*
- * Get all relations for subscription.
+ * Get the relations for the subscription.
  *
- * Returned list is palloc'ed in current memory context.
+ * If not_ready is true, return only the relations that are not in a ready
+ * state, otherwise return all the relations of the subscription.  The
+ * returned list is palloc'ed in the current memory context.
  */
 List *
-GetSubscriptionRelations(Oid subid)
+GetSubscriptionRelations(Oid subid, bool tables, bool sequences,
+						 bool not_ready)
 {
 	List	   *res = NIL;
 	Relation	rel;
@@ -450,12 +655,21 @@ GetSubscriptionRelations(Oid subid)
 	ScanKeyData skey[2];
 	SysScanDesc scan;
 
-	rel = heap_open(SubscriptionRelRelationId, AccessShareLock);
+	/* One or both of 'tables' and 'sequences' must be true. */
+	Assert(tables || sequences);
+
+	rel = table_open(SubscriptionRelRelationId, AccessShareLock);
 
 	ScanKeyInit(&skey[nkeys++],
 				Anum_pg_subscription_rel_srsubid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(subid));
+
+	if (not_ready)
+		ScanKeyInit(&skey[nkeys++],
+					Anum_pg_subscription_rel_srsubstate,
+					BTEqualStrategyNumber, F_CHARNE,
+					CharGetDatum(SUBREL_STATE_READY));
 
 	scan = systable_beginscan(rel, InvalidOid, false,
 							  NULL, nkeys, skey);
@@ -464,72 +678,97 @@ GetSubscriptionRelations(Oid subid)
 	{
 		Form_pg_subscription_rel subrel;
 		SubscriptionRelState *relstate;
+		Datum		d;
+		bool		isnull;
+		char		relkind;
 
 		subrel = (Form_pg_subscription_rel) GETSTRUCT(tup);
 
-		relstate = (SubscriptionRelState *) palloc(sizeof(SubscriptionRelState));
+		relkind = get_rel_relkind(subrel->srrelid);
+
+		/* The relation may have been dropped concurrently. */
+		if (relkind == '\0')
+			continue;
+
+		/*
+		 * The relation must be either a sequence or a table. Anything else
+		 * indicates an unexpected relation kind for a subscription relation.
+		 */
+		if (relkind == RELKIND_SEQUENCE)
+		{
+			/* Skip sequences if they were not requested */
+			if (!sequences)
+				continue;
+		}
+		else if (relkind == RELKIND_RELATION ||
+				 relkind == RELKIND_PARTITIONED_TABLE)
+		{
+			/* Skip tables if they were not requested */
+			if (!tables)
+				continue;
+		}
+		else
+			elog(ERROR, "unexpected relkind \"%c\" for relation %u in subscription %u",
+				 relkind, subrel->srrelid, subid);
+
+		relstate = palloc_object(SubscriptionRelState);
 		relstate->relid = subrel->srrelid;
 		relstate->state = subrel->srsubstate;
-		relstate->lsn = subrel->srsublsn;
+		d = SysCacheGetAttr(SUBSCRIPTIONRELMAP, tup,
+							Anum_pg_subscription_rel_srsublsn, &isnull);
+		if (isnull)
+			relstate->lsn = InvalidXLogRecPtr;
+		else
+			relstate->lsn = DatumGetLSN(d);
 
 		res = lappend(res, relstate);
 	}
 
 	/* Cleanup */
 	systable_endscan(scan);
-	heap_close(rel, AccessShareLock);
+	table_close(rel, AccessShareLock);
 
 	return res;
 }
 
 /*
- * Get all relations for subscription that are not in a ready state.
- *
- * Returned list is palloc'ed in current memory context.
+ * Update the dead tuple retention status for the given subscription.
  */
-List *
-GetSubscriptionNotReadyRelations(Oid subid)
+void
+UpdateDeadTupleRetentionStatus(Oid subid, bool active)
 {
-	List	   *res = NIL;
 	Relation	rel;
+	bool		nulls[Natts_pg_subscription];
+	bool		replaces[Natts_pg_subscription];
+	Datum		values[Natts_pg_subscription];
 	HeapTuple	tup;
-	int			nkeys = 0;
-	ScanKeyData skey[2];
-	SysScanDesc scan;
 
-	rel = heap_open(SubscriptionRelRelationId, AccessShareLock);
+	/* Look up the subscription in the catalog */
+	rel = table_open(SubscriptionRelationId, RowExclusiveLock);
+	tup = SearchSysCacheCopy1(SUBSCRIPTIONOID, ObjectIdGetDatum(subid));
 
-	ScanKeyInit(&skey[nkeys++],
-				Anum_pg_subscription_rel_srsubid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(subid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for subscription %u", subid);
 
-	ScanKeyInit(&skey[nkeys++],
-				Anum_pg_subscription_rel_srsubstate,
-				BTEqualStrategyNumber, F_CHARNE,
-				CharGetDatum(SUBREL_STATE_READY));
+	/* Must only modify subscriptions belonging to the current database. */
+	Assert(((Form_pg_subscription) GETSTRUCT(tup))->subdbid == MyDatabaseId);
 
-	scan = systable_beginscan(rel, InvalidOid, false,
-							  NULL, nkeys, skey);
+	LockSharedObject(SubscriptionRelationId, subid, 0, AccessShareLock);
 
-	while (HeapTupleIsValid(tup = systable_getnext(scan)))
-	{
-		Form_pg_subscription_rel subrel;
-		SubscriptionRelState *relstate;
+	/* Form a new tuple. */
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+	memset(replaces, false, sizeof(replaces));
 
-		subrel = (Form_pg_subscription_rel) GETSTRUCT(tup);
+	/* Set the subscription to disabled. */
+	values[Anum_pg_subscription_subretentionactive - 1] = BoolGetDatum(active);
+	replaces[Anum_pg_subscription_subretentionactive - 1] = true;
 
-		relstate = (SubscriptionRelState *) palloc(sizeof(SubscriptionRelState));
-		relstate->relid = subrel->srrelid;
-		relstate->state = subrel->srsubstate;
-		relstate->lsn = subrel->srsublsn;
+	/* Update the catalog */
+	tup = heap_modify_tuple(tup, RelationGetDescr(rel), values, nulls,
+							replaces);
+	CatalogTupleUpdate(rel, &tup->t_self, tup);
+	heap_freetuple(tup);
 
-		res = lappend(res, relstate);
-	}
-
-	/* Cleanup */
-	systable_endscan(scan);
-	heap_close(rel, AccessShareLock);
-
-	return res;
+	table_close(rel, NoLock);
 }

@@ -23,7 +23,7 @@
  * for example).
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_description.h
@@ -38,14 +38,16 @@
 #define PG_DESCRIPTION_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_description_d.h"
+#include "catalog/pg_description_d.h"	/* IWYU pragma: export */
 
 /* ----------------
  *		pg_description definition.  cpp turns this into
  *		typedef struct FormData_pg_description
  * ----------------
  */
-CATALOG(pg_description,2609,DescriptionRelationId) BKI_WITHOUT_OIDS
+BEGIN_CATALOG_STRUCT
+
+CATALOG(pg_description,2609,DescriptionRelationId)
 {
 	Oid			objoid;			/* OID of object itself */
 	Oid			classoid;		/* OID of table containing object */
@@ -56,11 +58,20 @@ CATALOG(pg_description,2609,DescriptionRelationId) BKI_WITHOUT_OIDS
 #endif
 } FormData_pg_description;
 
+END_CATALOG_STRUCT
+
 /* ----------------
  *		Form_pg_description corresponds to a pointer to a tuple with
  *		the format of pg_description relation.
  * ----------------
  */
 typedef FormData_pg_description * Form_pg_description;
+
+DECLARE_TOAST(pg_description, 2834, 2835);
+
+DECLARE_UNIQUE_INDEX_PKEY(pg_description_o_c_o_index, 2675, DescriptionObjIndexId, pg_description, btree(objoid oid_ops, classoid oid_ops, objsubid int4_ops));
+
+/* We do not use BKI_LOOKUP here because it causes problems for genbki.pl */
+DECLARE_FOREIGN_KEY((classoid), pg_class, (oid));
 
 #endif							/* PG_DESCRIPTION_H */

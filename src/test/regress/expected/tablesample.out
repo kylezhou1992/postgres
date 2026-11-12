@@ -74,7 +74,7 @@ CREATE VIEW test_tablesample_v2 AS
 --------+---------+-----------+----------+---------+---------+-------------
  id     | integer |           |          |         | plain   | 
 View definition:
- SELECT test_tablesample.id
+ SELECT id
    FROM test_tablesample TABLESAMPLE system ((10 * 2)) REPEATABLE (2);
 
 \d+ test_tablesample_v2
@@ -83,12 +83,12 @@ View definition:
 --------+---------+-----------+----------+---------+---------+-------------
  id     | integer |           |          |         | plain   | 
 View definition:
- SELECT test_tablesample.id
+ SELECT id
    FROM test_tablesample TABLESAMPLE system (99);
 
 -- check a sampled query doesn't affect cursor in progress
 BEGIN;
-DECLARE tablesample_cur CURSOR FOR
+DECLARE tablesample_cur SCROLL CURSOR FOR
   SELECT id FROM test_tablesample TABLESAMPLE SYSTEM (50) REPEATABLE (0);
 FETCH FIRST FROM tablesample_cur;
  id 
@@ -198,13 +198,13 @@ explain (costs off)
 -------------------------------------------------
  Aggregate
    ->  Append
-         ->  Sample Scan on person
+         ->  Sample Scan on person person_1
                Sampling: bernoulli ('100'::real)
-         ->  Sample Scan on emp
+         ->  Sample Scan on emp person_2
                Sampling: bernoulli ('100'::real)
-         ->  Sample Scan on student
+         ->  Sample Scan on student person_3
                Sampling: bernoulli ('100'::real)
-         ->  Sample Scan on stud_emp
+         ->  Sample Scan on stud_emp person_4
                Sampling: bernoulli ('100'::real)
 (10 rows)
 
@@ -274,6 +274,38 @@ select pct, count(unique1) from
   (values (0),(100)) v(pct),
   lateral (select * from tenk1 tablesample system (pct)) ss
   group by pct;
+ pct | count 
+-----+-------
+ 100 | 10000
+(1 row)
+
+-- check that a join alias Var in a pulled-up LATERAL subquery's TABLESAMPLE
+-- clause gets flattened
+explain (costs off)
+select pct, count(unique1) from
+  ((values (0)) v(pct) full join (values (100)) w(pct) using (pct)),
+  lateral (select * from tenk1 tablesample bernoulli (pct)) ss
+  group by pct order by pct;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ GroupAggregate
+   Group Key: (COALESCE((0), (100)))
+   ->  Sort
+         Sort Key: (COALESCE((0), (100)))
+         ->  Nested Loop
+               ->  Hash Full Join
+                     Hash Cond: ((0) = (100))
+                     ->  Result
+                     ->  Hash
+                           ->  Result
+               ->  Sample Scan on tenk1
+                     Sampling: bernoulli (COALESCE((0), (100)))
+(12 rows)
+
+select pct, count(unique1) from
+  ((values (0)) v(pct) full join (values (100)) w(pct) using (pct)),
+  lateral (select * from tenk1 tablesample bernoulli (pct)) ss
+  group by pct order by pct;
  pct | count 
 -----+-------
  100 | 10000

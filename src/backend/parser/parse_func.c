@@ -3,7 +3,7 @@
  * parse_func.c
  *		handle function calls in parser
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -35,12 +35,25 @@
 #include "utils/syscache.h"
 
 
+/* Possible error codes from LookupFuncNameInternal */
+typedef enum
+{
+	FUNCLOOKUP_NOSUCHFUNC,
+	FUNCLOOKUP_AMBIGUOUS,
+} FuncLookupError;
+
+static int	func_lookup_failure_details(int fgc_flags, List *argnames,
+										bool proc_call);
 static void unify_hypothetical_args(ParseState *pstate,
-						List *fargs, int numAggregatedArgs,
-						Oid *actual_arg_types, Oid *declared_arg_types);
+									List *fargs, int numAggregatedArgs,
+									Oid *actual_arg_types, Oid *declared_arg_types);
 static Oid	FuncNameAsType(List *funcname);
 static Node *ParseComplexProjection(ParseState *pstate, const char *funcname,
-					   Node *first_arg, int location);
+									Node *first_arg, int location);
+static Oid	LookupFuncNameInternal(ObjectType objtype, List *funcname,
+								   int nargs, const Oid *argtypes,
+								   bool include_out_arguments, bool missing_ok,
+								   FuncLookupError *lookupError);
 
 
 /*
@@ -72,7 +85,8 @@ static Node *ParseComplexProjection(ParseState *pstate, const char *funcname,
  *	contain any SRF calls, last_srf can just be pstate->p_last_srf.
  *
  *	proc_call is true if we are considering a CALL statement, so that the
- *	name must resolve to a procedure name, not anything else.
+ *	name must resolve to a procedure name, not anything else.  This flag
+ *	also specifies that the argument list includes any OUT-mode arguments.
  */
 Node *
 ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
@@ -81,16 +95,17 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 	bool		is_column = (fn == NULL);
 	List	   *agg_order = (fn ? fn->agg_order : NIL);
 	Expr	   *agg_filter = NULL;
+	WindowDef  *over = (fn ? fn->over : NULL);
 	bool		agg_within_group = (fn ? fn->agg_within_group : false);
 	bool		agg_star = (fn ? fn->agg_star : false);
 	bool		agg_distinct = (fn ? fn->agg_distinct : false);
 	bool		func_variadic = (fn ? fn->func_variadic : false);
-	WindowDef  *over = (fn ? fn->over : NULL);
+	int			ignore_nulls = (fn ? fn->ignore_nulls : NO_NULLTREATMENT);
+	CoercionForm funcformat = (fn ? fn->funcformat : COERCE_EXPLICIT_CALL);
 	bool		could_be_projection;
 	Oid			rettype;
 	Oid			funcid;
 	ListCell   *l;
-	ListCell   *nextl;
 	Node	   *first_arg = NULL;
 	int			nargs;
 	int			nargsplusdefs;
@@ -103,6 +118,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 	int			nvargs;
 	Oid			vatype;
 	FuncDetailCode fdresult;
+	int			fgc_flags;
 	char		aggkind = 0;
 	ParseCallbackState pcbstate;
 
@@ -137,21 +153,18 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 	 * to distinguish "input" and "output" parameter symbols while parsing
 	 * function-call constructs.  Don't do this if dealing with column syntax,
 	 * nor if we had WITHIN GROUP (because in that case it's critical to keep
-	 * the argument count unchanged).  We can't use foreach() because we may
-	 * modify the list ...
+	 * the argument count unchanged).
 	 */
 	nargs = 0;
-	for (l = list_head(fargs); l != NULL; l = nextl)
+	foreach(l, fargs)
 	{
 		Node	   *arg = lfirst(l);
 		Oid			argtype = exprType(arg);
 
-		nextl = lnext(l);
-
 		if (argtype == VOIDOID && IsA(arg, Param) &&
 			!is_column && !agg_within_group)
 		{
-			fargs = list_delete_ptr(fargs, arg);
+			fargs = foreach_delete_current(fargs, l);
 			continue;
 		}
 
@@ -256,7 +269,8 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 
 	fdresult = func_get_detail(funcname, fargs, argnames, nargs,
 							   actual_arg_types,
-							   !func_variadic, true,
+							   !func_variadic, true, proc_call,
+							   &fgc_flags,
 							   &funcid, &rettype, &retset,
 							   &nvargs, &vatype,
 							   &declared_arg_types, &argdefaults);
@@ -337,6 +351,13 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 					 errmsg("OVER specified, but %s is not a window function nor an aggregate function",
 							NameListToString(funcname)),
 					 parser_errposition(pstate, location)));
+		if (ignore_nulls != NO_NULLTREATMENT)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+			/*- translator: first %s is a null treatment option, eg IGNORE NULLS */
+					 errmsg("%s specified, but %s is not a window function",
+							"RESPECT/IGNORE NULLS", NameListToString(funcname)),
+					 parser_errposition(pstate, location)));
 	}
 
 	/*
@@ -409,9 +430,11 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 									func_signature_string(funcname, nargs,
 														  argnames,
 														  actual_arg_types)),
-							 errhint("There is an ordered-set aggregate %s, but it requires %d direct arguments, not %d.",
-									 NameListToString(funcname),
-									 catDirectArgs, numDirectArgs),
+							 errhint_plural("There is an ordered-set aggregate %s, but it requires %d direct argument, not %d.",
+											"There is an ordered-set aggregate %s, but it requires %d direct arguments, not %d.",
+											catDirectArgs,
+											NameListToString(funcname),
+											catDirectArgs, numDirectArgs),
 							 parser_errposition(pstate, location)));
 			}
 			else
@@ -438,9 +461,11 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 										func_signature_string(funcname, nargs,
 															  argnames,
 															  actual_arg_types)),
-								 errhint("There is an ordered-set aggregate %s, but it requires %d direct arguments, not %d.",
-										 NameListToString(funcname),
-										 catDirectArgs, numDirectArgs),
+								 errhint_plural("There is an ordered-set aggregate %s, but it requires %d direct argument, not %d.",
+												"There is an ordered-set aggregate %s, but it requires %d direct arguments, not %d.",
+												catDirectArgs,
+												NameListToString(funcname),
+												catDirectArgs, numDirectArgs),
 								 parser_errposition(pstate, location)));
 				}
 				else
@@ -477,9 +502,11 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 											func_signature_string(funcname, nargs,
 																  argnames,
 																  actual_arg_types)),
-									 errhint("There is an ordered-set aggregate %s, but it requires at least %d direct arguments.",
-											 NameListToString(funcname),
-											 catDirectArgs),
+									 errhint_plural("There is an ordered-set aggregate %s, but it requires at least %d direct argument.",
+													"There is an ordered-set aggregate %s, but it requires at least %d direct arguments.",
+													catDirectArgs,
+													NameListToString(funcname),
+													catDirectArgs),
 									 parser_errposition(pstate, location)));
 					}
 				}
@@ -500,6 +527,12 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 								NameListToString(funcname)),
 						 parser_errposition(pstate, location)));
 		}
+
+		if (ignore_nulls != NO_NULLTREATMENT)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("aggregate functions do not accept RESPECT/IGNORE NULLS"),
+					 parser_errposition(pstate, location)));
 	}
 	else if (fdresult == FUNCDETAIL_WINDOWFUNC)
 	{
@@ -548,8 +581,8 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 					 errmsg("procedure %s is not unique",
 							func_signature_string(funcname, nargs, argnames,
 												  actual_arg_types)),
-					 errhint("Could not choose a best candidate procedure. "
-							 "You might need to add explicit type casts."),
+					 errdetail("Could not choose a best candidate procedure."),
+					 errhint("You might need to add explicit type casts."),
 					 parser_errposition(pstate, location)));
 		else
 			ereport(ERROR,
@@ -557,8 +590,8 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 					 errmsg("function %s is not unique",
 							func_signature_string(funcname, nargs, argnames,
 												  actual_arg_types)),
-					 errhint("Could not choose a best candidate function. "
-							 "You might need to add explicit type casts."),
+					 errdetail("Could not choose a best candidate function."),
+					 errhint("You might need to add explicit type casts."),
 					 parser_errposition(pstate, location)));
 	}
 	else
@@ -586,7 +619,9 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 
 		/*
 		 * No function, and no column either.  Since we're dealing with
-		 * function notation, report "function does not exist".
+		 * function notation, report "function/procedure does not exist".
+		 * Depending on what was returned in fgc_flags, we can add some color
+		 * to that with detail or hint messages.
 		 */
 		if (list_length(agg_order) > 1 && !agg_within_group)
 		{
@@ -596,8 +631,8 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 					 errmsg("function %s does not exist",
 							func_signature_string(funcname, nargs, argnames,
 												  actual_arg_types)),
-					 errhint("No aggregate function matches the given name and argument types. "
-							 "Perhaps you misplaced ORDER BY; ORDER BY must appear "
+					 errdetail("No aggregate function matches the given name and argument types."),
+					 errhint("Perhaps you misplaced ORDER BY; ORDER BY must appear "
 							 "after all regular arguments of the aggregate."),
 					 parser_errposition(pstate, location)));
 		}
@@ -607,8 +642,8 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 					 errmsg("procedure %s does not exist",
 							func_signature_string(funcname, nargs, argnames,
 												  actual_arg_types)),
-					 errhint("No procedure matches the given name and argument types. "
-							 "You might need to add explicit type casts."),
+					 func_lookup_failure_details(fgc_flags, argnames,
+												 proc_call),
 					 parser_errposition(pstate, location)));
 		else
 			ereport(ERROR,
@@ -616,8 +651,8 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 					 errmsg("function %s does not exist",
 							func_signature_string(funcname, nargs, argnames,
 												  actual_arg_types)),
-					 errhint("No function matches the given name and argument types. "
-							 "You might need to add explicit type casts."),
+					 func_lookup_failure_details(fgc_flags, argnames,
+												 proc_call),
 					 parser_errposition(pstate, location)));
 	}
 
@@ -656,6 +691,32 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 											   nargsplusdefs,
 											   rettype,
 											   false);
+
+	/*
+	 * Reject any attempt to call a function that takes or returns type
+	 * internal from SQL.  (The FUNCDETAIL_COERCION case does not reach this
+	 * check because of the early return above, but that's okay because we
+	 * disallow coercions to or from type internal.)  Note that we are
+	 * checking the resolved argument and result types, so this will reject
+	 * calls to polymorphic functions that pass internal-type arguments.  The
+	 * casting rules should prevent that anyway, since we won't cast internal
+	 * to any polymorphic type, but no harm in being doubly sure.
+	 */
+	for (int i = 0; i < nargsplusdefs; i++)
+	{
+		if (declared_arg_types[i] == INTERNALOID)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("functions accepting type \"%s\" cannot be called explicitly",
+							"internal"),
+					 parser_errposition(pstate, location)));
+	}
+	if (rettype == INTERNALOID)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("functions returning type \"%s\" cannot be called explicitly",
+						"internal"),
+				 parser_errposition(pstate, location)));
 
 	/* perform the necessary typecasting of arguments */
 	make_fn_arguments(pstate, fargs, actual_arg_types, declared_arg_types);
@@ -736,7 +797,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		funcexpr->funcresulttype = rettype;
 		funcexpr->funcretset = retset;
 		funcexpr->funcvariadic = func_variadic;
-		funcexpr->funcformat = COERCE_EXPLICIT_CALL;
+		funcexpr->funcformat = funcformat;
 		/* funccollid and inputcollid will be set by parse_collate.c */
 		funcexpr->args = fargs;
 		funcexpr->location = location;
@@ -759,9 +820,28 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		aggref->aggstar = agg_star;
 		aggref->aggvariadic = func_variadic;
 		aggref->aggkind = aggkind;
+		aggref->aggpresorted = false;
 		/* agglevelsup will be set by transformAggregateCall */
 		aggref->aggsplit = AGGSPLIT_SIMPLE; /* planner might change this */
+		aggref->aggno = -1;		/* planner will set aggno and aggtransno */
+		aggref->aggtransno = -1;
 		aggref->location = location;
+
+		/*
+		 * The argument-count limit for aggregates is one less than for other
+		 * kinds of functions (cf. AggregateCreate).  Now that we know it's an
+		 * aggregate, apply the stricter limit.  We need an explicit check
+		 * because hypothetical-set aggregates don't have a fixed number of
+		 * arguments, so having matched the pg_proc entry proves nothing.
+		 */
+		if (list_length(fargs) > FUNC_MAX_ARGS - 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_TOO_MANY_ARGUMENTS),
+					 errmsg_plural("aggregates cannot have more than %d argument",
+								   "aggregates cannot have more than %d arguments",
+								   FUNC_MAX_ARGS - 1,
+								   FUNC_MAX_ARGS - 1),
+					 parser_errposition(pstate, location)));
 
 		/*
 		 * Reject attempt to call a parameterless aggregate without (*)
@@ -816,6 +896,8 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		wfunc->winstar = agg_star;
 		wfunc->winagg = (fdresult == FUNCDETAIL_AGGREGATE);
 		wfunc->aggfilter = agg_filter;
+		wfunc->ignore_nulls = ignore_nulls;
+		wfunc->runCondition = NIL;
 		wfunc->location = location;
 
 		/*
@@ -825,6 +907,19 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("DISTINCT is not implemented for window functions"),
+					 parser_errposition(pstate, location)));
+
+		/*
+		 * As above, enforce the correct argument-count limit if it's really
+		 * an aggregate.
+		 */
+		if (wfunc->winagg && list_length(fargs) > FUNC_MAX_ARGS - 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_TOO_MANY_ARGUMENTS),
+					 errmsg_plural("aggregates cannot have more than %d argument",
+								   "aggregates cannot have more than %d arguments",
+								   FUNC_MAX_ARGS - 1,
+								   FUNC_MAX_ARGS - 1),
 					 parser_errposition(pstate, location)));
 
 		/*
@@ -886,8 +981,107 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 	return retval;
 }
 
+/*
+ * Interpret the fgc_flags and issue a suitable detail or hint message.
+ *
+ * Helper function to reduce code duplication while throwing a
+ * function-not-found error.
+ */
+static int
+func_lookup_failure_details(int fgc_flags, List *argnames, bool proc_call)
+{
+	/*
+	 * If not FGC_NAME_VISIBLE, we shouldn't raise the question of whether the
+	 * arguments are wrong.  If the function name was not schema-qualified,
+	 * it's helpful to distinguish between doesn't-exist-anywhere and
+	 * not-in-search-path; but if it was, there's really nothing to add to the
+	 * basic "function/procedure %s does not exist" message.
+	 *
+	 * Note: we passed missing_ok = false to FuncnameGetCandidates, so there's
+	 * no need to consider FGC_SCHEMA_EXISTS here: we'd have already thrown an
+	 * error if an explicitly-given schema doesn't exist.
+	 */
+	if (!(fgc_flags & FGC_NAME_VISIBLE))
+	{
+		if (fgc_flags & FGC_SCHEMA_GIVEN)
+			return 0;			/* schema-qualified name */
+		else if (!(fgc_flags & FGC_NAME_EXISTS))
+		{
+			if (proc_call)
+				return errdetail("There is no procedure of that name.");
+			else
+				return errdetail("There is no function of that name.");
+		}
+		else
+		{
+			if (proc_call)
+				return errdetail("A procedure of that name exists, but it is not in the search_path.");
+			else
+				return errdetail("A function of that name exists, but it is not in the search_path.");
+		}
+	}
 
-/* func_match_argtypes()
+	/*
+	 * Next, complain if nothing had the right number of arguments.  (This
+	 * takes precedence over wrong-argnames cases because we won't even look
+	 * at the argnames unless there's a workable number of arguments.)
+	 */
+	if (!(fgc_flags & FGC_ARGCOUNT_MATCH))
+	{
+		if (proc_call)
+			return errdetail("No procedure of that name accepts the given number of arguments.");
+		else
+			return errdetail("No function of that name accepts the given number of arguments.");
+	}
+
+	/*
+	 * If there are argnames, and we failed to match them, again we should
+	 * mention that and not bring up the argument types.
+	 */
+	if (argnames != NIL && !(fgc_flags & FGC_ARGNAMES_MATCH))
+	{
+		if (proc_call)
+			return errdetail("No procedure of that name accepts the given argument names.");
+		else
+			return errdetail("No function of that name accepts the given argument names.");
+	}
+
+	/*
+	 * We could have matched all the given argnames and still not have had a
+	 * valid call, either because of improper use of mixed notation, or
+	 * because of missing arguments, or because the user misused VARIADIC. The
+	 * rules about named-argument matching are finicky enough that it's worth
+	 * trying to be specific about the problem.  (The messages here are chosen
+	 * with full knowledge of the steps that namespace.c uses while checking a
+	 * potential match.)
+	 */
+	if (argnames != NIL && !(fgc_flags & FGC_ARGNAMES_NONDUP))
+		return errdetail("In the closest available match, "
+						 "an argument was specified both positionally and by name.");
+
+	if (argnames != NIL && !(fgc_flags & FGC_ARGNAMES_ALL))
+		return errdetail("In the closest available match, "
+						 "not all required arguments were supplied.");
+
+	if (argnames != NIL && !(fgc_flags & FGC_ARGNAMES_VALID))
+		return errhint("This call would be correct if the variadic array were labeled VARIADIC and placed last.");
+
+	if (fgc_flags & FGC_VARIADIC_FAIL)
+		return errhint("The VARIADIC parameter must be placed last, even when using argument names.");
+
+	/*
+	 * Otherwise, the problem must be incorrect argument types.
+	 */
+	if (proc_call)
+		(void) errdetail("No procedure of that name accepts the given argument types.");
+	else
+		(void) errdetail("No function of that name accepts the given argument types.");
+	return errhint("You might need to add explicit type casts.");
+}
+
+
+/*
+ * func_match_argtypes()
  *
  * Given a list of candidate functions (having the right name and number
  * of arguments) and an array of input datatype OIDs, produce a shortlist of
@@ -930,7 +1124,8 @@ func_match_argtypes(int nargs,
 }								/* func_match_argtypes() */
 
 
-/* func_select_candidate()
+/*
+ * func_select_candidate()
  *		Given the input argtype array and more than one candidate
  *		for the function, attempt to resolve the conflict.
  *
@@ -1341,7 +1536,8 @@ func_select_candidate(int nargs,
 }								/* func_select_candidate() */
 
 
-/* func_get_detail()
+/*
+ * func_get_detail()
  *
  * Find the named function in the system catalogs.
  *
@@ -1353,9 +1549,14 @@ func_select_candidate(int nargs,
  *	1) check for possible interpretation as a type coercion request
  *	2) apply the ambiguous-function resolution rules
  *
- * Return values *funcid through *true_typeids receive info about the function.
- * If argdefaults isn't NULL, *argdefaults receives a list of any default
- * argument expressions that need to be added to the given arguments.
+ * If there is no match at all, we return FUNCDETAIL_NOTFOUND, and *fgc_flags
+ * is filled with some flags that may be useful for issuing an on-point error
+ * message (see FuncnameGetCandidates).
+ *
+ * On success, return values *funcid through *true_typeids receive info about
+ * the function.  If argdefaults isn't NULL, *argdefaults receives a list of
+ * any default argument expressions that need to be added to the given
+ * arguments.
  *
  * When processing a named- or mixed-notation call (ie, fargnames isn't NIL),
  * the returned true_typeids and argdefaults are ordered according to the
@@ -1380,6 +1581,8 @@ func_get_detail(List *funcname,
 				Oid *argtypes,
 				bool expand_variadic,
 				bool expand_defaults,
+				bool include_out_arguments,
+				int *fgc_flags, /* return value */
 				Oid *funcid,	/* return value */
 				Oid *rettype,	/* return value */
 				bool *retset,	/* return value */
@@ -1390,9 +1593,6 @@ func_get_detail(List *funcname,
 {
 	FuncCandidateList raw_candidates;
 	FuncCandidateList best_candidate;
-
-	/* Passing NULL for argtypes is no longer allowed */
-	Assert(argtypes);
 
 	/* initialize output arguments to silence compiler warnings */
 	*funcid = InvalidOid;
@@ -1407,7 +1607,8 @@ func_get_detail(List *funcname,
 	/* Get list of possible candidates from namespace search */
 	raw_candidates = FuncnameGetCandidates(funcname, nargs, fargnames,
 										   expand_variadic, expand_defaults,
-										   false);
+										   include_out_arguments, false,
+										   fgc_flags);
 
 	/*
 	 * Quickly check if there is an exact match to the input datatypes (there
@@ -1417,7 +1618,9 @@ func_get_detail(List *funcname,
 		 best_candidate != NULL;
 		 best_candidate = best_candidate->next)
 	{
-		if (memcmp(argtypes, best_candidate->args, nargs * sizeof(Oid)) == 0)
+		/* if nargs==0, argtypes can be null; don't pass that to memcmp */
+		if (nargs == 0 ||
+			memcmp(argtypes, best_candidate->args, nargs * sizeof(Oid)) == 0)
 			break;
 	}
 
@@ -1575,7 +1778,10 @@ func_get_detail(List *funcname,
 		 */
 		if (fargnames != NIL && !expand_variadic && nargs > 0 &&
 			best_candidate->argnumbers[nargs - 1] != nargs - 1)
+		{
+			*fgc_flags |= FGC_VARIADIC_FAIL;
 			return FUNCDETAIL_NOTFOUND;
+		}
 
 		*funcid = best_candidate->oid;
 		*nvargs = best_candidate->nvargs;
@@ -1614,7 +1820,6 @@ func_get_detail(List *funcname,
 		if (argdefaults && best_candidate->ndargs > 0)
 		{
 			Datum		proargdefaults;
-			bool		isnull;
 			char	   *str;
 			List	   *defaults;
 
@@ -1622,10 +1827,8 @@ func_get_detail(List *funcname,
 			if (best_candidate->ndargs > pform->pronargdefaults)
 				elog(ERROR, "not enough default arguments");
 
-			proargdefaults = SysCacheGetAttr(PROCOID, ftup,
-											 Anum_pg_proc_proargdefaults,
-											 &isnull);
-			Assert(!isnull);
+			proargdefaults = SysCacheGetAttrNotNull(PROCOID, ftup,
+													Anum_pg_proc_proargdefaults);
 			str = TextDatumGetCString(proargdefaults);
 			defaults = castNode(List, stringToNode(str));
 			pfree(str);
@@ -1653,7 +1856,7 @@ func_get_detail(List *funcname,
 					defargnumbers = bms_add_member(defargnumbers,
 												   firstdefarg[i]);
 				newdefaults = NIL;
-				i = pform->pronargs - pform->pronargdefaults;
+				i = best_candidate->nominalnargs - pform->pronargdefaults;
 				foreach(lc, defaults)
 				{
 					if (bms_is_member(i, defargnumbers))
@@ -1673,8 +1876,8 @@ func_get_detail(List *funcname,
 				int			ndelete;
 
 				ndelete = list_length(defaults) - best_candidate->ndargs;
-				while (ndelete-- > 0)
-					defaults = list_delete_first(defaults);
+				if (ndelete > 0)
+					defaults = list_delete_first_n(defaults, ndelete);
 				*argdefaults = defaults;
 			}
 		}
@@ -1728,11 +1931,9 @@ unify_hypothetical_args(ParseState *pstate,
 						Oid *actual_arg_types,
 						Oid *declared_arg_types)
 {
-	Node	   *args[FUNC_MAX_ARGS];
 	int			numDirectArgs,
 				numNonHypotheticalArgs;
-	int			i;
-	ListCell   *lc;
+	int			hargpos;
 
 	numDirectArgs = list_length(fargs) - numAggregatedArgs;
 	numNonHypotheticalArgs = numDirectArgs - numAggregatedArgs;
@@ -1740,25 +1941,21 @@ unify_hypothetical_args(ParseState *pstate,
 	if (numNonHypotheticalArgs < 0)
 		elog(ERROR, "incorrect number of arguments to hypothetical-set aggregate");
 
-	/* Deconstruct fargs into an array for ease of subscripting */
-	i = 0;
-	foreach(lc, fargs)
-	{
-		args[i++] = (Node *) lfirst(lc);
-	}
-
 	/* Check each hypothetical arg and corresponding aggregated arg */
-	for (i = numNonHypotheticalArgs; i < numDirectArgs; i++)
+	for (hargpos = numNonHypotheticalArgs; hargpos < numDirectArgs; hargpos++)
 	{
-		int			aargpos = numDirectArgs + (i - numNonHypotheticalArgs);
+		int			aargpos = numDirectArgs + (hargpos - numNonHypotheticalArgs);
+		ListCell   *harg = list_nth_cell(fargs, hargpos);
+		ListCell   *aarg = list_nth_cell(fargs, aargpos);
 		Oid			commontype;
+		int32		commontypmod;
 
 		/* A mismatch means AggregateCreate didn't check properly ... */
-		if (declared_arg_types[i] != declared_arg_types[aargpos])
+		if (declared_arg_types[hargpos] != declared_arg_types[aargpos])
 			elog(ERROR, "hypothetical-set aggregate has inconsistent declared argument types");
 
 		/* No need to unify if make_fn_arguments will coerce */
-		if (declared_arg_types[i] != ANYOID)
+		if (declared_arg_types[hargpos] != ANYOID)
 			continue;
 
 		/*
@@ -1767,37 +1964,33 @@ unify_hypothetical_args(ParseState *pstate,
 		 * the aggregated values).
 		 */
 		commontype = select_common_type(pstate,
-										list_make2(args[aargpos], args[i]),
+										list_make2(lfirst(aarg), lfirst(harg)),
 										"WITHIN GROUP",
 										NULL);
+		commontypmod = select_common_typmod(pstate,
+											list_make2(lfirst(aarg), lfirst(harg)),
+											commontype);
 
 		/*
 		 * Perform the coercions.  We don't need to worry about NamedArgExprs
 		 * here because they aren't supported with aggregates.
 		 */
-		args[i] = coerce_type(pstate,
-							  args[i],
-							  actual_arg_types[i],
-							  commontype, -1,
-							  COERCION_IMPLICIT,
-							  COERCE_IMPLICIT_CAST,
-							  -1);
-		actual_arg_types[i] = commontype;
-		args[aargpos] = coerce_type(pstate,
-									args[aargpos],
-									actual_arg_types[aargpos],
-									commontype, -1,
-									COERCION_IMPLICIT,
-									COERCE_IMPLICIT_CAST,
-									-1);
+		lfirst(harg) = coerce_type(pstate,
+								   (Node *) lfirst(harg),
+								   actual_arg_types[hargpos],
+								   commontype, commontypmod,
+								   COERCION_IMPLICIT,
+								   COERCE_IMPLICIT_CAST,
+								   -1);
+		actual_arg_types[hargpos] = commontype;
+		lfirst(aarg) = coerce_type(pstate,
+								   (Node *) lfirst(aarg),
+								   actual_arg_types[aargpos],
+								   commontype, commontypmod,
+								   COERCION_IMPLICIT,
+								   COERCE_IMPLICIT_CAST,
+								   -1);
 		actual_arg_types[aargpos] = commontype;
-	}
-
-	/* Reconstruct fargs from array */
-	i = 0;
-	foreach(lc, fargs)
-	{
-		lfirst(lc) = args[i++];
 	}
 }
 
@@ -1877,7 +2070,12 @@ FuncNameAsType(List *funcname)
 	Oid			result;
 	Type		typtup;
 
-	typtup = LookupTypeName(NULL, makeTypeNameFromNameList(funcname), NULL, false);
+	/*
+	 * temp_ok=false protects the <refsect1 id="sql-createfunction-security">
+	 * contract for writing SECURITY DEFINER functions safely.
+	 */
+	typtup = LookupTypeNameExtended(NULL, makeTypeNameFromNameList(funcname),
+									NULL, false, false);
 	if (typtup == NULL)
 		return InvalidOid;
 
@@ -1917,13 +2115,13 @@ ParseComplexProjection(ParseState *pstate, const char *funcname, Node *first_arg
 	if (IsA(first_arg, Var) &&
 		((Var *) first_arg)->varattno == InvalidAttrNumber)
 	{
-		RangeTblEntry *rte;
+		ParseNamespaceItem *nsitem;
 
-		rte = GetRTEByRangeTablePosn(pstate,
-									 ((Var *) first_arg)->varno,
-									 ((Var *) first_arg)->varlevelsup);
+		nsitem = GetNSItemByVar(pstate, (Var *) first_arg);
 		/* Return a Var if funcname matches a column, else NULL */
-		return scanRTEForColumn(pstate, rte, funcname, location, 0, NULL);
+		return scanNSItemForColumn(pstate, nsitem,
+								   ((Var *) first_arg)->varlevelsup,
+								   funcname, location);
 	}
 
 	/*
@@ -1999,7 +2197,7 @@ funcname_signature_string(const char *funcname, int nargs,
 		if (i >= numposargs)
 		{
 			appendStringInfo(&argbuf, "%s => ", (char *) lfirst(lc));
-			lc = lnext(lc);
+			lc = lnext(argnames, lc);
 		}
 		appendStringInfoString(&argbuf, format_type_be(argtypes[i]));
 	}
@@ -2022,93 +2220,185 @@ func_signature_string(List *funcname, int nargs,
 }
 
 /*
+ * LookupFuncNameInternal
+ *		Workhorse for LookupFuncName/LookupFuncWithArgs
+ *
+ * In an error situation, e.g. can't find the function, then we return
+ * InvalidOid and set *lookupError to indicate what went wrong.
+ *
+ * Possible errors:
+ *	FUNCLOOKUP_NOSUCHFUNC: we can't find a function of this name.
+ *	FUNCLOOKUP_AMBIGUOUS: more than one function matches.
+ */
+static Oid
+LookupFuncNameInternal(ObjectType objtype, List *funcname,
+					   int nargs, const Oid *argtypes,
+					   bool include_out_arguments, bool missing_ok,
+					   FuncLookupError *lookupError)
+{
+	Oid			result = InvalidOid;
+	FuncCandidateList clist;
+	int			fgc_flags;
+
+	/* NULL argtypes allowed for nullary functions only */
+	Assert(argtypes != NULL || nargs == 0);
+
+	/* Always set *lookupError, to forestall uninitialized-variable warnings */
+	*lookupError = FUNCLOOKUP_NOSUCHFUNC;
+
+	/* Get list of candidate objects */
+	clist = FuncnameGetCandidates(funcname, nargs, NIL, false, false,
+								  include_out_arguments, missing_ok,
+								  &fgc_flags);
+
+	/* Scan list for a match to the arg types (if specified) and the objtype */
+	for (; clist != NULL; clist = clist->next)
+	{
+		/* Check arg type match, if specified */
+		if (nargs >= 0)
+		{
+			/* if nargs==0, argtypes can be null; don't pass that to memcmp */
+			if (nargs > 0 &&
+				memcmp(argtypes, clist->args, nargs * sizeof(Oid)) != 0)
+				continue;
+		}
+
+		/* Check for duplicates reported by FuncnameGetCandidates */
+		if (!OidIsValid(clist->oid))
+		{
+			*lookupError = FUNCLOOKUP_AMBIGUOUS;
+			return InvalidOid;
+		}
+
+		/* Check objtype match, if specified */
+		switch (objtype)
+		{
+			case OBJECT_FUNCTION:
+			case OBJECT_AGGREGATE:
+				/* Ignore procedures */
+				if (get_func_prokind(clist->oid) == PROKIND_PROCEDURE)
+					continue;
+				break;
+			case OBJECT_PROCEDURE:
+				/* Ignore non-procedures */
+				if (get_func_prokind(clist->oid) != PROKIND_PROCEDURE)
+					continue;
+				break;
+			case OBJECT_ROUTINE:
+				/* no restriction */
+				break;
+			default:
+				Assert(false);
+		}
+
+		/* Check for multiple matches */
+		if (OidIsValid(result))
+		{
+			*lookupError = FUNCLOOKUP_AMBIGUOUS;
+			return InvalidOid;
+		}
+
+		/* OK, we have a candidate */
+		result = clist->oid;
+	}
+
+	return result;
+}
+
+/*
  * LookupFuncName
  *
  * Given a possibly-qualified function name and optionally a set of argument
- * types, look up the function.  Pass nargs == -1 to indicate that no argument
- * types are specified.
+ * types, look up the function.  Pass nargs == -1 to indicate that the number
+ * and types of the arguments are unspecified (this is NOT the same as
+ * specifying that there are no arguments).
  *
  * If the function name is not schema-qualified, it is sought in the current
  * namespace search path.
  *
- * If the function is not found, we return InvalidOid if noError is true,
+ * If the function is not found, we return InvalidOid if missing_ok is true,
  * else raise an error.
+ *
+ * If nargs == -1 and multiple functions are found matching this function name
+ * we will raise an ambiguous-function error, regardless of what missing_ok is
+ * set to.
+ *
+ * Only functions will be found; procedures will be ignored even if they
+ * match the name and argument types.  (However, we don't trouble to reject
+ * aggregates or window functions here.)
  */
 Oid
-LookupFuncName(List *funcname, int nargs, const Oid *argtypes, bool noError)
+LookupFuncName(List *funcname, int nargs, const Oid *argtypes, bool missing_ok)
 {
-	FuncCandidateList clist;
+	Oid			funcoid;
+	FuncLookupError lookupError;
 
-	/* Passing NULL for argtypes is no longer allowed */
-	Assert(argtypes);
+	funcoid = LookupFuncNameInternal(OBJECT_FUNCTION,
+									 funcname, nargs, argtypes,
+									 false, missing_ok,
+									 &lookupError);
 
-	clist = FuncnameGetCandidates(funcname, nargs, NIL, false, false, noError);
+	if (OidIsValid(funcoid))
+		return funcoid;
 
-	/*
-	 * If no arguments were specified, the name must yield a unique candidate.
-	 */
-	if (nargs == -1)
+	switch (lookupError)
 	{
-		if (clist)
-		{
-			if (clist->next)
-			{
-				if (!noError)
-					ereport(ERROR,
-							(errcode(ERRCODE_AMBIGUOUS_FUNCTION),
-							 errmsg("function name \"%s\" is not unique",
-									NameListToString(funcname)),
-							 errhint("Specify the argument list to select the function unambiguously.")));
-			}
-			else
-				return clist->oid;
-		}
-		else
-		{
-			if (!noError)
+		case FUNCLOOKUP_NOSUCHFUNC:
+			/* Let the caller deal with it when missing_ok is true */
+			if (missing_ok)
+				return InvalidOid;
+
+			if (nargs < 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_UNDEFINED_FUNCTION),
 						 errmsg("could not find a function named \"%s\"",
 								NameListToString(funcname))));
-		}
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_FUNCTION),
+						 errmsg("function %s does not exist",
+								func_signature_string(funcname, nargs,
+													  NIL, argtypes))));
+			break;
+
+		case FUNCLOOKUP_AMBIGUOUS:
+			/* Raise an error regardless of missing_ok */
+			ereport(ERROR,
+					(errcode(ERRCODE_AMBIGUOUS_FUNCTION),
+					 errmsg("function name \"%s\" is not unique",
+							NameListToString(funcname)),
+					 errhint("Specify the argument list to select the function unambiguously.")));
+			break;
 	}
 
-	while (clist)
-	{
-		if (memcmp(argtypes, clist->args, nargs * sizeof(Oid)) == 0)
-			return clist->oid;
-		clist = clist->next;
-	}
-
-	if (!noError)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_FUNCTION),
-				 errmsg("function %s does not exist",
-						func_signature_string(funcname, nargs,
-											  NIL, argtypes))));
-
-	return InvalidOid;
+	return InvalidOid;			/* Keep compiler quiet */
 }
 
 /*
  * LookupFuncWithArgs
  *
- * Like LookupFuncName, but the argument types are specified by a
+ * Like LookupFuncName, but the argument types are specified by an
  * ObjectWithArgs node.  Also, this function can check whether the result is a
  * function, procedure, or aggregate, based on the objtype argument.  Pass
  * OBJECT_ROUTINE to accept any of them.
  *
  * For historical reasons, we also accept aggregates when looking for a
  * function.
+ *
+ * When missing_ok is true we don't generate any error for missing objects and
+ * return InvalidOid.  Other types of errors can still be raised, regardless
+ * of the value of missing_ok.
  */
 Oid
-LookupFuncWithArgs(ObjectType objtype, ObjectWithArgs *func, bool noError)
+LookupFuncWithArgs(ObjectType objtype, ObjectWithArgs *func, bool missing_ok)
 {
-	Oid			argoids[FUNC_MAX_ARGS];
+	Oid			argoids[FUNC_MAX_ARGS] = {0};
 	int			argcount;
+	int			nargs;
 	int			i;
 	ListCell   *args_item;
 	Oid			oid;
+	FuncLookupError lookupError;
 
 	Assert(objtype == OBJECT_AGGREGATE ||
 		   objtype == OBJECT_FUNCTION ||
@@ -2117,114 +2407,280 @@ LookupFuncWithArgs(ObjectType objtype, ObjectWithArgs *func, bool noError)
 
 	argcount = list_length(func->objargs);
 	if (argcount > FUNC_MAX_ARGS)
-		ereport(ERROR,
-				(errcode(ERRCODE_TOO_MANY_ARGUMENTS),
-				 errmsg_plural("functions cannot have more than %d argument",
-							   "functions cannot have more than %d arguments",
-							   FUNC_MAX_ARGS,
-							   FUNC_MAX_ARGS)));
-
-	args_item = list_head(func->objargs);
-	for (i = 0; i < argcount; i++)
 	{
-		TypeName   *t = (TypeName *) lfirst(args_item);
-
-		argoids[i] = LookupTypeNameOid(NULL, t, noError);
-		args_item = lnext(args_item);
+		if (objtype == OBJECT_PROCEDURE)
+			ereport(ERROR,
+					(errcode(ERRCODE_TOO_MANY_ARGUMENTS),
+					 errmsg_plural("procedures cannot have more than %d argument",
+								   "procedures cannot have more than %d arguments",
+								   FUNC_MAX_ARGS,
+								   FUNC_MAX_ARGS)));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_TOO_MANY_ARGUMENTS),
+					 errmsg_plural("functions cannot have more than %d argument",
+								   "functions cannot have more than %d arguments",
+								   FUNC_MAX_ARGS,
+								   FUNC_MAX_ARGS)));
 	}
 
 	/*
-	 * When looking for a function or routine, we pass noError through to
-	 * LookupFuncName and let it make any error messages.  Otherwise, we make
-	 * our own errors for the aggregate and procedure cases.
+	 * First, perform a lookup considering only input arguments (traditional
+	 * Postgres rules).
 	 */
-	oid = LookupFuncName(func->objname, func->args_unspecified ? -1 : argcount, argoids,
-						 (objtype == OBJECT_FUNCTION || objtype == OBJECT_ROUTINE) ? noError : true);
-
-	if (objtype == OBJECT_FUNCTION)
+	i = 0;
+	foreach(args_item, func->objargs)
 	{
-		/* Make sure it's a function, not a procedure */
-		if (oid && get_func_prokind(oid) == PROKIND_PROCEDURE)
-		{
-			if (noError)
-				return InvalidOid;
-			ereport(ERROR,
-					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("%s is not a function",
-							func_signature_string(func->objname, argcount,
-												  NIL, argoids))));
-		}
-	}
-	else if (objtype == OBJECT_PROCEDURE)
-	{
-		if (!OidIsValid(oid))
-		{
-			if (noError)
-				return InvalidOid;
-			else if (func->args_unspecified)
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_FUNCTION),
-						 errmsg("could not find a procedure named \"%s\"",
-								NameListToString(func->objname))));
-			else
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_FUNCTION),
-						 errmsg("procedure %s does not exist",
-								func_signature_string(func->objname, argcount,
-													  NIL, argoids))));
-		}
+		TypeName   *t = lfirst_node(TypeName, args_item);
 
-		/* Make sure it's a procedure */
-		if (get_func_prokind(oid) != PROKIND_PROCEDURE)
-		{
-			if (noError)
-				return InvalidOid;
-			ereport(ERROR,
-					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("%s is not a procedure",
-							func_signature_string(func->objname, argcount,
-												  NIL, argoids))));
-		}
-	}
-	else if (objtype == OBJECT_AGGREGATE)
-	{
-		if (!OidIsValid(oid))
-		{
-			if (noError)
-				return InvalidOid;
-			else if (func->args_unspecified)
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_FUNCTION),
-						 errmsg("could not find an aggregate named \"%s\"",
-								NameListToString(func->objname))));
-			else if (argcount == 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_FUNCTION),
-						 errmsg("aggregate %s(*) does not exist",
-								NameListToString(func->objname))));
-			else
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_FUNCTION),
-						 errmsg("aggregate %s does not exist",
-								func_signature_string(func->objname, argcount,
-													  NIL, argoids))));
-		}
-
-		/* Make sure it's an aggregate */
-		if (get_func_prokind(oid) != PROKIND_AGGREGATE)
-		{
-			if (noError)
-				return InvalidOid;
-			/* we do not use the (*) notation for functions... */
-			ereport(ERROR,
-					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("function %s is not an aggregate",
-							func_signature_string(func->objname, argcount,
-												  NIL, argoids))));
-		}
+		argoids[i] = LookupTypeNameOid(NULL, t, missing_ok);
+		if (!OidIsValid(argoids[i]))
+			return InvalidOid;	/* missing_ok must be true */
+		i++;
 	}
 
-	return oid;
+	/*
+	 * Set nargs for LookupFuncNameInternal. It expects -1 to mean no args
+	 * were specified.
+	 */
+	nargs = func->args_unspecified ? -1 : argcount;
+
+	/*
+	 * In args_unspecified mode, also tell LookupFuncNameInternal to consider
+	 * the object type, since there seems no reason not to.  However, if we
+	 * have an argument list, disable the objtype check, because we'd rather
+	 * complain about "object is of wrong type" than "object doesn't exist".
+	 * (Note that with args, FuncnameGetCandidates will have ensured there's
+	 * only one argtype match, so we're not risking an ambiguity failure via
+	 * this choice.)
+	 */
+	oid = LookupFuncNameInternal(func->args_unspecified ? objtype : OBJECT_ROUTINE,
+								 func->objname, nargs, argoids,
+								 false, missing_ok,
+								 &lookupError);
+
+	/*
+	 * If PROCEDURE or ROUTINE was specified, and we have an argument list
+	 * that contains no parameter mode markers, and we didn't already discover
+	 * that there's ambiguity, perform a lookup considering all arguments.
+	 * (Note: for a zero-argument procedure, or in args_unspecified mode, the
+	 * normal lookup is sufficient; so it's OK to require non-NIL objfuncargs
+	 * to perform this lookup.)
+	 */
+	if ((objtype == OBJECT_PROCEDURE || objtype == OBJECT_ROUTINE) &&
+		func->objfuncargs != NIL &&
+		lookupError != FUNCLOOKUP_AMBIGUOUS)
+	{
+		bool		have_param_mode = false;
+
+		/*
+		 * Check for non-default parameter mode markers.  If there are any,
+		 * then the command does not conform to SQL-spec syntax, so we may
+		 * assume that the traditional Postgres lookup method of considering
+		 * only input parameters is sufficient.  (Note that because the spec
+		 * doesn't have OUT arguments for functions, we also don't need this
+		 * hack in FUNCTION or AGGREGATE mode.)
+		 */
+		foreach(args_item, func->objfuncargs)
+		{
+			FunctionParameter *fp = lfirst_node(FunctionParameter, args_item);
+
+			if (fp->mode != FUNC_PARAM_DEFAULT)
+			{
+				have_param_mode = true;
+				break;
+			}
+		}
+
+		if (!have_param_mode)
+		{
+			Oid			poid;
+
+			/* Without mode marks, objargs surely includes all params */
+			Assert(list_length(func->objfuncargs) == argcount);
+
+			/* For objtype == OBJECT_PROCEDURE, we can ignore non-procedures */
+			poid = LookupFuncNameInternal(objtype, func->objname,
+										  argcount, argoids,
+										  true, missing_ok,
+										  &lookupError);
+
+			/* Combine results, handling ambiguity */
+			if (OidIsValid(poid))
+			{
+				if (OidIsValid(oid) && oid != poid)
+				{
+					/* oops, we got hits both ways, on different objects */
+					oid = InvalidOid;
+					lookupError = FUNCLOOKUP_AMBIGUOUS;
+				}
+				else
+					oid = poid;
+			}
+			else if (lookupError == FUNCLOOKUP_AMBIGUOUS)
+				oid = InvalidOid;
+		}
+	}
+
+	if (OidIsValid(oid))
+	{
+		/*
+		 * Even if we found the function, perform validation that the objtype
+		 * matches the prokind of the found function.  For historical reasons
+		 * we allow the objtype of FUNCTION to include aggregates and window
+		 * functions; but we draw the line if the object is a procedure.  That
+		 * is a new enough feature that this historical rule does not apply.
+		 *
+		 * (This check is partially redundant with the objtype check in
+		 * LookupFuncNameInternal; but not entirely, since we often don't tell
+		 * LookupFuncNameInternal to apply that check at all.)
+		 */
+		switch (objtype)
+		{
+			case OBJECT_FUNCTION:
+				/* Only complain if it's a procedure. */
+				if (get_func_prokind(oid) == PROKIND_PROCEDURE)
+					ereport(ERROR,
+							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+							 errmsg("%s is not a function",
+									func_signature_string(func->objname, argcount,
+														  NIL, argoids))));
+				break;
+
+			case OBJECT_PROCEDURE:
+				/* Reject if found object is not a procedure. */
+				if (get_func_prokind(oid) != PROKIND_PROCEDURE)
+					ereport(ERROR,
+							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+							 errmsg("%s is not a procedure",
+									func_signature_string(func->objname, argcount,
+														  NIL, argoids))));
+				break;
+
+			case OBJECT_AGGREGATE:
+				/* Reject if found object is not an aggregate. */
+				if (get_func_prokind(oid) != PROKIND_AGGREGATE)
+					ereport(ERROR,
+							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+							 errmsg("function %s is not an aggregate",
+									func_signature_string(func->objname, argcount,
+														  NIL, argoids))));
+				break;
+
+			default:
+				/* OBJECT_ROUTINE accepts anything. */
+				break;
+		}
+
+		return oid;				/* All good */
+	}
+	else
+	{
+		/* Deal with cases where the lookup failed */
+		switch (lookupError)
+		{
+			case FUNCLOOKUP_NOSUCHFUNC:
+				/* Suppress no-such-func errors when missing_ok is true */
+				if (missing_ok)
+					break;
+
+				switch (objtype)
+				{
+					case OBJECT_PROCEDURE:
+						if (func->args_unspecified)
+							ereport(ERROR,
+									(errcode(ERRCODE_UNDEFINED_FUNCTION),
+									 errmsg("could not find a procedure named \"%s\"",
+											NameListToString(func->objname))));
+						else
+							ereport(ERROR,
+									(errcode(ERRCODE_UNDEFINED_FUNCTION),
+									 errmsg("procedure %s does not exist",
+											func_signature_string(func->objname, argcount,
+																  NIL, argoids))));
+						break;
+
+					case OBJECT_AGGREGATE:
+						if (func->args_unspecified)
+							ereport(ERROR,
+									(errcode(ERRCODE_UNDEFINED_FUNCTION),
+									 errmsg("could not find an aggregate named \"%s\"",
+											NameListToString(func->objname))));
+						else if (argcount == 0)
+							ereport(ERROR,
+									(errcode(ERRCODE_UNDEFINED_FUNCTION),
+									 errmsg("aggregate %s(*) does not exist",
+											NameListToString(func->objname))));
+						else
+							ereport(ERROR,
+									(errcode(ERRCODE_UNDEFINED_FUNCTION),
+									 errmsg("aggregate %s does not exist",
+											func_signature_string(func->objname, argcount,
+																  NIL, argoids))));
+						break;
+
+					default:
+						/* FUNCTION and ROUTINE */
+						if (func->args_unspecified)
+							ereport(ERROR,
+									(errcode(ERRCODE_UNDEFINED_FUNCTION),
+									 errmsg("could not find a function named \"%s\"",
+											NameListToString(func->objname))));
+						else
+							ereport(ERROR,
+									(errcode(ERRCODE_UNDEFINED_FUNCTION),
+									 errmsg("function %s does not exist",
+											func_signature_string(func->objname, argcount,
+																  NIL, argoids))));
+						break;
+				}
+				break;
+
+			case FUNCLOOKUP_AMBIGUOUS:
+				switch (objtype)
+				{
+					case OBJECT_FUNCTION:
+						ereport(ERROR,
+								(errcode(ERRCODE_AMBIGUOUS_FUNCTION),
+								 errmsg("function name \"%s\" is not unique",
+										NameListToString(func->objname)),
+								 func->args_unspecified ?
+								 errhint("Specify the argument list to select the function unambiguously.") : 0));
+						break;
+					case OBJECT_PROCEDURE:
+						ereport(ERROR,
+								(errcode(ERRCODE_AMBIGUOUS_FUNCTION),
+								 errmsg("procedure name \"%s\" is not unique",
+										NameListToString(func->objname)),
+								 func->args_unspecified ?
+								 errhint("Specify the argument list to select the procedure unambiguously.") : 0));
+						break;
+					case OBJECT_AGGREGATE:
+						ereport(ERROR,
+								(errcode(ERRCODE_AMBIGUOUS_FUNCTION),
+								 errmsg("aggregate name \"%s\" is not unique",
+										NameListToString(func->objname)),
+								 func->args_unspecified ?
+								 errhint("Specify the argument list to select the aggregate unambiguously.") : 0));
+						break;
+					case OBJECT_ROUTINE:
+						ereport(ERROR,
+								(errcode(ERRCODE_AMBIGUOUS_FUNCTION),
+								 errmsg("routine name \"%s\" is not unique",
+										NameListToString(func->objname)),
+								 func->args_unspecified ?
+								 errhint("Specify the argument list to select the routine unambiguously.") : 0));
+						break;
+
+					default:
+						Assert(false);	/* Disallowed by Assert above */
+						break;
+				}
+				break;
+		}
+
+		return InvalidOid;
+	}
 }
 
 /*
@@ -2299,9 +2755,6 @@ check_srf_call_placement(ParseState *pstate, Node *last_srf, int location)
 			break;
 		case EXPR_KIND_WINDOW_PARTITION:
 		case EXPR_KIND_WINDOW_ORDER:
-			/* okay, these are effectively GROUP BY/ORDER BY */
-			pstate->p_hasTargetSRFs = true;
-			break;
 		case EXPR_KIND_WINDOW_FRAME_RANGE:
 		case EXPR_KIND_WINDOW_FRAME_ROWS:
 		case EXPR_KIND_WINDOW_FRAME_GROUPS:
@@ -2331,6 +2784,7 @@ check_srf_call_placement(ParseState *pstate, Node *last_srf, int location)
 			errkind = true;
 			break;
 		case EXPR_KIND_RETURNING:
+		case EXPR_KIND_MERGE_RETURNING:
 			errkind = true;
 			break;
 		case EXPR_KIND_VALUES:
@@ -2340,6 +2794,9 @@ check_srf_call_placement(ParseState *pstate, Node *last_srf, int location)
 		case EXPR_KIND_VALUES_SINGLE:
 			/* okay, since we process this like a SELECT tlist */
 			pstate->p_hasTargetSRFs = true;
+			break;
+		case EXPR_KIND_MERGE_WHEN:
+			err = _("set-returning functions are not allowed in MERGE WHEN conditions");
 			break;
 		case EXPR_KIND_CHECK_CONSTRAINT:
 		case EXPR_KIND_DOMAIN_CHECK:
@@ -2355,6 +2812,9 @@ check_srf_call_placement(ParseState *pstate, Node *last_srf, int location)
 		case EXPR_KIND_INDEX_PREDICATE:
 			err = _("set-returning functions are not allowed in index predicates");
 			break;
+		case EXPR_KIND_STATS_EXPRESSION:
+			err = _("set-returning functions are not allowed in statistics expressions");
+			break;
 		case EXPR_KIND_ALTER_COL_TRANSFORM:
 			err = _("set-returning functions are not allowed in transform expressions");
 			break;
@@ -2364,11 +2824,23 @@ check_srf_call_placement(ParseState *pstate, Node *last_srf, int location)
 		case EXPR_KIND_TRIGGER_WHEN:
 			err = _("set-returning functions are not allowed in trigger WHEN conditions");
 			break;
+		case EXPR_KIND_PARTITION_BOUND:
+			err = _("set-returning functions are not allowed in partition bound");
+			break;
 		case EXPR_KIND_PARTITION_EXPRESSION:
 			err = _("set-returning functions are not allowed in partition key expressions");
 			break;
 		case EXPR_KIND_CALL_ARGUMENT:
 			err = _("set-returning functions are not allowed in CALL arguments");
+			break;
+		case EXPR_KIND_COPY_WHERE:
+			err = _("set-returning functions are not allowed in COPY FROM WHERE conditions");
+			break;
+		case EXPR_KIND_GENERATED_COLUMN:
+			err = _("set-returning functions are not allowed in column generation expressions");
+			break;
+		case EXPR_KIND_CYCLE_MARK:
+			errkind = true;
 			break;
 
 			/*

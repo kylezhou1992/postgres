@@ -90,11 +90,11 @@
  * This is the structure used for entries in the old contrib/hstore
  * implementation. Notice that this is the same size as the new entry
  * (two 32-bit words per key/value pair) and that the header is the
- * same, so the old and new versions of ARRPTR, STRPTR, CALCDATASIZE
- * etc. are compatible.
+ * same, so the old and new versions of ARRPTR, STRPTR,
+ * hstoreCalcDataSize etc. are compatible.
  *
  * If the above statement isn't true on some bizarre platform, we're
- * a bit hosed (see StaticAssertStmt in hstoreValidOldFormat).
+ * a bit hosed.
  */
 typedef struct
 {
@@ -104,6 +104,9 @@ typedef struct
 				valisnull:1,
 				pos:31;
 } HOldEntry;
+
+StaticAssertDecl(sizeof(HOldEntry) == 2 * sizeof(HEntry),
+				 "old hstore format is not upward-compatible");
 
 static int	hstoreValidNewFormat(HStore *hs);
 static int	hstoreValidOldFormat(HStore *hs);
@@ -120,8 +123,8 @@ hstoreValidNewFormat(HStore *hs)
 {
 	int			count = HS_COUNT(hs);
 	HEntry	   *entries = ARRPTR(hs);
-	int			buflen = (count) ? HSE_ENDPOS(entries[2 * (count) - 1]) : 0;
-	int			vsize = CALCDATASIZE(count, buflen);
+	Size		buflen = (count) ? HSE_ENDPOS(entries[2 * (count) - 1]) : 0;
+	Size		vsize = hstoreCalcDataSize(count, buflen);
 	int			i;
 
 	if (hs->size_ & HS_FLAG_NEWVERSION)
@@ -170,18 +173,14 @@ hstoreValidNewFormat(HStore *hs)
 static int
 hstoreValidOldFormat(HStore *hs)
 {
-	int			count = hs->size_;
+	uint32		count = hs->size_;
 	HOldEntry  *entries = (HOldEntry *) ARRPTR(hs);
-	int			vsize;
-	int			lastpos = 0;
-	int			i;
+	Size		vsize;
+	Size		lastpos = 0;
+	uint32		i;
 
 	if (hs->size_ & HS_FLAG_NEWVERSION)
 		return 0;
-
-	/* New format uses an HEntry for key and another for value */
-	StaticAssertStmt(sizeof(HOldEntry) == 2 * sizeof(HEntry),
-					 "old hstore format is not upward-compatible");
 
 	if (count == 0)
 		return 2;
@@ -189,7 +188,7 @@ hstoreValidOldFormat(HStore *hs)
 	if (count > 0xFFFFFFF)
 		return 0;
 
-	if (CALCDATASIZE(count, 0) > VARSIZE(hs))
+	if (hstoreCalcDataSize(count, 0) > VARSIZE(hs))
 		return 0;
 
 	if (entries[0].pos != 0)
@@ -213,11 +212,12 @@ hstoreValidOldFormat(HStore *hs)
 	{
 		if (entries[i].pos != lastpos)
 			return 0;
-		lastpos += (entries[i].keylen
-					+ ((entries[i].valisnull) ? 0 : entries[i].vallen));
+		lastpos = add_size(lastpos,
+						   entries[i].keylen
+						   + ((entries[i].valisnull) ? 0 : entries[i].vallen));
 	}
 
-	vsize = CALCDATASIZE(count, lastpos);
+	vsize = hstoreCalcDataSize(count, lastpos);
 
 	if (vsize > VARSIZE(hs))
 		return 0;
@@ -238,34 +238,35 @@ hstoreUpgrade(Datum orig)
 	HStore	   *hs = (HStore *) PG_DETOAST_DATUM(orig);
 	int			valid_new;
 	int			valid_old;
-	bool		writable;
 
 	/* Return immediately if no conversion needed */
-	if ((hs->size_ & HS_FLAG_NEWVERSION) ||
-		hs->size_ == 0 ||
-		(VARSIZE(hs) < 32768 && HSE_ISFIRST((ARRPTR(hs)[0]))))
+	if (hs->size_ & HS_FLAG_NEWVERSION)
 		return hs;
+
+	/* Do we have a writable copy? If not, make one. */
+	if ((void *) hs == (void *) DatumGetPointer(orig))
+		hs = (HStore *) PG_DETOAST_DATUM_COPY(orig);
+
+	if (hs->size_ == 0 ||
+		(VARSIZE(hs) < 32768 && HSE_ISFIRST((ARRPTR(hs)[0]))))
+	{
+		HS_SETCOUNT(hs, HS_COUNT(hs));
+		HS_FIXSIZE(hs, HS_COUNT(hs));
+		return hs;
+	}
 
 	valid_new = hstoreValidNewFormat(hs);
 	valid_old = hstoreValidOldFormat(hs);
-	/* Do we have a writable copy? */
-	writable = ((void *) hs != (void *) DatumGetPointer(orig));
 
 	if (!valid_old || hs->size_ == 0)
 	{
 		if (valid_new)
 		{
 			/*
-			 * force the "new version" flag and the correct varlena length,
-			 * but only if we have a writable copy already (which we almost
-			 * always will, since short new-format values won't come through
-			 * here)
+			 * force the "new version" flag and the correct varlena length.
 			 */
-			if (writable)
-			{
-				HS_SETCOUNT(hs, HS_COUNT(hs));
-				HS_FIXSIZE(hs, HS_COUNT(hs));
-			}
+			HS_SETCOUNT(hs, HS_COUNT(hs));
+			HS_FIXSIZE(hs, HS_COUNT(hs));
 			return hs;
 		}
 		else
@@ -298,19 +299,14 @@ hstoreUpgrade(Datum orig)
 
 	if (valid_new)
 	{
-#if HSTORE_IS_HSTORE_NEW
+#ifdef HSTORE_IS_HSTORE_NEW
 		elog(WARNING, "ambiguous hstore value resolved as hstore-new");
 
 		/*
-		 * force the "new version" flag and the correct varlena length, but
-		 * only if we have a writable copy already (which we almost always
-		 * will, since short new-format values won't come through here)
+		 * force the "new version" flag and the correct varlena length.
 		 */
-		if (writable)
-		{
-			HS_SETCOUNT(hs, HS_COUNT(hs));
-			HS_FIXSIZE(hs, HS_COUNT(hs));
-		}
+		HS_SETCOUNT(hs, HS_COUNT(hs));
+		HS_FIXSIZE(hs, HS_COUNT(hs));
 		return hs;
 #else
 		elog(WARNING, "ambiguous hstore value resolved as hstore-old");
@@ -318,18 +314,13 @@ hstoreUpgrade(Datum orig)
 	}
 
 	/*
-	 * must have an old-style value. Overwrite it in place as a new-style one,
-	 * making sure we have a writable copy first.
+	 * must have an old-style value. Overwrite it in place as a new-style one.
 	 */
-
-	if (!writable)
-		hs = (HStore *) PG_DETOAST_DATUM_COPY(orig);
-
 	{
-		int			count = hs->size_;
+		uint32		count = hs->size_;
 		HEntry	   *new_entries = ARRPTR(hs);
 		HOldEntry  *old_entries = (HOldEntry *) ARRPTR(hs);
-		int			i;
+		uint32		i;
 
 		for (i = 0; i < count; ++i)
 		{

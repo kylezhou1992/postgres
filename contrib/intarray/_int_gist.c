@@ -4,17 +4,29 @@
 #include "postgres.h"
 
 #include <limits.h>
-
-#include "access/gist.h"
-#include "access/stratnum.h"
+#include <math.h>
 
 #include "_int.h"
+#include "access/gist.h"
+#include "access/reloptions.h"
+#include "access/stratnum.h"
 
 #define GETENTRY(vec,pos) ((ArrayType *) DatumGetPointer((vec)->vector[(pos)].key))
 
 /*
-** GiST support methods
-*/
+ * Control the maximum sparseness of compressed keys.
+ *
+ * The upper safe bound for this limit is half the maximum allocatable array
+ * size. A lower bound would give more guarantees that pathological data
+ * wouldn't eat excessive CPU and memory, but at the expense of breaking
+ * possibly working (after a fashion) indexes.
+ */
+#define MAXNUMELTS (Min((MaxAllocSize / sizeof(Datum)),((MaxAllocSize - ARR_OVERHEAD_NONULLS(1)) / sizeof(int)))/2)
+/* or: #define MAXNUMELTS 1000000 */
+
+/*
+ * GiST support methods
+ */
 PG_FUNCTION_INFO_V1(g_int_consistent);
 PG_FUNCTION_INFO_V1(g_int_compress);
 PG_FUNCTION_INFO_V1(g_int_decompress);
@@ -22,24 +34,26 @@ PG_FUNCTION_INFO_V1(g_int_penalty);
 PG_FUNCTION_INFO_V1(g_int_picksplit);
 PG_FUNCTION_INFO_V1(g_int_union);
 PG_FUNCTION_INFO_V1(g_int_same);
+PG_FUNCTION_INFO_V1(g_int_options);
 
 
 /*
-** The GiST Consistent method for _intments
-** Should return false if for all data items x below entry,
-** the predicate x op query == false, where op is the oper
-** corresponding to strategy in the pg_amop table.
-*/
+ * The GiST Consistent method for _intments
+ * Should return false if for all data items x below entry,
+ * the predicate x op query == false, where op is the oper
+ * corresponding to strategy in the pg_amop table.
+ */
 Datum
 g_int_consistent(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	ArrayType  *query = PG_GETARG_ARRAYTYPE_P_COPY(1);
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
-
-	/* Oid		subtype = PG_GETARG_OID(3); */
+#ifdef NOT_USED
+	Oid			subtype = PG_GETARG_OID(3);
+#endif
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
-	bool		retval;
+	bool		retval = false; /* silence compiler warning */
 
 	/* this is exact except for RTSameStrategyNumber */
 	*recheck = (strategy == RTSameStrategyNumber);
@@ -81,12 +95,23 @@ g_int_consistent(PG_FUNCTION_ARGS)
 			break;
 		case RTContainedByStrategyNumber:
 		case RTOldContainedByStrategyNumber:
+
+			/*
+			 * This code is unreachable as of intarray 1.4, because the <@
+			 * operator has been removed from the opclass.  We keep it for now
+			 * to support older versions of the SQL definitions.
+			 */
 			if (GIST_LEAF(entry))
 				retval = inner_int_contains(query,
 											(ArrayType *) DatumGetPointer(entry->key));
 			else
-				retval = inner_int_overlap((ArrayType *) DatumGetPointer(entry->key),
-										   query);
+			{
+				/*
+				 * Unfortunately, because empty arrays could be anywhere in
+				 * the index, we must search the whole tree.
+				 */
+				retval = true;
+			}
 			break;
 		default:
 			retval = false;
@@ -133,19 +158,22 @@ g_int_union(PG_FUNCTION_ARGS)
 }
 
 /*
-** GiST Compress and Decompress methods
-*/
+ * GiST Compress and Decompress methods
+ */
 Datum
 g_int_compress(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	GISTENTRY  *retval;
 	ArrayType  *r;
-	int			len;
+	int			num_ranges = G_INT_GET_NUMRANGES();
+	int			len,
+				lenr;
 	int		   *dr;
 	int			i,
-				min,
+				j,
 				cand;
+	int64		min;
 
 	if (entry->leafkey)
 	{
@@ -153,11 +181,13 @@ g_int_compress(PG_FUNCTION_ARGS)
 		CHECKARRVALID(r);
 		PREPAREARR(r);
 
-		if (ARRNELEMS(r) >= 2 * MAXNUMRANGE)
-			elog(NOTICE, "input array is too big (%d maximum allowed, %d current), use gist__intbig_ops opclass instead",
-				 2 * MAXNUMRANGE - 1, ARRNELEMS(r));
+		if (ARRNELEMS(r) >= 2 * num_ranges)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("input array is too big (%d maximum allowed, %d current), use gist__intbig_ops opclass instead",
+							2 * num_ranges - 1, ARRNELEMS(r))));
 
-		retval = palloc(sizeof(GISTENTRY));
+		retval = palloc_object(GISTENTRY);
 		gistentryinit(*retval, PointerGetDatum(r),
 					  entry->rel, entry->page, entry->offset, false);
 
@@ -178,7 +208,7 @@ g_int_compress(PG_FUNCTION_ARGS)
 		PG_RETURN_POINTER(entry);
 	}
 
-	if ((len = ARRNELEMS(r)) >= 2 * MAXNUMRANGE)
+	if ((len = ARRNELEMS(r)) >= 2 * num_ranges)
 	{							/* compress */
 		if (r == (ArrayType *) DatumGetPointer(entry->key))
 			r = DatumGetArrayTypePCopy(entry->key);
@@ -186,25 +216,68 @@ g_int_compress(PG_FUNCTION_ARGS)
 
 		dr = ARRPTR(r);
 
-		for (i = len - 1; i >= 0; i--)
-			dr[2 * i] = dr[2 * i + 1] = dr[i];
+		/*
+		 * "len" at this point is the number of ranges we will construct.
+		 * "lenr" is the number of ranges we must eventually remove by
+		 * merging, we must be careful to remove no more than this number.
+		 */
+		lenr = len - num_ranges;
 
-		len *= 2;
-		cand = 1;
-		while (len > MAXNUMRANGE * 2)
+		/*
+		 * Initially assume we can merge consecutive ints into a range. but we
+		 * must count every value removed and stop when lenr runs out
+		 */
+		for (j = i = len - 1; i > 0 && lenr > 0; i--, j--)
 		{
-			min = INT_MAX;
+			int			r_end = dr[i];
+			int			r_start = r_end;
+
+			while (i > 0 && lenr > 0 && dr[i - 1] == r_start - 1)
+				--r_start, --i, --lenr;
+			dr[2 * j] = r_start;
+			dr[2 * j + 1] = r_end;
+		}
+		/* just copy the rest, if any, as trivial ranges */
+		for (; i >= 0; i--, j--)
+			dr[2 * j] = dr[2 * j + 1] = dr[i];
+
+		if (++j)
+		{
+			/*
+			 * shunt everything down to start at the right place
+			 */
+			memmove(&dr[0], &dr[2 * j], 2 * (len - j) * sizeof(int32));
+		}
+
+		/*
+		 * make "len" be number of array elements, not ranges
+		 */
+		len = 2 * (len - j);
+		cand = 1;
+		while (len > num_ranges * 2)
+		{
+			min = PG_INT64_MAX;
 			for (i = 2; i < len; i += 2)
-				if (min > (dr[i] - dr[i - 1]))
+				if (min > ((int64) dr[i] - (int64) dr[i - 1]))
 				{
-					min = (dr[i] - dr[i - 1]);
+					min = ((int64) dr[i] - (int64) dr[i - 1]);
 					cand = i;
 				}
-			memmove((void *) &dr[cand - 1], (void *) &dr[cand + 1], (len - cand - 1) * sizeof(int32));
+			memmove(&dr[cand - 1], &dr[cand + 1], (len - cand - 1) * sizeof(int32));
 			len -= 2;
 		}
+
+		/*
+		 * check sparseness of result
+		 */
+		lenr = internal_size(dr, len);
+		if (lenr < 0 || lenr > MAXNUMELTS)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("data is too sparse, recreate index using gist__intbig_ops opclass instead")));
+
 		r = resize_intArrayType(r, len);
-		retval = palloc(sizeof(GISTENTRY));
+		retval = palloc_object(GISTENTRY);
 		gistentryinit(*retval, PointerGetDatum(r),
 					  entry->rel, entry->page, entry->offset, false);
 		PG_RETURN_POINTER(retval);
@@ -219,13 +292,13 @@ g_int_decompress(PG_FUNCTION_ARGS)
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	GISTENTRY  *retval;
 	ArrayType  *r;
+	int			num_ranges = G_INT_GET_NUMRANGES();
 	int		   *dr,
 				lenr;
 	ArrayType  *in;
 	int			lenin;
 	int		   *din;
-	int			i,
-				j;
+	int			i;
 
 	in = DatumGetArrayTypeP(entry->key);
 
@@ -234,7 +307,7 @@ g_int_decompress(PG_FUNCTION_ARGS)
 	{
 		if (in != (ArrayType *) DatumGetPointer(entry->key))
 		{
-			retval = palloc(sizeof(GISTENTRY));
+			retval = palloc_object(GISTENTRY);
 			gistentryinit(*retval, PointerGetDatum(in),
 						  entry->rel, entry->page, entry->offset, false);
 			PG_RETURN_POINTER(retval);
@@ -245,11 +318,11 @@ g_int_decompress(PG_FUNCTION_ARGS)
 
 	lenin = ARRNELEMS(in);
 
-	if (lenin < 2 * MAXNUMRANGE)
+	if (lenin < 2 * num_ranges)
 	{							/* not compressed value */
 		if (in != (ArrayType *) DatumGetPointer(entry->key))
 		{
-			retval = palloc(sizeof(GISTENTRY));
+			retval = palloc_object(GISTENTRY);
 			gistentryinit(*retval, PointerGetDatum(in),
 						  entry->rel, entry->page, entry->offset, false);
 
@@ -260,18 +333,25 @@ g_int_decompress(PG_FUNCTION_ARGS)
 
 	din = ARRPTR(in);
 	lenr = internal_size(din, lenin);
+	if (lenr < 0 || lenr > MAXNUMELTS)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("compressed array is too big, recreate index using gist__intbig_ops opclass instead")));
 
 	r = new_intArrayType(lenr);
 	dr = ARRPTR(r);
 
 	for (i = 0; i < lenin; i += 2)
-		for (j = din[i]; j <= din[i + 1]; j++)
+	{
+		/* use int64 for j in case din[i + 1] is INT_MAX */
+		for (int64 j = din[i]; j <= din[i + 1]; j++)
 			if ((!i) || *(dr - 1) != j)
-				*dr++ = j;
+				*dr++ = (int) j;
+	}
 
 	if (in != (ArrayType *) DatumGetPointer(entry->key))
 		pfree(in);
-	retval = palloc(sizeof(GISTENTRY));
+	retval = palloc_object(GISTENTRY);
 	gistentryinit(*retval, PointerGetDatum(r),
 				  entry->rel, entry->page, entry->offset, false);
 
@@ -279,8 +359,8 @@ g_int_decompress(PG_FUNCTION_ARGS)
 }
 
 /*
-** The GiST Penalty method for _intments
-*/
+ * The GiST Penalty method for _intments
+ */
 Datum
 g_int_penalty(PG_FUNCTION_ARGS)
 {
@@ -356,9 +436,9 @@ comparecost(const void *a, const void *b)
 }
 
 /*
-** The GiST PickSplit method for _intments
-** We use Guttman's poly time split algorithm
-*/
+ * The GiST PickSplit method for _intments
+ * We use Guttman's poly time split algorithm
+ */
 Datum
 g_int_picksplit(PG_FUNCTION_ARGS)
 {
@@ -456,7 +536,7 @@ g_int_picksplit(PG_FUNCTION_ARGS)
 	/*
 	 * sort entries
 	 */
-	costvector = (SPLITCOST *) palloc(sizeof(SPLITCOST) * maxoff);
+	costvector = palloc_array(SPLITCOST, maxoff);
 	for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i))
 	{
 		costvector[i - 1].pos = i;
@@ -467,9 +547,9 @@ g_int_picksplit(PG_FUNCTION_ARGS)
 		union_d = inner_int_union(datum_r, datum_alpha);
 		rt__int_size(union_d, &size_beta);
 		pfree(union_d);
-		costvector[i - 1].cost = Abs((size_alpha - size_l) - (size_beta - size_r));
+		costvector[i - 1].cost = fabsf((size_alpha - size_l) - (size_beta - size_r));
 	}
-	qsort((void *) costvector, maxoff, sizeof(SPLITCOST), comparecost);
+	qsort(costvector, maxoff, sizeof(SPLITCOST), comparecost);
 
 	/*
 	 * Now split up the regions between the two seeds.  An important property
@@ -541,4 +621,18 @@ g_int_picksplit(PG_FUNCTION_ARGS)
 	v->spl_rdatum = PointerGetDatum(datum_r);
 
 	PG_RETURN_POINTER(v);
+}
+
+Datum
+g_int_options(PG_FUNCTION_ARGS)
+{
+	local_relopts *relopts = (local_relopts *) PG_GETARG_POINTER(0);
+
+	init_local_reloptions(relopts, sizeof(GISTIntArrayOptions));
+	add_local_int_reloption(relopts, "numranges",
+							"number of ranges for compression",
+							G_INT_NUMRANGES_DEFAULT, 1, G_INT_NUMRANGES_MAX,
+							offsetof(GISTIntArrayOptions, num_ranges));
+
+	PG_RETURN_VOID();
 }

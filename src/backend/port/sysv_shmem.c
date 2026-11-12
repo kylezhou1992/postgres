@@ -9,7 +9,7 @@
  * exist, though, because mmap'd shmem provides no way to find out how
  * many processes are attached, which we need for interlocking purposes.
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -22,22 +22,21 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/file.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#ifdef HAVE_SYS_IPC_H
 #include <sys/ipc.h>
-#endif
-#ifdef HAVE_SYS_SHM_H
+#include <sys/mman.h>
 #include <sys/shm.h>
-#endif
+#include <sys/stat.h>
 
 #include "miscadmin.h"
+#include "port/pg_bitutils.h"
 #include "portability/mem.h"
 #include "storage/dsm.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/pg_shmem.h"
+#include "storage/shmem.h"
 #include "utils/guc.h"
+#include "utils/guc_hooks.h"
 #include "utils/pidfile.h"
 
 
@@ -62,29 +61,49 @@
  * to a process after exec().  Since EXEC_BACKEND is intended only for
  * developer use, this shouldn't be a big problem.  Because of this, we do
  * not worry about supporting anonymous shmem in the EXEC_BACKEND cases below.
+ *
+ * As of PostgreSQL 12, we regained the ability to use a large System V shared
+ * memory region even in non-EXEC_BACKEND builds, if shared_memory_type is set
+ * to sysv (though this is not the default).
  */
-#ifndef EXEC_BACKEND
-#define USE_ANONYMOUS_SHMEM
-#endif
 
 
 typedef key_t IpcMemoryKey;		/* shared memory key passed to shmget(2) */
 typedef int IpcMemoryId;		/* shared memory ID returned by shmget(2) */
 
+/*
+ * How does a given IpcMemoryId relate to this PostgreSQL process?
+ *
+ * One could recycle unattached segments of different data directories if we
+ * distinguished that case from other SHMSTATE_FOREIGN cases.  Doing so would
+ * cause us to visit less of the key space, making us less likely to detect a
+ * SHMSTATE_ATTACHED key.  It would also complicate the concurrency analysis,
+ * in that postmasters of different data directories could simultaneously
+ * attempt to recycle a given key.  We'll waste keys longer in some cases, but
+ * avoiding the problems of the alternative justifies that loss.
+ */
+typedef enum
+{
+	SHMSTATE_ANALYSIS_FAILURE,	/* unexpected failure to analyze the ID */
+	SHMSTATE_ATTACHED,			/* pertinent to DataDir, has attached PIDs */
+	SHMSTATE_ENOENT,			/* no segment of that ID */
+	SHMSTATE_FOREIGN,			/* exists, but not pertinent to DataDir */
+	SHMSTATE_UNATTACHED,		/* pertinent to DataDir, no attached PIDs */
+} IpcMemoryState;
+
 
 unsigned long UsedShmemSegID = 0;
 void	   *UsedShmemSegAddr = NULL;
 
-#ifdef USE_ANONYMOUS_SHMEM
 static Size AnonymousShmemSize;
 static void *AnonymousShmem = NULL;
-#endif
 
 static void *InternalIpcMemoryCreate(IpcMemoryKey memKey, Size size);
 static void IpcMemoryDetach(int status, Datum shmaddr);
 static void IpcMemoryDelete(int status, Datum shmId);
-static PGShmemHeader *PGSharedMemoryAttach(IpcMemoryKey key,
-					 IpcMemoryId *shmid);
+static IpcMemoryState PGSharedMemoryAttach(IpcMemoryId shmId,
+										   void *attachAt,
+										   PGShmemHeader **addr);
 
 
 /*
@@ -122,6 +141,16 @@ InternalIpcMemoryCreate(IpcMemoryKey memKey, Size size)
 
 		if (pg_shmem_addr)
 			requestedAddress = (void *) strtoul(pg_shmem_addr, NULL, 0);
+		else
+		{
+#if defined(__darwin__) && SIZEOF_VOID_P == 8
+			/*
+			 * Provide a default value that is believed to avoid problems with
+			 * ASLR on the current macOS release.
+			 */
+			requestedAddress = (void *) 0x80000000000;
+#endif
+		}
 	}
 #endif
 
@@ -178,7 +207,7 @@ InternalIpcMemoryCreate(IpcMemoryKey memKey, Size size)
 				 */
 				if (shmctl(shmid, IPC_RMID, NULL) < 0)
 					elog(LOG, "shmctl(%d, %d, 0) failed: %m",
-						 (int) shmid, IPC_RMID);
+						 shmid, IPC_RMID);
 			}
 		}
 
@@ -288,14 +317,46 @@ IpcMemoryDelete(int status, Datum shmId)
 bool
 PGSharedMemoryIsInUse(unsigned long id1, unsigned long id2)
 {
-	IpcMemoryId shmId = (IpcMemoryId) id2;
+	PGShmemHeader *memAddress;
+	IpcMemoryState state;
+
+	state = PGSharedMemoryAttach((IpcMemoryId) id2, NULL, &memAddress);
+	if (memAddress && shmdt(memAddress) < 0)
+		elog(LOG, "shmdt(%p) failed: %m", memAddress);
+	switch (state)
+	{
+		case SHMSTATE_ENOENT:
+		case SHMSTATE_FOREIGN:
+		case SHMSTATE_UNATTACHED:
+			return false;
+		case SHMSTATE_ANALYSIS_FAILURE:
+		case SHMSTATE_ATTACHED:
+			return true;
+	}
+	return true;
+}
+
+/*
+ * Test for a segment with id shmId; see comment at IpcMemoryState.
+ *
+ * If the segment exists, we'll attempt to attach to it, using attachAt
+ * if that's not NULL (but it's best to pass NULL if possible).
+ *
+ * *addr is set to the segment memory address if we attached to it, else NULL.
+ */
+static IpcMemoryState
+PGSharedMemoryAttach(IpcMemoryId shmId,
+					 void *attachAt,
+					 PGShmemHeader **addr)
+{
 	struct shmid_ds shmStat;
 	struct stat statbuf;
 	PGShmemHeader *hdr;
 
+	*addr = NULL;
+
 	/*
-	 * We detect whether a shared memory segment is in use by seeing whether
-	 * it (a) exists and (b) has any processes attached to it.
+	 * First, try to stat the shm segment ID, to see if it exists at all.
 	 */
 	if (shmctl(shmId, IPC_STAT, &shmStat) < 0)
 	{
@@ -305,15 +366,15 @@ PGSharedMemoryIsInUse(unsigned long id1, unsigned long id2)
 		 * exists.
 		 */
 		if (errno == EINVAL)
-			return false;
+			return SHMSTATE_ENOENT;
 
 		/*
-		 * EACCES implies that the segment belongs to some other userid, which
-		 * means it is not a Postgres shmem segment (or at least, not one that
-		 * is relevant to our data directory).
+		 * EACCES implies we have no read permission, which means it is not a
+		 * Postgres shmem segment (or at least, not one that is relevant to
+		 * our data directory).
 		 */
 		if (errno == EACCES)
-			return false;
+			return SHMSTATE_FOREIGN;
 
 		/*
 		 * Some Linux kernel versions (in fact, all of them as of July 2007)
@@ -324,33 +385,55 @@ PGSharedMemoryIsInUse(unsigned long id1, unsigned long id2)
 		 */
 #ifdef HAVE_LINUX_EIDRM_BUG
 		if (errno == EIDRM)
-			return false;
+			return SHMSTATE_ENOENT;
 #endif
 
 		/*
-		 * Otherwise, we had better assume that the segment is in use. The
-		 * only likely case is EIDRM, which implies that the segment has been
-		 * IPC_RMID'd but there are still processes attached to it.
+		 * Otherwise, we had better assume that the segment is in use.  The
+		 * only likely case is (non-Linux, assumed spec-compliant) EIDRM,
+		 * which implies that the segment has been IPC_RMID'd but there are
+		 * still processes attached to it.
 		 */
-		return true;
+		return SHMSTATE_ANALYSIS_FAILURE;
 	}
-
-	/* If it has no attached processes, it's not in use */
-	if (shmStat.shm_nattch == 0)
-		return false;
 
 	/*
 	 * Try to attach to the segment and see if it matches our data directory.
-	 * This avoids shmid-conflict problems on machines that are running
-	 * several postmasters under the same userid.
+	 * This avoids any risk of duplicate-shmem-key conflicts on machines that
+	 * are running several postmasters under the same userid.
+	 *
+	 * (When we're called from PGSharedMemoryCreate, this stat call is
+	 * duplicative; but since this isn't a high-traffic case it's not worth
+	 * trying to optimize.)
 	 */
 	if (stat(DataDir, &statbuf) < 0)
-		return true;			/* if can't stat, be conservative */
+		return SHMSTATE_ANALYSIS_FAILURE;	/* can't stat; be conservative */
 
-	hdr = (PGShmemHeader *) shmat(shmId, NULL, PG_SHMAT_FLAGS);
-
+	hdr = (PGShmemHeader *) shmat(shmId, attachAt, PG_SHMAT_FLAGS);
 	if (hdr == (PGShmemHeader *) -1)
-		return true;			/* if can't attach, be conservative */
+	{
+		/*
+		 * Attachment failed.  The cases we're interested in are the same as
+		 * for the shmctl() call above.  In particular, note that the owning
+		 * postmaster could have terminated and removed the segment between
+		 * shmctl() and shmat().
+		 *
+		 * If attachAt isn't NULL, it's possible that EINVAL reflects a
+		 * problem with that address not a vanished segment, so it's best to
+		 * pass NULL when probing for conflicting segments.
+		 */
+		if (errno == EINVAL)
+			return SHMSTATE_ENOENT; /* segment disappeared */
+		if (errno == EACCES)
+			return SHMSTATE_FOREIGN;	/* must be non-Postgres */
+#ifdef HAVE_LINUX_EIDRM_BUG
+		if (errno == EIDRM)
+			return SHMSTATE_ENOENT; /* segment disappeared */
+#endif
+		/* Otherwise, be conservative. */
+		return SHMSTATE_ANALYSIS_FAILURE;
+	}
+	*addr = hdr;
 
 	if (hdr->magic != PGShmemMagic ||
 		hdr->device != statbuf.st_dev ||
@@ -358,24 +441,21 @@ PGSharedMemoryIsInUse(unsigned long id1, unsigned long id2)
 	{
 		/*
 		 * It's either not a Postgres segment, or not one for my data
-		 * directory.  In either case it poses no threat.
+		 * directory.
 		 */
-		shmdt((void *) hdr);
-		return false;
+		return SHMSTATE_FOREIGN;
 	}
 
-	/* Trouble --- looks a lot like there's still live backends */
-	shmdt((void *) hdr);
-
-	return true;
+	/*
+	 * It does match our data directory, so now test whether any processes are
+	 * still attached to it.  (We are, now, but the shm_nattch result is from
+	 * before we attached to it.)
+	 */
+	return shmStat.shm_nattch == 0 ? SHMSTATE_UNATTACHED : SHMSTATE_ATTACHED;
 }
 
-#ifdef USE_ANONYMOUS_SHMEM
-
-#ifdef MAP_HUGETLB
-
 /*
- * Identify the huge page size to use.
+ * Identify the huge page size to use, and compute the related mmap flags.
  *
  * Some Linux kernel versions have a bug causing mmap() to fail on requests
  * that are not a multiple of the hugepage size.  Versions without that bug
@@ -391,25 +471,19 @@ PGSharedMemoryIsInUse(unsigned long id1, unsigned long id2)
  * hugepage sizes, we might want to think about more invasive strategies,
  * such as increasing shared_buffers to absorb the extra space.
  *
- * Returns the (real or assumed) page size into *hugepagesize,
- * and the hugepage-related mmap flags to use into *mmap_flags.
- *
- * Currently *mmap_flags is always just MAP_HUGETLB.  Someday, on systems
- * that support it, we might OR in additional bits to specify a particular
- * non-default huge page size.
+ * Returns the (real, assumed or config provided) page size into
+ * *hugepagesize, and the hugepage-related mmap flags to use into
+ * *mmap_flags if requested by the caller.  If huge pages are not supported,
+ * *hugepagesize and *mmap_flags are set to 0.
  */
-static void
+void
 GetHugePageSize(Size *hugepagesize, int *mmap_flags)
 {
-	/*
-	 * If we fail to find out the system's default huge page size, assume it
-	 * is 2MB.  This will work fine when the actual size is less.  If it's
-	 * more, we might get mmap() or munmap() failures due to unaligned
-	 * requests; but at this writing, there are no reports of any non-Linux
-	 * systems being picky about that.
-	 */
-	*hugepagesize = 2 * 1024 * 1024;
-	*mmap_flags = MAP_HUGETLB;
+#ifdef MAP_HUGETLB
+
+	Size		default_hugepagesize = 0;
+	Size		hugepagesize_local = 0;
+	int			mmap_flags_local = 0;
 
 	/*
 	 * System-dependent code to find out the default huge page size.
@@ -418,6 +492,7 @@ GetHugePageSize(Size *hugepagesize, int *mmap_flags)
 	 * nnnn kB".  Ignore any failures, falling back to the preset default.
 	 */
 #ifdef __linux__
+
 	{
 		FILE	   *fp = AllocateFile("/proc/meminfo", "r");
 		char		buf[128];
@@ -432,7 +507,7 @@ GetHugePageSize(Size *hugepagesize, int *mmap_flags)
 				{
 					if (ch == 'k')
 					{
-						*hugepagesize = sz * (Size) 1024;
+						default_hugepagesize = sz * (Size) 1024;
 						break;
 					}
 					/* We could accept other units besides kB, if needed */
@@ -442,9 +517,77 @@ GetHugePageSize(Size *hugepagesize, int *mmap_flags)
 		}
 	}
 #endif							/* __linux__ */
-}
+
+	if (huge_page_size != 0)
+	{
+		/* If huge page size is requested explicitly, use that. */
+		hugepagesize_local = (Size) huge_page_size * 1024;
+	}
+	else if (default_hugepagesize != 0)
+	{
+		/* Otherwise use the system default, if we have it. */
+		hugepagesize_local = default_hugepagesize;
+	}
+	else
+	{
+		/*
+		 * If we fail to find out the system's default huge page size, or no
+		 * huge page size is requested explicitly, assume it is 2MB. This will
+		 * work fine when the actual size is less.  If it's more, we might get
+		 * mmap() or munmap() failures due to unaligned requests; but at this
+		 * writing, there are no reports of any non-Linux systems being picky
+		 * about that.
+		 */
+		hugepagesize_local = 2 * 1024 * 1024;
+	}
+
+	mmap_flags_local = MAP_HUGETLB;
+
+	/*
+	 * On recent enough Linux, also include the explicit page size, if
+	 * necessary.
+	 */
+#if defined(MAP_HUGE_MASK) && defined(MAP_HUGE_SHIFT)
+	if (hugepagesize_local != default_hugepagesize)
+	{
+		int			shift = pg_ceil_log2_64(hugepagesize_local);
+
+		mmap_flags_local |= (shift & MAP_HUGE_MASK) << MAP_HUGE_SHIFT;
+	}
+#endif
+
+	/* assign the results found */
+	if (mmap_flags)
+		*mmap_flags = mmap_flags_local;
+	if (hugepagesize)
+		*hugepagesize = hugepagesize_local;
+
+#else
+
+	if (hugepagesize)
+		*hugepagesize = 0;
+	if (mmap_flags)
+		*mmap_flags = 0;
 
 #endif							/* MAP_HUGETLB */
+}
+
+/*
+ * GUC check_hook for huge_page_size
+ */
+bool
+check_huge_page_size(int *newval, void **extra, GucSource source)
+{
+#if !(defined(MAP_HUGE_MASK) && defined(MAP_HUGE_SHIFT))
+	/* Recent enough Linux only, for now.  See GetHugePageSize(). */
+	if (*newval != 0)
+	{
+		GUC_check_errdetail("\"huge_page_size\" must be 0 on this platform.");
+		return false;
+	}
+#endif
+	return true;
+}
 
 /*
  * Creates an anonymous mmap()ed shared memory segment.
@@ -459,6 +602,7 @@ CreateAnonymousSegment(Size *size)
 	Size		allocsize = *size;
 	void	   *ptr = MAP_FAILED;
 	int			mmap_errno = 0;
+	int			mmap_flags = MAP_SHARED | MAP_ANONYMOUS | MAP_HASSEMAPHORE;
 
 #ifndef MAP_HUGETLB
 	/* PGSharedMemoryCreate should have dealt with this case */
@@ -470,21 +614,29 @@ CreateAnonymousSegment(Size *size)
 		 * Round up the request size to a suitable large value.
 		 */
 		Size		hugepagesize;
-		int			mmap_flags;
+		int			huge_mmap_flags;
 
-		GetHugePageSize(&hugepagesize, &mmap_flags);
+		GetHugePageSize(&hugepagesize, &huge_mmap_flags);
 
 		if (allocsize % hugepagesize != 0)
-			allocsize += hugepagesize - (allocsize % hugepagesize);
+			allocsize = add_size(allocsize, hugepagesize - (allocsize % hugepagesize));
 
 		ptr = mmap(NULL, allocsize, PROT_READ | PROT_WRITE,
-				   PG_MMAP_FLAGS | mmap_flags, -1, 0);
+				   mmap_flags | huge_mmap_flags, -1, 0);
 		mmap_errno = errno;
 		if (huge_pages == HUGE_PAGES_TRY && ptr == MAP_FAILED)
 			elog(DEBUG1, "mmap(%zu) with MAP_HUGETLB failed, huge pages disabled: %m",
 				 allocsize);
 	}
 #endif
+
+	/*
+	 * Report whether huge pages are in use.  This needs to be tracked before
+	 * the second mmap() call if attempting to use huge pages failed
+	 * previously.
+	 */
+	SetConfigOption("huge_pages_status", (ptr == MAP_FAILED) ? "off" : "on",
+					PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
 
 	if (ptr == MAP_FAILED && huge_pages != HUGE_PAGES_ON)
 	{
@@ -494,7 +646,7 @@ CreateAnonymousSegment(Size *size)
 		 */
 		allocsize = *size;
 		ptr = mmap(NULL, allocsize, PROT_READ | PROT_WRITE,
-				   PG_MMAP_FLAGS, -1, 0);
+				   mmap_flags, -1, 0);
 		mmap_errno = errno;
 	}
 
@@ -508,9 +660,9 @@ CreateAnonymousSegment(Size *size)
 						 "for a shared memory segment exceeded available memory, "
 						 "swap space, or huge pages. To reduce the request size "
 						 "(currently %zu bytes), reduce PostgreSQL's shared "
-						 "memory usage, perhaps by reducing shared_buffers or "
-						 "max_connections.",
-						 *size) : 0));
+						 "memory usage, perhaps by reducing \"shared_buffers\" or "
+						 "\"max_connections\".",
+						 allocsize) : 0));
 	}
 
 	*size = allocsize;
@@ -534,8 +686,6 @@ AnonymousShmemDetach(int status, Datum arg)
 	}
 }
 
-#endif							/* USE_ANONYMOUS_SHMEM */
-
 /*
  * PGSharedMemoryCreate
  *
@@ -543,60 +693,83 @@ AnonymousShmemDetach(int status, Datum arg)
  * standard header.  Also, register an on_shmem_exit callback to release
  * the storage.
  *
- * Dead Postgres segments are recycled if found, but we do not fail upon
- * collision with non-Postgres shmem segments.  The idea here is to detect and
- * re-use keys that may have been assigned by a crashed postmaster or backend.
- *
- * makePrivate means to always create a new segment, rather than attach to
- * or recycle any existing segment.
- *
- * The port number is passed for possible use as a key (for SysV, we use
- * it to generate the starting shmem key).  In a standalone backend,
- * zero will be passed.
+ * Dead Postgres segments pertinent to this DataDir are recycled if found, but
+ * we do not fail upon collision with foreign shmem segments.  The idea here
+ * is to detect and re-use keys that may have been assigned by a crashed
+ * postmaster or backend.
  */
 PGShmemHeader *
-PGSharedMemoryCreate(Size size, bool makePrivate, int port,
+PGSharedMemoryCreate(Size size,
 					 PGShmemHeader **shim)
 {
 	IpcMemoryKey NextShmemSegID;
 	void	   *memAddress;
 	PGShmemHeader *hdr;
-	IpcMemoryId shmid;
 	struct stat statbuf;
 	Size		sysvsize;
 
+	/*
+	 * We use the data directory's ID info (inode and device numbers) to
+	 * positively identify shmem segments associated with this data dir, and
+	 * also as seeds for searching for a free shmem key.
+	 */
+	if (stat(DataDir, &statbuf) < 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not stat data directory \"%s\": %m",
+						DataDir)));
+
 	/* Complain if hugepages demanded but we can't possibly support them */
-#if !defined(USE_ANONYMOUS_SHMEM) || !defined(MAP_HUGETLB)
+#if !defined(MAP_HUGETLB)
 	if (huge_pages == HUGE_PAGES_ON)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("huge pages not supported on this platform")));
 #endif
 
+	/* For now, we don't support huge pages in SysV memory */
+	if (huge_pages == HUGE_PAGES_ON && shared_memory_type != SHMEM_TYPE_MMAP)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("huge pages not supported with the current \"shared_memory_type\" setting")));
+
 	/* Room for a header? */
 	Assert(size > MAXALIGN(sizeof(PGShmemHeader)));
 
-#ifdef USE_ANONYMOUS_SHMEM
-	AnonymousShmem = CreateAnonymousSegment(&size);
-	AnonymousShmemSize = size;
-
-	/* Register on-exit routine to unmap the anonymous segment */
-	on_shmem_exit(AnonymousShmemDetach, (Datum) 0);
-
-	/* Now we need only allocate a minimal-sized SysV shmem block. */
-	sysvsize = sizeof(PGShmemHeader);
-#else
-	sysvsize = size;
-#endif
-
-	/* Make sure PGSharedMemoryAttach doesn't fail without need */
-	UsedShmemSegAddr = NULL;
-
-	/* Loop till we find a free IPC key */
-	NextShmemSegID = port * 1000;
-
-	for (NextShmemSegID++;; NextShmemSegID++)
+	if (shared_memory_type == SHMEM_TYPE_MMAP)
 	{
+		AnonymousShmem = CreateAnonymousSegment(&size);
+		AnonymousShmemSize = size;
+
+		/* Register on-exit routine to unmap the anonymous segment */
+		on_shmem_exit(AnonymousShmemDetach, (Datum) 0);
+
+		/* Now we need only allocate a minimal-sized SysV shmem block. */
+		sysvsize = sizeof(PGShmemHeader);
+	}
+	else
+	{
+		sysvsize = size;
+
+		/* huge pages are only available with mmap */
+		SetConfigOption("huge_pages_status", "off",
+						PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
+	}
+
+	/*
+	 * Loop till we find a free IPC key.  Trust CreateDataDirLockFile() to
+	 * ensure no more than one postmaster per data directory can enter this
+	 * loop simultaneously.  (CreateDataDirLockFile() does not entirely ensure
+	 * that, but prefer fixing it over coping here.)
+	 */
+	NextShmemSegID = statbuf.st_ino;
+
+	for (;;)
+	{
+		IpcMemoryId shmid;
+		PGShmemHeader *oldhdr;
+		IpcMemoryState state;
+
 		/* Try to create new segment */
 		memAddress = InternalIpcMemoryCreate(NextShmemSegID, sysvsize);
 		if (memAddress)
@@ -604,69 +777,77 @@ PGSharedMemoryCreate(Size size, bool makePrivate, int port,
 
 		/* Check shared memory and possibly remove and recreate */
 
-		if (makePrivate)		/* a standalone backend shouldn't do this */
-			continue;
-
-		if ((memAddress = PGSharedMemoryAttach(NextShmemSegID, &shmid)) == NULL)
-			continue;			/* can't attach, not one of mine */
-
 		/*
-		 * If I am not the creator and it belongs to an extant process,
-		 * continue.
+		 * shmget() failure is typically EACCES, hence SHMSTATE_FOREIGN.
+		 * ENOENT, a narrow possibility, implies SHMSTATE_ENOENT, but one can
+		 * safely treat SHMSTATE_ENOENT like SHMSTATE_FOREIGN.
 		 */
-		hdr = (PGShmemHeader *) memAddress;
-		if (hdr->creatorPID != getpid())
+		shmid = shmget(NextShmemSegID, sizeof(PGShmemHeader), 0);
+		if (shmid < 0)
 		{
-			if (kill(hdr->creatorPID, 0) == 0 || errno != ESRCH)
-			{
-				shmdt(memAddress);
-				continue;		/* segment belongs to a live process */
-			}
+			oldhdr = NULL;
+			state = SHMSTATE_FOREIGN;
+		}
+		else
+			state = PGSharedMemoryAttach(shmid, NULL, &oldhdr);
+
+		switch (state)
+		{
+			case SHMSTATE_ANALYSIS_FAILURE:
+			case SHMSTATE_ATTACHED:
+				ereport(FATAL,
+						(errcode(ERRCODE_LOCK_FILE_EXISTS),
+						 errmsg("pre-existing shared memory block (key %lu, ID %lu) is still in use",
+								(unsigned long) NextShmemSegID,
+								(unsigned long) shmid),
+						 errhint("Terminate any old server processes associated with data directory \"%s\".",
+								 DataDir)));
+				break;
+			case SHMSTATE_ENOENT:
+
+				/*
+				 * To our surprise, some other process deleted since our last
+				 * InternalIpcMemoryCreate().  Moments earlier, we would have
+				 * seen SHMSTATE_FOREIGN.  Try that same ID again.
+				 */
+				elog(LOG,
+					 "shared memory block (key %lu, ID %lu) deleted during startup",
+					 (unsigned long) NextShmemSegID,
+					 (unsigned long) shmid);
+				break;
+			case SHMSTATE_FOREIGN:
+				NextShmemSegID++;
+				break;
+			case SHMSTATE_UNATTACHED:
+
+				/*
+				 * The segment pertains to DataDir, and every process that had
+				 * used it has died or detached.  Zap it, if possible, and any
+				 * associated dynamic shared memory segments, as well.  This
+				 * shouldn't fail, but if it does, assume the segment belongs
+				 * to someone else after all, and try the next candidate.
+				 * Otherwise, try again to create the segment.  That may fail
+				 * if some other process creates the same shmem key before we
+				 * do, in which case we'll try the next key.
+				 */
+				if (oldhdr->dsm_control != 0)
+					dsm_cleanup_using_control_segment(oldhdr->dsm_control);
+				if (shmctl(shmid, IPC_RMID, NULL) < 0)
+					NextShmemSegID++;
+				break;
 		}
 
-		/*
-		 * The segment appears to be from a dead Postgres process, or from a
-		 * previous cycle of life in this same process.  Zap it, if possible,
-		 * and any associated dynamic shared memory segments, as well. This
-		 * probably shouldn't fail, but if it does, assume the segment belongs
-		 * to someone else after all, and continue quietly.
-		 */
-		if (hdr->dsm_control != 0)
-			dsm_cleanup_using_control_segment(hdr->dsm_control);
-		shmdt(memAddress);
-		if (shmctl(shmid, IPC_RMID, NULL) < 0)
-			continue;
-
-		/*
-		 * Now try again to create the segment.
-		 */
-		memAddress = InternalIpcMemoryCreate(NextShmemSegID, sysvsize);
-		if (memAddress)
-			break;				/* successful create and attach */
-
-		/*
-		 * Can only get here if some other process managed to create the same
-		 * shmem key before we did.  Let him have that one, loop around to try
-		 * next key.
-		 */
+		if (oldhdr && shmdt(oldhdr) < 0)
+			elog(LOG, "shmdt(%p) failed: %m", oldhdr);
 	}
 
-	/*
-	 * OK, we created a new segment.  Mark it as created by this process. The
-	 * order of assignments here is critical so that another Postgres process
-	 * can't see the header as valid but belonging to an invalid PID!
-	 */
+	/* Initialize new segment. */
 	hdr = (PGShmemHeader *) memAddress;
 	hdr->creatorPID = getpid();
 	hdr->magic = PGShmemMagic;
 	hdr->dsm_control = 0;
 
 	/* Fill in the data directory ID info, too */
-	if (stat(DataDir, &statbuf) < 0)
-		ereport(FATAL,
-				(errcode_for_file_access(),
-				 errmsg("could not stat data directory \"%s\": %m",
-						DataDir)));
 	hdr->device = statbuf.st_dev;
 	hdr->inode = statbuf.st_ino;
 
@@ -674,7 +855,7 @@ PGSharedMemoryCreate(Size size, bool makePrivate, int port,
 	 * Initialize space allocation status for segment.
 	 */
 	hdr->totalsize = size;
-	hdr->freeoffset = MAXALIGN(sizeof(PGShmemHeader));
+	hdr->content_offset = MAXALIGN(sizeof(PGShmemHeader));
 	*shim = hdr;
 
 	/* Save info for possible future use */
@@ -687,14 +868,10 @@ PGSharedMemoryCreate(Size size, bool makePrivate, int port,
 	 * block. Otherwise, the System V shared memory block is only a shim, and
 	 * we must return a pointer to the real block.
 	 */
-#ifdef USE_ANONYMOUS_SHMEM
 	if (AnonymousShmem == NULL)
 		return hdr;
 	memcpy(AnonymousShmem, hdr, sizeof(PGShmemHeader));
 	return (PGShmemHeader *) AnonymousShmem;
-#else
-	return hdr;
-#endif
 }
 
 #ifdef EXEC_BACKEND
@@ -715,7 +892,8 @@ void
 PGSharedMemoryReAttach(void)
 {
 	IpcMemoryId shmid;
-	void	   *hdr;
+	PGShmemHeader *hdr;
+	IpcMemoryState state;
 	void	   *origUsedShmemSegAddr = UsedShmemSegAddr;
 
 	Assert(UsedShmemSegAddr != NULL);
@@ -728,14 +906,18 @@ PGSharedMemoryReAttach(void)
 #endif
 
 	elog(DEBUG3, "attaching to %p", UsedShmemSegAddr);
-	hdr = (void *) PGSharedMemoryAttach((IpcMemoryKey) UsedShmemSegID, &shmid);
-	if (hdr == NULL)
+	shmid = shmget(UsedShmemSegID, sizeof(PGShmemHeader), 0);
+	if (shmid < 0)
+		state = SHMSTATE_FOREIGN;
+	else
+		state = PGSharedMemoryAttach(shmid, UsedShmemSegAddr, &hdr);
+	if (state != SHMSTATE_ATTACHED)
 		elog(FATAL, "could not reattach to shared memory (key=%d, addr=%p): %m",
 			 (int) UsedShmemSegID, UsedShmemSegAddr);
 	if (hdr != origUsedShmemSegAddr)
 		elog(FATAL, "reattaching to shared memory returned unexpected address (got %p, expected %p)",
 			 hdr, origUsedShmemSegAddr);
-	dsm_set_control_handle(((PGShmemHeader *) hdr)->dsm_control);
+	dsm_set_control_handle(hdr->dsm_control);
 
 	UsedShmemSegAddr = hdr;		/* probably redundant */
 }
@@ -801,7 +983,6 @@ PGSharedMemoryDetach(void)
 		UsedShmemSegAddr = NULL;
 	}
 
-#ifdef USE_ANONYMOUS_SHMEM
 	if (AnonymousShmem != NULL)
 	{
 		if (munmap(AnonymousShmem, AnonymousShmemSize) < 0)
@@ -809,33 +990,4 @@ PGSharedMemoryDetach(void)
 				 AnonymousShmem, AnonymousShmemSize);
 		AnonymousShmem = NULL;
 	}
-#endif
-}
-
-
-/*
- * Attach to shared memory and make sure it has a Postgres header
- *
- * Returns attach address if OK, else NULL
- */
-static PGShmemHeader *
-PGSharedMemoryAttach(IpcMemoryKey key, IpcMemoryId *shmid)
-{
-	PGShmemHeader *hdr;
-
-	if ((*shmid = shmget(key, sizeof(PGShmemHeader), 0)) < 0)
-		return NULL;
-
-	hdr = (PGShmemHeader *) shmat(*shmid, UsedShmemSegAddr, PG_SHMAT_FLAGS);
-
-	if (hdr == (PGShmemHeader *) -1)
-		return NULL;			/* failed: must be some other app's */
-
-	if (hdr->magic != PGShmemMagic)
-	{
-		shmdt((void *) hdr);
-		return NULL;			/* segment belongs to a non-Postgres app */
-	}
-
-	return hdr;
 }

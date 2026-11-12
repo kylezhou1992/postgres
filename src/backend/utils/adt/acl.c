@@ -3,7 +3,7 @@
  * acl.c
  *	  Basic access control list data structures manipulation routines.
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,29 +16,42 @@
 
 #include <ctype.h>
 
-#include "access/hash.h"
 #include "access/htup_details.h"
+#include "bootstrap/bootstrap.h"
 #include "catalog/catalog.h"
 #include "catalog/namespace.h"
-#include "catalog/pg_authid.h"
 #include "catalog/pg_auth_members.h"
-#include "catalog/pg_type.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_class.h"
-#include "commands/dbcommands.h"
+#include "catalog/pg_database.h"
+#include "catalog/pg_foreign_data_wrapper.h"
+#include "catalog/pg_foreign_server.h"
+#include "catalog/pg_language.h"
+#include "catalog/pg_largeobject.h"
+#include "catalog/pg_namespace.h"
+#include "catalog/pg_proc.h"
+#include "catalog/pg_tablespace.h"
+#include "catalog/pg_type.h"
 #include "commands/proclang.h"
 #include "commands/tablespace.h"
+#include "common/hashfn.h"
 #include "foreign/foreign.h"
 #include "funcapi.h"
+#include "lib/bloomfilter.h"
+#include "lib/qunique.h"
 #include "miscadmin.h"
+#include "port/pg_bitutils.h"
+#include "storage/large_object.h"
 #include "utils/acl.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/varlena.h"
-
 
 typedef struct
 {
@@ -49,50 +62,49 @@ typedef struct
 /*
  * We frequently need to test whether a given role is a member of some other
  * role.  In most of these tests the "given role" is the same, namely the
- * active current user.  So we can optimize it by keeping a cached list of
- * all the roles the "given role" is a member of, directly or indirectly.
- * The cache is flushed whenever we detect a change in pg_auth_members.
- *
- * There are actually two caches, one computed under "has_privs" rules
- * (do not recurse where rolinherit isn't true) and one computed under
- * "is_member" rules (recurse regardless of rolinherit).
+ * active current user.  So we can optimize it by keeping cached lists of all
+ * the roles the "given role" is a member of, directly or indirectly.
  *
  * Possibly this mechanism should be generalized to allow caching membership
  * info for multiple roles?
  *
- * The has_privs cache is:
- * cached_privs_role is the role OID the cache is for.
- * cached_privs_roles is an OID list of roles that cached_privs_role
- *		has the privileges of (always including itself).
- * The cache is valid if cached_privs_role is not InvalidOid.
- *
- * The is_member cache is similarly:
- * cached_member_role is the role OID the cache is for.
- * cached_membership_roles is an OID list of roles that cached_member_role
- *		is a member of (always including itself).
- * The cache is valid if cached_member_role is not InvalidOid.
+ * Each element of cached_roles is an OID list of constituent roles for the
+ * corresponding element of cached_role (always including the cached_role
+ * itself).  There's a separate cache for each RoleRecurseType, with the
+ * corresponding semantics.
  */
-static Oid	cached_privs_role = InvalidOid;
-static List *cached_privs_roles = NIL;
-static Oid	cached_member_role = InvalidOid;
-static List *cached_membership_roles = NIL;
+enum RoleRecurseType
+{
+	ROLERECURSE_MEMBERS = 0,	/* recurse unconditionally */
+	ROLERECURSE_PRIVS = 1,		/* recurse through inheritable grants */
+	ROLERECURSE_SETROLE = 2		/* recurse through grants with set_option */
+};
+static Oid	cached_role[] = {InvalidOid, InvalidOid, InvalidOid};
+static List *cached_roles[] = {NIL, NIL, NIL};
+uint32		cached_db_hash;
 
+/*
+ * If the list of roles gathered by roles_is_member_of() grows larger than the
+ * below threshold, a Bloom filter is created to speed up list membership
+ * checks.  This threshold is set arbitrarily high to avoid the overhead of
+ * creating the Bloom filter until it seems likely to provide a net benefit.
+ */
+#define ROLES_LIST_BLOOM_THRESHOLD 1024
 
-static const char *getid(const char *s, char *n);
+static const char *getid(const char *s, char *n, Node *escontext);
 static void putid(char *p, const char *s);
 static Acl *allocacl(int n);
 static void check_acl(const Acl *acl);
-static const char *aclparse(const char *s, AclItem *aip);
+static const char *aclparse(const char *s, AclItem *aip, Node *escontext);
 static bool aclitem_match(const AclItem *a1, const AclItem *a2);
 static int	aclitemComparator(const void *arg1, const void *arg2);
 static void check_circularity(const Acl *old_acl, const AclItem *mod_aip,
-				  Oid ownerId);
+							  Oid ownerId);
 static Acl *recursive_revoke(Acl *acl, Oid grantee, AclMode revoke_privs,
-				 Oid ownerId, DropBehavior behavior);
+							 Oid ownerId, DropBehavior behavior);
 
-static AclMode convert_priv_string(text *priv_type_text);
 static AclMode convert_any_priv_string(text *priv_type_text,
-						const priv_map *privileges);
+									   const priv_map *privileges);
 
 static Oid	convert_table_name(text *tablename);
 static AclMode convert_table_priv_string(text *priv_type_text);
@@ -115,11 +127,30 @@ static Oid	convert_tablespace_name(text *tablespacename);
 static AclMode convert_tablespace_priv_string(text *priv_type_text);
 static Oid	convert_type_name(text *typename);
 static AclMode convert_type_priv_string(text *priv_type_text);
+static AclMode convert_parameter_priv_string(text *priv_text);
+static AclMode convert_largeobject_priv_string(text *priv_type_text);
 static AclMode convert_role_priv_string(text *priv_type_text);
 static AclResult pg_role_aclcheck(Oid role_oid, Oid roleid, AclMode mode);
 
-static void RoleMembershipCacheCallback(Datum arg, int cacheid, uint32 hashvalue);
+static void RoleMembershipCacheCallback(Datum arg, SysCacheIdentifier cacheid,
+										uint32 hashvalue);
 
+
+/*
+ * Test whether an identifier char can be left unquoted in ACLs.
+ *
+ * Formerly, we used isalnum() even on non-ASCII characters, resulting in
+ * unportable behavior.  To ensure dump compatibility with old versions,
+ * we now treat high-bit-set characters as always requiring quoting during
+ * putid(), but getid() will always accept them without quotes.
+ */
+static inline bool
+is_safe_acl_char(unsigned char c, bool is_getid)
+{
+	if (IS_HIGHBIT_SET(c))
+		return is_getid;
+	return isalnum(c) || c == '_';
+}
 
 /*
  * getid
@@ -132,9 +163,12 @@ static void RoleMembershipCacheCallback(Datum arg, int cacheid, uint32 hashvalue
  *		in 's', after any quotes.  Also:
  *		- loads the identifier into 'n'.  (If no identifier is found, 'n'
  *		  contains an empty string.)  'n' must be NAMEDATALEN bytes.
+ *
+ * Errors are reported via ereport, unless escontext is an ErrorSaveData node,
+ * in which case we log the error there and return NULL.
  */
 static const char *
-getid(const char *s, char *n)
+getid(const char *s, char *n, Node *escontext)
 {
 	int			len = 0;
 	bool		in_quotes = false;
@@ -143,21 +177,22 @@ getid(const char *s, char *n)
 
 	while (isspace((unsigned char) *s))
 		s++;
-	/* This code had better match what putid() does, below */
 	for (;
 		 *s != '\0' &&
-		 (isalnum((unsigned char) *s) ||
-		  *s == '_' ||
-		  *s == '"' ||
-		  in_quotes);
+		 (in_quotes || *s == '"' || is_safe_acl_char(*s, true));
 		 s++)
 	{
 		if (*s == '"')
 		{
+			if (!in_quotes)
+			{
+				in_quotes = true;
+				continue;
+			}
 			/* safe to look at next char (could be '\0' though) */
 			if (*(s + 1) != '"')
 			{
-				in_quotes = !in_quotes;
+				in_quotes = false;
 				continue;
 			}
 			/* it's an escaped double quote; skip the escaping char */
@@ -166,7 +201,7 @@ getid(const char *s, char *n)
 
 		/* Add the character to the string */
 		if (len >= NAMEDATALEN - 1)
-			ereport(ERROR,
+			ereturn(escontext, NULL,
 					(errcode(ERRCODE_NAME_TOO_LONG),
 					 errmsg("identifier too long"),
 					 errdetail("Identifier must be less than %d characters.",
@@ -183,7 +218,7 @@ getid(const char *s, char *n)
 /*
  * Write a role name at *p, adding double quotes if needed.
  * There must be at least (2*NAMEDATALEN)+2 bytes available at *p.
- * This needs to be kept in sync with copyAclUserName in pg_dump/dumputils.c
+ * This needs to be kept in sync with dequoteAclUserName in pg_dump/dumputils.c
  */
 static void
 putid(char *p, const char *s)
@@ -191,10 +226,10 @@ putid(char *p, const char *s)
 	const char *src;
 	bool		safe = true;
 
+	/* Detect whether we need to use double quotes */
 	for (src = s; *src; src++)
 	{
-		/* This test had better match what getid() does, above */
-		if (!isalnum((unsigned char) *src) && *src != '_')
+		if (!is_safe_acl_char(*src, false))
 		{
 			safe = false;
 			break;
@@ -228,14 +263,20 @@ putid(char *p, const char *s)
  *		This routine is called by the parser as well as aclitemin(), hence
  *		the added generality.
  *
+ *		In bootstrap mode, we consult a hard-wired list of role names
+ *		(see bootstrap.c) rather than trying to access the catalogs.
+ *
  * RETURNS:
  *		the string position in 's' immediately following the ACL
  *		specification.  Also:
  *		- loads the structure pointed to by 'aip' with the appropriate
  *		  UID/GID, id type identifier and mode type values.
+ *
+ * Errors are reported via ereport, unless escontext is an ErrorSaveData node,
+ * in which case we log the error there and return NULL.
  */
 static const char *
-aclparse(const char *s, AclItem *aip)
+aclparse(const char *s, AclItem *aip, Node *escontext)
 {
 	AclMode		privs,
 				goption,
@@ -245,28 +286,30 @@ aclparse(const char *s, AclItem *aip)
 
 	Assert(s && aip);
 
-#ifdef ACLDEBUG
-	elog(LOG, "aclparse: input = \"%s\"", s);
-#endif
-	s = getid(s, name);
+	s = getid(s, name, escontext);
+	if (s == NULL)
+		return NULL;
 	if (*s != '=')
 	{
 		/* we just read a keyword, not a name */
 		if (strcmp(name, "group") != 0 && strcmp(name, "user") != 0)
-			ereport(ERROR,
+			ereturn(escontext, NULL,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("unrecognized key word: \"%s\"", name),
 					 errhint("ACL key word must be \"group\" or \"user\".")));
-		s = getid(s, name);		/* move s to the name beyond the keyword */
+		/* move s to the name beyond the keyword */
+		s = getid(s, name, escontext);
+		if (s == NULL)
+			return NULL;
 		if (name[0] == '\0')
-			ereport(ERROR,
+			ereturn(escontext, NULL,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("missing name"),
 					 errhint("A name must follow the \"group\" or \"user\" key word.")));
 	}
 
 	if (*s != '=')
-		ereport(ERROR,
+		ereturn(escontext, NULL,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("missing \"=\" sign")));
 
@@ -315,11 +358,17 @@ aclparse(const char *s, AclItem *aip)
 			case ACL_CONNECT_CHR:
 				read = ACL_CONNECT;
 				break;
-			case 'R':			/* ignore old RULE privileges */
-				read = 0;
+			case ACL_SET_CHR:
+				read = ACL_SET;
+				break;
+			case ACL_ALTER_SYSTEM_CHR:
+				read = ACL_ALTER_SYSTEM;
+				break;
+			case ACL_MAINTAIN_CHR:
+				read = ACL_MAINTAIN;
 				break;
 			default:
-				ereport(ERROR,
+				ereturn(escontext, NULL,
 						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 						 errmsg("invalid mode character: must be one of \"%s\"",
 								ACL_ALL_RIGHTS_STR)));
@@ -331,36 +380,51 @@ aclparse(const char *s, AclItem *aip)
 	if (name[0] == '\0')
 		aip->ai_grantee = ACL_ID_PUBLIC;
 	else
-		aip->ai_grantee = get_role_oid(name, false);
+	{
+		if (IsBootstrapProcessingMode())
+			aip->ai_grantee = boot_get_role_oid(name);
+		else
+			aip->ai_grantee = get_role_oid(name, true);
+		if (!OidIsValid(aip->ai_grantee))
+			ereturn(escontext, NULL,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("role \"%s\" does not exist", name)));
+	}
 
 	/*
 	 * XXX Allow a degree of backward compatibility by defaulting the grantor
-	 * to the superuser.
+	 * to the superuser.  We condone that practice in the catalog .dat files
+	 * (i.e., in bootstrap mode) for brevity; otherwise, issue a warning.
 	 */
 	if (*s == '/')
 	{
-		s = getid(s + 1, name2);
+		s = getid(s + 1, name2, escontext);
+		if (s == NULL)
+			return NULL;
 		if (name2[0] == '\0')
-			ereport(ERROR,
+			ereturn(escontext, NULL,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 					 errmsg("a name must follow the \"/\" sign")));
-		aip->ai_grantor = get_role_oid(name2, false);
+		if (IsBootstrapProcessingMode())
+			aip->ai_grantor = boot_get_role_oid(name2);
+		else
+			aip->ai_grantor = get_role_oid(name2, true);
+		if (!OidIsValid(aip->ai_grantor))
+			ereturn(escontext, NULL,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("role \"%s\" does not exist", name2)));
 	}
 	else
 	{
 		aip->ai_grantor = BOOTSTRAP_SUPERUSERID;
-		ereport(WARNING,
-				(errcode(ERRCODE_INVALID_GRANTOR),
-				 errmsg("defaulting grantor to user ID %u",
-						BOOTSTRAP_SUPERUSERID)));
+		if (!IsBootstrapProcessingMode())
+			ereport(WARNING,
+					(errcode(ERRCODE_INVALID_GRANTOR),
+					 errmsg("defaulting grantor to user ID %u",
+							BOOTSTRAP_SUPERUSERID)));
 	}
 
 	ACLITEM_SET_PRIVS_GOPTIONS(*aip, privs, goption);
-
-#ifdef ACLDEBUG
-	elog(LOG, "aclparse: correctly read [%u %x %x]",
-		 aip->ai_grantee, privs, goption);
-#endif
 
 	return s;
 }
@@ -565,14 +629,19 @@ Datum
 aclitemin(PG_FUNCTION_ARGS)
 {
 	const char *s = PG_GETARG_CSTRING(0);
+	Node	   *escontext = fcinfo->context;
 	AclItem    *aip;
 
-	aip = (AclItem *) palloc(sizeof(AclItem));
-	s = aclparse(s, aip);
+	aip = palloc_object(AclItem);
+
+	s = aclparse(s, aip, escontext);
+	if (s == NULL)
+		PG_RETURN_NULL();
+
 	while (isspace((unsigned char) *s))
 		++s;
 	if (*s)
-		ereport(ERROR,
+		ereturn(escontext, (Datum) 0,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("extra garbage at the end of the ACL specification")));
 
@@ -583,6 +652,10 @@ aclitemin(PG_FUNCTION_ARGS)
  * aclitemout
  *		Allocates storage for, and fills in, a new null-delimited string
  *		containing a formatted ACL specification.  See aclparse for details.
+ *
+ *		In bootstrap mode, this is called for debug printouts (initdb -d).
+ *		We could ask bootstrap.c to provide an inverse of boot_get_role_oid(),
+ *		but it seems at least as useful to just print numeric role OIDs.
  *
  * RETURNS:
  *		the new string
@@ -606,7 +679,10 @@ aclitemout(PG_FUNCTION_ARGS)
 
 	if (aip->ai_grantee != ACL_ID_PUBLIC)
 	{
-		htup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(aip->ai_grantee));
+		if (!IsBootstrapProcessingMode())
+			htup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(aip->ai_grantee));
+		else
+			htup = NULL;
 		if (HeapTupleIsValid(htup))
 		{
 			putid(p, NameStr(((Form_pg_authid) GETSTRUCT(htup))->rolname));
@@ -614,7 +690,7 @@ aclitemout(PG_FUNCTION_ARGS)
 		}
 		else
 		{
-			/* Generate numeric OID if we don't find an entry */
+			/* No such entry, or bootstrap mode: print numeric OID */
 			sprintf(p, "%u", aip->ai_grantee);
 		}
 	}
@@ -625,16 +701,19 @@ aclitemout(PG_FUNCTION_ARGS)
 
 	for (i = 0; i < N_ACL_RIGHTS; ++i)
 	{
-		if (ACLITEM_GET_PRIVS(*aip) & (1 << i))
+		if (ACLITEM_GET_PRIVS(*aip) & (UINT64CONST(1) << i))
 			*p++ = ACL_ALL_RIGHTS_STR[i];
-		if (ACLITEM_GET_GOPTIONS(*aip) & (1 << i))
+		if (ACLITEM_GET_GOPTIONS(*aip) & (UINT64CONST(1) << i))
 			*p++ = '*';
 	}
 
 	*p++ = '/';
 	*p = '\0';
 
-	htup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(aip->ai_grantor));
+	if (!IsBootstrapProcessingMode())
+		htup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(aip->ai_grantor));
+	else
+		htup = NULL;
 	if (HeapTupleIsValid(htup))
 	{
 		putid(p, NameStr(((Form_pg_authid) GETSTRUCT(htup))->rolname));
@@ -642,7 +721,7 @@ aclitemout(PG_FUNCTION_ARGS)
 	}
 	else
 	{
-		/* Generate numeric OID if we don't find an entry */
+		/* No such entry, or bootstrap mode: print numeric OID */
 		sprintf(p, "%u", aip->ai_grantor);
 	}
 
@@ -808,8 +887,12 @@ acldefault(ObjectType objtype, Oid ownerId)
 			world_default = ACL_USAGE;
 			owner_default = ACL_ALL_RIGHTS_TYPE;
 			break;
+		case OBJECT_PARAMETER_ACL:
+			world_default = ACL_NO_RIGHTS;
+			owner_default = ACL_ALL_RIGHTS_PARAMETER_ACL;
+			break;
 		default:
-			elog(ERROR, "unrecognized objtype: %d", (int) objtype);
+			elog(ERROR, "unrecognized object type: %d", (int) objtype);
 			world_default = ACL_NO_RIGHTS;	/* keep compiler quiet */
 			owner_default = ACL_NO_RIGHTS;
 			break;
@@ -890,6 +973,9 @@ acldefault_sql(PG_FUNCTION_ARGS)
 		case 'n':
 			objtype = OBJECT_SCHEMA;
 			break;
+		case 'p':
+			objtype = OBJECT_PARAMETER_ACL;
+			break;
 		case 't':
 			objtype = OBJECT_TABLESPACE;
 			break;
@@ -903,7 +989,16 @@ acldefault_sql(PG_FUNCTION_ARGS)
 			objtype = OBJECT_TYPE;
 			break;
 		default:
-			elog(ERROR, "unrecognized objtype abbreviation: %c", objtypec);
+			/* Avoid printing non-ASCII bytes, else we have encoding issues */
+			if (objtypec >= ' ' && objtypec < 0x7f)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("unrecognized object type abbreviation: \"%c\"", objtypec)));
+			else				/* use \ooo format, like charout() */
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("unrecognized object type abbreviation: \"\\%03o\"",
+								(unsigned char) objtypec)));
 	}
 
 	PG_RETURN_ACL_P(acldefault(objtype, owner));
@@ -1046,6 +1141,12 @@ aclupdate(const Acl *old_acl, const AclItem *mod_aip,
  * The result is a modified copy; the input object is not changed.
  *
  * NB: caller is responsible for having detoasted the input ACL, if needed.
+ *
+ * Note: the name of this function is a bit of a misnomer, since it will
+ * happily make the specified role substitution whether the old role is
+ * really the owner of the parent object or merely mentioned in its ACL.
+ * But the vast majority of callers use it in connection with ALTER OWNER
+ * operations, so we'll keep the name.
  */
 Acl *
 aclnewowner(const Acl *old_acl, Oid oldOwnerId, Oid newOwnerId)
@@ -1474,8 +1575,7 @@ aclmembers(const Acl *acl, Oid **roleids)
 	Oid		   *list;
 	const AclItem *acldat;
 	int			i,
-				j,
-				k;
+				j;
 
 	if (acl == NULL || ACL_NUM(acl) == 0)
 	{
@@ -1486,7 +1586,7 @@ aclmembers(const Acl *acl, Oid **roleids)
 	check_acl(acl);
 
 	/* Allocate the worst-case space requirement */
-	list = palloc(ACL_NUM(acl) * 2 * sizeof(Oid));
+	list = palloc_array(Oid, ACL_NUM(acl) * 2);
 	acldat = ACL_DAT(acl);
 
 	/*
@@ -1507,21 +1607,14 @@ aclmembers(const Acl *acl, Oid **roleids)
 	/* Sort the array */
 	qsort(list, j, sizeof(Oid), oid_cmp);
 
-	/* Remove duplicates from the array */
-	k = 0;
-	for (i = 1; i < j; i++)
-	{
-		if (list[k] != list[i])
-			list[++k] = list[i];
-	}
-
 	/*
 	 * We could repalloc the array down to minimum size, but it's hardly worth
 	 * it since it's only transient memory.
 	 */
 	*roleids = list;
 
-	return k + 1;
+	/* Remove duplicates from the array */
+	return qunique(list, j, sizeof(Oid), oid_cmp);
 }
 
 
@@ -1579,10 +1672,29 @@ makeaclitem(PG_FUNCTION_ARGS)
 	bool		goption = PG_GETARG_BOOL(3);
 	AclItem    *result;
 	AclMode		priv;
+	static const priv_map any_priv_map[] = {
+		{"SELECT", ACL_SELECT},
+		{"INSERT", ACL_INSERT},
+		{"UPDATE", ACL_UPDATE},
+		{"DELETE", ACL_DELETE},
+		{"TRUNCATE", ACL_TRUNCATE},
+		{"REFERENCES", ACL_REFERENCES},
+		{"TRIGGER", ACL_TRIGGER},
+		{"EXECUTE", ACL_EXECUTE},
+		{"USAGE", ACL_USAGE},
+		{"CREATE", ACL_CREATE},
+		{"TEMP", ACL_CREATE_TEMP},
+		{"TEMPORARY", ACL_CREATE_TEMP},
+		{"CONNECT", ACL_CONNECT},
+		{"SET", ACL_SET},
+		{"ALTER SYSTEM", ACL_ALTER_SYSTEM},
+		{"MAINTAIN", ACL_MAINTAIN},
+		{NULL, 0}
+	};
 
-	priv = convert_priv_string(privtext);
+	priv = convert_any_priv_string(privtext, any_priv_map);
 
-	result = (AclItem *) palloc(sizeof(AclItem));
+	result = palloc_object(AclItem);
 
 	result->ai_grantee = grantee;
 	result->ai_grantor = grantor;
@@ -1591,46 +1703,6 @@ makeaclitem(PG_FUNCTION_ARGS)
 							   (goption ? priv : ACL_NO_RIGHTS));
 
 	PG_RETURN_ACLITEM_P(result);
-}
-
-static AclMode
-convert_priv_string(text *priv_type_text)
-{
-	char	   *priv_type = text_to_cstring(priv_type_text);
-
-	if (pg_strcasecmp(priv_type, "SELECT") == 0)
-		return ACL_SELECT;
-	if (pg_strcasecmp(priv_type, "INSERT") == 0)
-		return ACL_INSERT;
-	if (pg_strcasecmp(priv_type, "UPDATE") == 0)
-		return ACL_UPDATE;
-	if (pg_strcasecmp(priv_type, "DELETE") == 0)
-		return ACL_DELETE;
-	if (pg_strcasecmp(priv_type, "TRUNCATE") == 0)
-		return ACL_TRUNCATE;
-	if (pg_strcasecmp(priv_type, "REFERENCES") == 0)
-		return ACL_REFERENCES;
-	if (pg_strcasecmp(priv_type, "TRIGGER") == 0)
-		return ACL_TRIGGER;
-	if (pg_strcasecmp(priv_type, "EXECUTE") == 0)
-		return ACL_EXECUTE;
-	if (pg_strcasecmp(priv_type, "USAGE") == 0)
-		return ACL_USAGE;
-	if (pg_strcasecmp(priv_type, "CREATE") == 0)
-		return ACL_CREATE;
-	if (pg_strcasecmp(priv_type, "TEMP") == 0)
-		return ACL_CREATE_TEMP;
-	if (pg_strcasecmp(priv_type, "TEMPORARY") == 0)
-		return ACL_CREATE_TEMP;
-	if (pg_strcasecmp(priv_type, "CONNECT") == 0)
-		return ACL_CONNECT;
-	if (pg_strcasecmp(priv_type, "RULE") == 0)
-		return 0;				/* ignore old RULE privileges */
-
-	ereport(ERROR,
-			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			 errmsg("unrecognized privilege type: \"%s\"", priv_type)));
-	return ACL_NO_RIGHTS;		/* keep compiler quiet */
 }
 
 
@@ -1720,6 +1792,12 @@ convert_aclright_to_string(int aclright)
 			return "TEMPORARY";
 		case ACL_CONNECT:
 			return "CONNECT";
+		case ACL_SET:
+			return "SET";
+		case ACL_ALTER_SYSTEM:
+			return "ALTER SYSTEM";
+		case ACL_MAINTAIN:
+			return "MAINTAIN";
 		default:
 			elog(ERROR, "unrecognized aclright: %d", aclright);
 			return NULL;
@@ -1763,7 +1841,7 @@ aclexplode(PG_FUNCTION_ARGS)
 		 * build tupdesc for result tuples (matches out parameters in pg_proc
 		 * entry)
 		 */
-		tupdesc = CreateTemplateTupleDesc(4, false);
+		tupdesc = CreateTemplateTupleDesc(4);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "grantor",
 						   OIDOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "grantee",
@@ -1773,13 +1851,14 @@ aclexplode(PG_FUNCTION_ARGS)
 		TupleDescInitEntry(tupdesc, (AttrNumber) 4, "is_grantable",
 						   BOOLOID, -1, 0);
 
+		TupleDescFinalize(tupdesc);
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 
 		/* allocate memory for user context */
-		idx = (int *) palloc(sizeof(int[2]));
+		idx = palloc_array(int, 2);
 		idx[0] = 0;				/* ACL array item index */
 		idx[1] = -1;			/* privilege type counter */
-		funcctx->user_fctx = (void *) idx;
+		funcctx->user_fctx = idx;
 
 		MemoryContextSwitchTo(oldcontext);
 	}
@@ -1803,21 +1882,19 @@ aclexplode(PG_FUNCTION_ARGS)
 				break;
 		}
 		aidata = &aidat[idx[0]];
-		priv_bit = 1 << idx[1];
+		priv_bit = UINT64CONST(1) << idx[1];
 
 		if (ACLITEM_GET_PRIVS(*aidata) & priv_bit)
 		{
 			Datum		result;
 			Datum		values[4];
-			bool		nulls[4];
+			bool		nulls[4] = {0};
 			HeapTuple	tuple;
 
 			values[0] = ObjectIdGetDatum(aidata->ai_grantor);
 			values[1] = ObjectIdGetDatum(aidata->ai_grantee);
 			values[2] = CStringGetTextDatum(convert_aclright_to_string(priv_bit));
 			values[3] = BoolGetDatum((ACLITEM_GET_GOPTIONS(*aidata) & priv_bit) != 0);
-
-			MemSet(nulls, 0, sizeof(nulls));
 
 			tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
 			result = HeapTupleGetDatum(tuple);
@@ -1906,14 +1983,15 @@ has_table_privilege_name_id(PG_FUNCTION_ARGS)
 	Oid			roleid;
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	roleid = get_role_oid_or_public(NameStr(*username));
 	mode = convert_table_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(tableoid)))
-		PG_RETURN_NULL();
+	aclresult = pg_class_aclcheck_ext(tableoid, roleid, mode, &is_missing);
 
-	aclresult = pg_class_aclcheck(tableoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -1932,14 +2010,15 @@ has_table_privilege_id(PG_FUNCTION_ARGS)
 	Oid			roleid;
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	roleid = GetUserId();
 	mode = convert_table_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(tableoid)))
-		PG_RETURN_NULL();
+	aclresult = pg_class_aclcheck_ext(tableoid, roleid, mode, &is_missing);
 
-	aclresult = pg_class_aclcheck(tableoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -1980,13 +2059,14 @@ has_table_privilege_id_id(PG_FUNCTION_ARGS)
 	text	   *priv_type_text = PG_GETARG_TEXT_PP(2);
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	mode = convert_table_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(tableoid)))
-		PG_RETURN_NULL();
+	aclresult = pg_class_aclcheck_ext(tableoid, roleid, mode, &is_missing);
 
-	aclresult = pg_class_aclcheck(tableoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -2031,8 +2111,8 @@ convert_table_priv_string(text *priv_type_text)
 		{"REFERENCES WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_REFERENCES)},
 		{"TRIGGER", ACL_TRIGGER},
 		{"TRIGGER WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_TRIGGER)},
-		{"RULE", 0},			/* ignore old RULE privileges */
-		{"RULE WITH GRANT OPTION", 0},
+		{"MAINTAIN", ACL_MAINTAIN},
+		{"MAINTAIN WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_MAINTAIN)},
 		{NULL, 0}
 	};
 
@@ -2125,6 +2205,7 @@ has_sequence_privilege_name_id(PG_FUNCTION_ARGS)
 	AclMode		mode;
 	AclResult	aclresult;
 	char		relkind;
+	bool		is_missing = false;
 
 	roleid = get_role_oid_or_public(NameStr(*username));
 	mode = convert_sequence_priv_string(priv_type_text);
@@ -2137,7 +2218,10 @@ has_sequence_privilege_name_id(PG_FUNCTION_ARGS)
 				 errmsg("\"%s\" is not a sequence",
 						get_rel_name(sequenceoid))));
 
-	aclresult = pg_class_aclcheck(sequenceoid, roleid, mode);
+	aclresult = pg_class_aclcheck_ext(sequenceoid, roleid, mode, &is_missing);
+
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -2157,6 +2241,7 @@ has_sequence_privilege_id(PG_FUNCTION_ARGS)
 	AclMode		mode;
 	AclResult	aclresult;
 	char		relkind;
+	bool		is_missing = false;
 
 	roleid = GetUserId();
 	mode = convert_sequence_priv_string(priv_type_text);
@@ -2169,7 +2254,10 @@ has_sequence_privilege_id(PG_FUNCTION_ARGS)
 				 errmsg("\"%s\" is not a sequence",
 						get_rel_name(sequenceoid))));
 
-	aclresult = pg_class_aclcheck(sequenceoid, roleid, mode);
+	aclresult = pg_class_aclcheck_ext(sequenceoid, roleid, mode, &is_missing);
+
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -2216,6 +2304,7 @@ has_sequence_privilege_id_id(PG_FUNCTION_ARGS)
 	AclMode		mode;
 	AclResult	aclresult;
 	char		relkind;
+	bool		is_missing = false;
 
 	mode = convert_sequence_priv_string(priv_type_text);
 	relkind = get_rel_relkind(sequenceoid);
@@ -2227,7 +2316,10 @@ has_sequence_privilege_id_id(PG_FUNCTION_ARGS)
 				 errmsg("\"%s\" is not a sequence",
 						get_rel_name(sequenceoid))));
 
-	aclresult = pg_class_aclcheck(sequenceoid, roleid, mode);
+	aclresult = pg_class_aclcheck_ext(sequenceoid, roleid, mode, &is_missing);
+
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -2336,18 +2428,22 @@ has_any_column_privilege_name_id(PG_FUNCTION_ARGS)
 	Oid			roleid;
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	roleid = get_role_oid_or_public(NameStr(*username));
 	mode = convert_column_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(tableoid)))
-		PG_RETURN_NULL();
-
 	/* First check at table level, then examine each column if needed */
-	aclresult = pg_class_aclcheck(tableoid, roleid, mode);
+	aclresult = pg_class_aclcheck_ext(tableoid, roleid, mode, &is_missing);
 	if (aclresult != ACLCHECK_OK)
-		aclresult = pg_attribute_aclcheck_all(tableoid, roleid, mode,
-											  ACLMASK_ANY);
+	{
+		if (is_missing)
+			PG_RETURN_NULL();
+		aclresult = pg_attribute_aclcheck_all_ext(tableoid, roleid, mode,
+												  ACLMASK_ANY, &is_missing);
+		if (is_missing)
+			PG_RETURN_NULL();
+	}
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -2366,18 +2462,22 @@ has_any_column_privilege_id(PG_FUNCTION_ARGS)
 	Oid			roleid;
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	roleid = GetUserId();
 	mode = convert_column_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(tableoid)))
-		PG_RETURN_NULL();
-
 	/* First check at table level, then examine each column if needed */
-	aclresult = pg_class_aclcheck(tableoid, roleid, mode);
+	aclresult = pg_class_aclcheck_ext(tableoid, roleid, mode, &is_missing);
 	if (aclresult != ACLCHECK_OK)
-		aclresult = pg_attribute_aclcheck_all(tableoid, roleid, mode,
-											  ACLMASK_ANY);
+	{
+		if (is_missing)
+			PG_RETURN_NULL();
+		aclresult = pg_attribute_aclcheck_all_ext(tableoid, roleid, mode,
+												  ACLMASK_ANY, &is_missing);
+		if (is_missing)
+			PG_RETURN_NULL();
+	}
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -2422,17 +2522,21 @@ has_any_column_privilege_id_id(PG_FUNCTION_ARGS)
 	text	   *priv_type_text = PG_GETARG_TEXT_PP(2);
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	mode = convert_column_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(tableoid)))
-		PG_RETURN_NULL();
-
 	/* First check at table level, then examine each column if needed */
-	aclresult = pg_class_aclcheck(tableoid, roleid, mode);
+	aclresult = pg_class_aclcheck_ext(tableoid, roleid, mode, &is_missing);
 	if (aclresult != ACLCHECK_OK)
-		aclresult = pg_attribute_aclcheck_all(tableoid, roleid, mode,
-											  ACLMASK_ANY);
+	{
+		if (is_missing)
+			PG_RETURN_NULL();
+		aclresult = pg_attribute_aclcheck_all_ext(tableoid, roleid, mode,
+												  ACLMASK_ANY, &is_missing);
+		if (is_missing)
+			PG_RETURN_NULL();
+	}
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -2466,8 +2570,7 @@ column_privilege_check(Oid tableoid, AttrNumber attnum,
 					   Oid roleid, AclMode mode)
 {
 	AclResult	aclresult;
-	HeapTuple	attTuple;
-	Form_pg_attribute attributeForm;
+	bool		is_missing = false;
 
 	/*
 	 * If convert_column_name failed, we can just return -1 immediately.
@@ -2476,42 +2579,25 @@ column_privilege_check(Oid tableoid, AttrNumber attnum,
 		return -1;
 
 	/*
-	 * First check if we have the privilege at the table level.  We check
-	 * existence of the pg_class row before risking calling pg_class_aclcheck.
-	 * Note: it might seem there's a race condition against concurrent DROP,
-	 * but really it's safe because there will be no syscache flush between
-	 * here and there.  So if we see the row in the syscache, so will
-	 * pg_class_aclcheck.
+	 * Check for column-level privileges first. This serves in part as a check
+	 * on whether the column even exists, so we need to do it before checking
+	 * table-level privilege.
 	 */
-	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(tableoid)))
-		return -1;
-
-	aclresult = pg_class_aclcheck(tableoid, roleid, mode);
-
+	aclresult = pg_attribute_aclcheck_ext(tableoid, attnum, roleid,
+										  mode, &is_missing);
 	if (aclresult == ACLCHECK_OK)
-		return true;
-
-	/*
-	 * No table privilege, so try per-column privileges.  Again, we have to
-	 * check for dropped attribute first, and we rely on the syscache not to
-	 * notice a concurrent drop before pg_attribute_aclcheck fetches the row.
-	 */
-	attTuple = SearchSysCache2(ATTNUM,
-							   ObjectIdGetDatum(tableoid),
-							   Int16GetDatum(attnum));
-	if (!HeapTupleIsValid(attTuple))
+		return 1;
+	else if (is_missing)
 		return -1;
-	attributeForm = (Form_pg_attribute) GETSTRUCT(attTuple);
-	if (attributeForm->attisdropped)
-	{
-		ReleaseSysCache(attTuple);
+
+	/* Next check if we have the privilege at the table level */
+	aclresult = pg_class_aclcheck_ext(tableoid, roleid, mode, &is_missing);
+	if (aclresult == ACLCHECK_OK)
+		return 1;
+	else if (is_missing)
 		return -1;
-	}
-	ReleaseSysCache(attTuple);
-
-	aclresult = pg_attribute_aclcheck(tableoid, attnum, roleid, mode);
-
-	return (aclresult == ACLCHECK_OK);
+	else
+		return 0;
 }
 
 /*
@@ -2946,7 +3032,7 @@ has_database_privilege_name_name(PG_FUNCTION_ARGS)
 	databaseoid = convert_database_name(databasename);
 	mode = convert_database_priv_string(priv_type_text);
 
-	aclresult = pg_database_aclcheck(databaseoid, roleid, mode);
+	aclresult = object_aclcheck(DatabaseRelationId, databaseoid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -2971,7 +3057,7 @@ has_database_privilege_name(PG_FUNCTION_ARGS)
 	databaseoid = convert_database_name(databasename);
 	mode = convert_database_priv_string(priv_type_text);
 
-	aclresult = pg_database_aclcheck(databaseoid, roleid, mode);
+	aclresult = object_aclcheck(DatabaseRelationId, databaseoid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -2990,14 +3076,17 @@ has_database_privilege_name_id(PG_FUNCTION_ARGS)
 	Oid			roleid;
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	roleid = get_role_oid_or_public(NameStr(*username));
 	mode = convert_database_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(DATABASEOID, ObjectIdGetDatum(databaseoid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(DatabaseRelationId, databaseoid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_database_aclcheck(databaseoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3016,14 +3105,17 @@ has_database_privilege_id(PG_FUNCTION_ARGS)
 	Oid			roleid;
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	roleid = GetUserId();
 	mode = convert_database_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(DATABASEOID, ObjectIdGetDatum(databaseoid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(DatabaseRelationId, databaseoid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_database_aclcheck(databaseoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3046,7 +3138,7 @@ has_database_privilege_id_name(PG_FUNCTION_ARGS)
 	databaseoid = convert_database_name(databasename);
 	mode = convert_database_priv_string(priv_type_text);
 
-	aclresult = pg_database_aclcheck(databaseoid, roleid, mode);
+	aclresult = object_aclcheck(DatabaseRelationId, databaseoid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3064,13 +3156,16 @@ has_database_privilege_id_id(PG_FUNCTION_ARGS)
 	text	   *priv_type_text = PG_GETARG_TEXT_PP(2);
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	mode = convert_database_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(DATABASEOID, ObjectIdGetDatum(databaseoid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(DatabaseRelationId, databaseoid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_database_aclcheck(databaseoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3110,7 +3205,6 @@ convert_database_priv_string(text *priv_type_text)
 	};
 
 	return convert_any_priv_string(priv_type_text, database_priv_map);
-
 }
 
 
@@ -3144,7 +3238,7 @@ has_foreign_data_wrapper_privilege_name_name(PG_FUNCTION_ARGS)
 	fdwid = convert_foreign_data_wrapper_name(fdwname);
 	mode = convert_foreign_data_wrapper_priv_string(priv_type_text);
 
-	aclresult = pg_foreign_data_wrapper_aclcheck(fdwid, roleid, mode);
+	aclresult = object_aclcheck(ForeignDataWrapperRelationId, fdwid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3169,7 +3263,7 @@ has_foreign_data_wrapper_privilege_name(PG_FUNCTION_ARGS)
 	fdwid = convert_foreign_data_wrapper_name(fdwname);
 	mode = convert_foreign_data_wrapper_priv_string(priv_type_text);
 
-	aclresult = pg_foreign_data_wrapper_aclcheck(fdwid, roleid, mode);
+	aclresult = object_aclcheck(ForeignDataWrapperRelationId, fdwid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3188,14 +3282,17 @@ has_foreign_data_wrapper_privilege_name_id(PG_FUNCTION_ARGS)
 	Oid			roleid;
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	roleid = get_role_oid_or_public(NameStr(*username));
 	mode = convert_foreign_data_wrapper_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(FOREIGNDATAWRAPPEROID, ObjectIdGetDatum(fdwid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(ForeignDataWrapperRelationId, fdwid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_foreign_data_wrapper_aclcheck(fdwid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3214,14 +3311,17 @@ has_foreign_data_wrapper_privilege_id(PG_FUNCTION_ARGS)
 	Oid			roleid;
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	roleid = GetUserId();
 	mode = convert_foreign_data_wrapper_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(FOREIGNDATAWRAPPEROID, ObjectIdGetDatum(fdwid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(ForeignDataWrapperRelationId, fdwid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_foreign_data_wrapper_aclcheck(fdwid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3244,7 +3344,7 @@ has_foreign_data_wrapper_privilege_id_name(PG_FUNCTION_ARGS)
 	fdwid = convert_foreign_data_wrapper_name(fdwname);
 	mode = convert_foreign_data_wrapper_priv_string(priv_type_text);
 
-	aclresult = pg_foreign_data_wrapper_aclcheck(fdwid, roleid, mode);
+	aclresult = object_aclcheck(ForeignDataWrapperRelationId, fdwid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3262,13 +3362,16 @@ has_foreign_data_wrapper_privilege_id_id(PG_FUNCTION_ARGS)
 	text	   *priv_type_text = PG_GETARG_TEXT_PP(2);
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	mode = convert_foreign_data_wrapper_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(FOREIGNDATAWRAPPEROID, ObjectIdGetDatum(fdwid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(ForeignDataWrapperRelationId, fdwid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_foreign_data_wrapper_aclcheck(fdwid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3335,7 +3438,7 @@ has_function_privilege_name_name(PG_FUNCTION_ARGS)
 	functionoid = convert_function_name(functionname);
 	mode = convert_function_priv_string(priv_type_text);
 
-	aclresult = pg_proc_aclcheck(functionoid, roleid, mode);
+	aclresult = object_aclcheck(ProcedureRelationId, functionoid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3360,7 +3463,7 @@ has_function_privilege_name(PG_FUNCTION_ARGS)
 	functionoid = convert_function_name(functionname);
 	mode = convert_function_priv_string(priv_type_text);
 
-	aclresult = pg_proc_aclcheck(functionoid, roleid, mode);
+	aclresult = object_aclcheck(ProcedureRelationId, functionoid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3379,14 +3482,17 @@ has_function_privilege_name_id(PG_FUNCTION_ARGS)
 	Oid			roleid;
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	roleid = get_role_oid_or_public(NameStr(*username));
 	mode = convert_function_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(PROCOID, ObjectIdGetDatum(functionoid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(ProcedureRelationId, functionoid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_proc_aclcheck(functionoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3405,14 +3511,17 @@ has_function_privilege_id(PG_FUNCTION_ARGS)
 	Oid			roleid;
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	roleid = GetUserId();
 	mode = convert_function_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(PROCOID, ObjectIdGetDatum(functionoid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(ProcedureRelationId, functionoid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_proc_aclcheck(functionoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3435,7 +3544,7 @@ has_function_privilege_id_name(PG_FUNCTION_ARGS)
 	functionoid = convert_function_name(functionname);
 	mode = convert_function_priv_string(priv_type_text);
 
-	aclresult = pg_proc_aclcheck(functionoid, roleid, mode);
+	aclresult = object_aclcheck(ProcedureRelationId, functionoid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3453,13 +3562,16 @@ has_function_privilege_id_id(PG_FUNCTION_ARGS)
 	text	   *priv_type_text = PG_GETARG_TEXT_PP(2);
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	mode = convert_function_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(PROCOID, ObjectIdGetDatum(functionoid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(ProcedureRelationId, functionoid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_proc_aclcheck(functionoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3535,7 +3647,7 @@ has_language_privilege_name_name(PG_FUNCTION_ARGS)
 	languageoid = convert_language_name(languagename);
 	mode = convert_language_priv_string(priv_type_text);
 
-	aclresult = pg_language_aclcheck(languageoid, roleid, mode);
+	aclresult = object_aclcheck(LanguageRelationId, languageoid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3560,7 +3672,7 @@ has_language_privilege_name(PG_FUNCTION_ARGS)
 	languageoid = convert_language_name(languagename);
 	mode = convert_language_priv_string(priv_type_text);
 
-	aclresult = pg_language_aclcheck(languageoid, roleid, mode);
+	aclresult = object_aclcheck(LanguageRelationId, languageoid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3579,14 +3691,17 @@ has_language_privilege_name_id(PG_FUNCTION_ARGS)
 	Oid			roleid;
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	roleid = get_role_oid_or_public(NameStr(*username));
 	mode = convert_language_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(LANGOID, ObjectIdGetDatum(languageoid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(LanguageRelationId, languageoid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_language_aclcheck(languageoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3605,14 +3720,17 @@ has_language_privilege_id(PG_FUNCTION_ARGS)
 	Oid			roleid;
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	roleid = GetUserId();
 	mode = convert_language_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(LANGOID, ObjectIdGetDatum(languageoid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(LanguageRelationId, languageoid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_language_aclcheck(languageoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3635,7 +3753,7 @@ has_language_privilege_id_name(PG_FUNCTION_ARGS)
 	languageoid = convert_language_name(languagename);
 	mode = convert_language_priv_string(priv_type_text);
 
-	aclresult = pg_language_aclcheck(languageoid, roleid, mode);
+	aclresult = object_aclcheck(LanguageRelationId, languageoid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3653,13 +3771,16 @@ has_language_privilege_id_id(PG_FUNCTION_ARGS)
 	text	   *priv_type_text = PG_GETARG_TEXT_PP(2);
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	mode = convert_language_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(LANGOID, ObjectIdGetDatum(languageoid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(LanguageRelationId, languageoid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_language_aclcheck(languageoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3726,7 +3847,7 @@ has_schema_privilege_name_name(PG_FUNCTION_ARGS)
 	schemaoid = convert_schema_name(schemaname);
 	mode = convert_schema_priv_string(priv_type_text);
 
-	aclresult = pg_namespace_aclcheck(schemaoid, roleid, mode);
+	aclresult = object_aclcheck(NamespaceRelationId, schemaoid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3751,7 +3872,7 @@ has_schema_privilege_name(PG_FUNCTION_ARGS)
 	schemaoid = convert_schema_name(schemaname);
 	mode = convert_schema_priv_string(priv_type_text);
 
-	aclresult = pg_namespace_aclcheck(schemaoid, roleid, mode);
+	aclresult = object_aclcheck(NamespaceRelationId, schemaoid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3770,14 +3891,17 @@ has_schema_privilege_name_id(PG_FUNCTION_ARGS)
 	Oid			roleid;
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	roleid = get_role_oid_or_public(NameStr(*username));
 	mode = convert_schema_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(NAMESPACEOID, ObjectIdGetDatum(schemaoid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(NamespaceRelationId, schemaoid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_namespace_aclcheck(schemaoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3796,14 +3920,17 @@ has_schema_privilege_id(PG_FUNCTION_ARGS)
 	Oid			roleid;
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	roleid = GetUserId();
 	mode = convert_schema_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(NAMESPACEOID, ObjectIdGetDatum(schemaoid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(NamespaceRelationId, schemaoid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_namespace_aclcheck(schemaoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3826,7 +3953,7 @@ has_schema_privilege_id_name(PG_FUNCTION_ARGS)
 	schemaoid = convert_schema_name(schemaname);
 	mode = convert_schema_priv_string(priv_type_text);
 
-	aclresult = pg_namespace_aclcheck(schemaoid, roleid, mode);
+	aclresult = object_aclcheck(NamespaceRelationId, schemaoid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3844,13 +3971,16 @@ has_schema_privilege_id_id(PG_FUNCTION_ARGS)
 	text	   *priv_type_text = PG_GETARG_TEXT_PP(2);
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	mode = convert_schema_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(NAMESPACEOID, ObjectIdGetDatum(schemaoid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(NamespaceRelationId, schemaoid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_namespace_aclcheck(schemaoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3919,7 +4049,7 @@ has_server_privilege_name_name(PG_FUNCTION_ARGS)
 	serverid = convert_server_name(servername);
 	mode = convert_server_priv_string(priv_type_text);
 
-	aclresult = pg_foreign_server_aclcheck(serverid, roleid, mode);
+	aclresult = object_aclcheck(ForeignServerRelationId, serverid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3944,7 +4074,7 @@ has_server_privilege_name(PG_FUNCTION_ARGS)
 	serverid = convert_server_name(servername);
 	mode = convert_server_priv_string(priv_type_text);
 
-	aclresult = pg_foreign_server_aclcheck(serverid, roleid, mode);
+	aclresult = object_aclcheck(ForeignServerRelationId, serverid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3963,14 +4093,17 @@ has_server_privilege_name_id(PG_FUNCTION_ARGS)
 	Oid			roleid;
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	roleid = get_role_oid_or_public(NameStr(*username));
 	mode = convert_server_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(FOREIGNSERVEROID, ObjectIdGetDatum(serverid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(ForeignServerRelationId, serverid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_foreign_server_aclcheck(serverid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -3989,14 +4122,17 @@ has_server_privilege_id(PG_FUNCTION_ARGS)
 	Oid			roleid;
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	roleid = GetUserId();
 	mode = convert_server_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(FOREIGNSERVEROID, ObjectIdGetDatum(serverid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(ForeignServerRelationId, serverid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_foreign_server_aclcheck(serverid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -4019,7 +4155,7 @@ has_server_privilege_id_name(PG_FUNCTION_ARGS)
 	serverid = convert_server_name(servername);
 	mode = convert_server_priv_string(priv_type_text);
 
-	aclresult = pg_foreign_server_aclcheck(serverid, roleid, mode);
+	aclresult = object_aclcheck(ForeignServerRelationId, serverid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -4037,13 +4173,16 @@ has_server_privilege_id_id(PG_FUNCTION_ARGS)
 	text	   *priv_type_text = PG_GETARG_TEXT_PP(2);
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	mode = convert_server_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(FOREIGNSERVEROID, ObjectIdGetDatum(serverid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(ForeignServerRelationId, serverid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_foreign_server_aclcheck(serverid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -4110,7 +4249,7 @@ has_tablespace_privilege_name_name(PG_FUNCTION_ARGS)
 	tablespaceoid = convert_tablespace_name(tablespacename);
 	mode = convert_tablespace_priv_string(priv_type_text);
 
-	aclresult = pg_tablespace_aclcheck(tablespaceoid, roleid, mode);
+	aclresult = object_aclcheck(TableSpaceRelationId, tablespaceoid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -4135,7 +4274,7 @@ has_tablespace_privilege_name(PG_FUNCTION_ARGS)
 	tablespaceoid = convert_tablespace_name(tablespacename);
 	mode = convert_tablespace_priv_string(priv_type_text);
 
-	aclresult = pg_tablespace_aclcheck(tablespaceoid, roleid, mode);
+	aclresult = object_aclcheck(TableSpaceRelationId, tablespaceoid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -4154,14 +4293,17 @@ has_tablespace_privilege_name_id(PG_FUNCTION_ARGS)
 	Oid			roleid;
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	roleid = get_role_oid_or_public(NameStr(*username));
 	mode = convert_tablespace_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(TABLESPACEOID, ObjectIdGetDatum(tablespaceoid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(TableSpaceRelationId, tablespaceoid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_tablespace_aclcheck(tablespaceoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -4180,14 +4322,17 @@ has_tablespace_privilege_id(PG_FUNCTION_ARGS)
 	Oid			roleid;
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	roleid = GetUserId();
 	mode = convert_tablespace_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(TABLESPACEOID, ObjectIdGetDatum(tablespaceoid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(TableSpaceRelationId, tablespaceoid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_tablespace_aclcheck(tablespaceoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -4210,7 +4355,7 @@ has_tablespace_privilege_id_name(PG_FUNCTION_ARGS)
 	tablespaceoid = convert_tablespace_name(tablespacename);
 	mode = convert_tablespace_priv_string(priv_type_text);
 
-	aclresult = pg_tablespace_aclcheck(tablespaceoid, roleid, mode);
+	aclresult = object_aclcheck(TableSpaceRelationId, tablespaceoid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -4228,13 +4373,16 @@ has_tablespace_privilege_id_id(PG_FUNCTION_ARGS)
 	text	   *priv_type_text = PG_GETARG_TEXT_PP(2);
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	mode = convert_tablespace_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(TABLESPACEOID, ObjectIdGetDatum(tablespaceoid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(TableSpaceRelationId, tablespaceoid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_tablespace_aclcheck(tablespaceoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -4300,7 +4448,7 @@ has_type_privilege_name_name(PG_FUNCTION_ARGS)
 	typeoid = convert_type_name(typename);
 	mode = convert_type_priv_string(priv_type_text);
 
-	aclresult = pg_type_aclcheck(typeoid, roleid, mode);
+	aclresult = object_aclcheck(TypeRelationId, typeoid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -4325,7 +4473,7 @@ has_type_privilege_name(PG_FUNCTION_ARGS)
 	typeoid = convert_type_name(typename);
 	mode = convert_type_priv_string(priv_type_text);
 
-	aclresult = pg_type_aclcheck(typeoid, roleid, mode);
+	aclresult = object_aclcheck(TypeRelationId, typeoid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -4344,14 +4492,17 @@ has_type_privilege_name_id(PG_FUNCTION_ARGS)
 	Oid			roleid;
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	roleid = get_role_oid_or_public(NameStr(*username));
 	mode = convert_type_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(TYPEOID, ObjectIdGetDatum(typeoid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(TypeRelationId, typeoid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_type_aclcheck(typeoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -4370,14 +4521,17 @@ has_type_privilege_id(PG_FUNCTION_ARGS)
 	Oid			roleid;
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	roleid = GetUserId();
 	mode = convert_type_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(TYPEOID, ObjectIdGetDatum(typeoid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(TypeRelationId, typeoid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_type_aclcheck(typeoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -4400,7 +4554,7 @@ has_type_privilege_id_name(PG_FUNCTION_ARGS)
 	typeoid = convert_type_name(typename);
 	mode = convert_type_priv_string(priv_type_text);
 
-	aclresult = pg_type_aclcheck(typeoid, roleid, mode);
+	aclresult = object_aclcheck(TypeRelationId, typeoid, roleid, mode);
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -4418,13 +4572,16 @@ has_type_privilege_id_id(PG_FUNCTION_ARGS)
 	text	   *priv_type_text = PG_GETARG_TEXT_PP(2);
 	AclMode		mode;
 	AclResult	aclresult;
+	bool		is_missing = false;
 
 	mode = convert_type_priv_string(priv_type_text);
 
-	if (!SearchSysCacheExists1(TYPEOID, ObjectIdGetDatum(typeoid)))
-		PG_RETURN_NULL();
+	aclresult = object_aclcheck_ext(TypeRelationId, typeoid,
+									roleid, mode,
+									&is_missing);
 
-	aclresult = pg_type_aclcheck(typeoid, roleid, mode);
+	if (is_missing)
+		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(aclresult == ACLCHECK_OK);
 }
@@ -4469,6 +4626,232 @@ convert_type_priv_string(text *priv_type_text)
 	return convert_any_priv_string(priv_type_text, type_priv_map);
 }
 
+/*
+ * has_parameter_privilege variants
+ *		These are all named "has_parameter_privilege" at the SQL level.
+ *		They take various combinations of parameter name with
+ *		user name, user OID, or implicit user = current_user.
+ *
+ *		The result is a boolean value: true if user has been granted
+ *		the indicated privilege or false if not.
+ */
+
+/*
+ * has_param_priv_byname
+ *
+ *		Helper function to check user privileges on a parameter given the
+ *		role by Oid, parameter by text name, and privileges as AclMode.
+ */
+static bool
+has_param_priv_byname(Oid roleid, const text *parameter, AclMode priv)
+{
+	char	   *paramstr = text_to_cstring(parameter);
+
+	return pg_parameter_aclcheck(paramstr, roleid, priv) == ACLCHECK_OK;
+}
+
+/*
+ * has_parameter_privilege_name_name
+ *		Check user privileges on a parameter given name username, text
+ *		parameter, and text priv name.
+ */
+Datum
+has_parameter_privilege_name_name(PG_FUNCTION_ARGS)
+{
+	Name		username = PG_GETARG_NAME(0);
+	text	   *parameter = PG_GETARG_TEXT_PP(1);
+	AclMode		priv = convert_parameter_priv_string(PG_GETARG_TEXT_PP(2));
+	Oid			roleid = get_role_oid_or_public(NameStr(*username));
+
+	PG_RETURN_BOOL(has_param_priv_byname(roleid, parameter, priv));
+}
+
+/*
+ * has_parameter_privilege_name
+ *		Check user privileges on a parameter given text parameter and text priv
+ *		name.  current_user is assumed
+ */
+Datum
+has_parameter_privilege_name(PG_FUNCTION_ARGS)
+{
+	text	   *parameter = PG_GETARG_TEXT_PP(0);
+	AclMode		priv = convert_parameter_priv_string(PG_GETARG_TEXT_PP(1));
+
+	PG_RETURN_BOOL(has_param_priv_byname(GetUserId(), parameter, priv));
+}
+
+/*
+ * has_parameter_privilege_id_name
+ *		Check user privileges on a parameter given roleid, text parameter, and
+ *		text priv name.
+ */
+Datum
+has_parameter_privilege_id_name(PG_FUNCTION_ARGS)
+{
+	Oid			roleid = PG_GETARG_OID(0);
+	text	   *parameter = PG_GETARG_TEXT_PP(1);
+	AclMode		priv = convert_parameter_priv_string(PG_GETARG_TEXT_PP(2));
+
+	PG_RETURN_BOOL(has_param_priv_byname(roleid, parameter, priv));
+}
+
+/*
+ *		Support routines for has_parameter_privilege family.
+ */
+
+/*
+ * convert_parameter_priv_string
+ *		Convert text string to AclMode value.
+ */
+static AclMode
+convert_parameter_priv_string(text *priv_text)
+{
+	static const priv_map parameter_priv_map[] = {
+		{"SET", ACL_SET},
+		{"SET WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_SET)},
+		{"ALTER SYSTEM", ACL_ALTER_SYSTEM},
+		{"ALTER SYSTEM WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_ALTER_SYSTEM)},
+		{NULL, 0}
+	};
+
+	return convert_any_priv_string(priv_text, parameter_priv_map);
+}
+
+/*
+ * has_largeobject_privilege variants
+ *		These are all named "has_largeobject_privilege" at the SQL level.
+ *		They take various combinations of large object OID with
+ *		user name, user OID, or implicit user = current_user.
+ *
+ *		The result is a boolean value: true if user has the indicated
+ *		privilege, false if not, or NULL if object doesn't exist.
+ */
+
+/*
+ * has_lo_priv_byid
+ *
+ *		Helper function to check user privileges on a large object given the
+ *		role by Oid, large object by Oid, and privileges as AclMode.
+ */
+static bool
+has_lo_priv_byid(Oid roleid, Oid lobjId, AclMode priv, bool *is_missing)
+{
+	Snapshot	snapshot = NULL;
+	AclResult	aclresult;
+
+	if (priv & ACL_UPDATE)
+		snapshot = NULL;
+	else
+		snapshot = GetActiveSnapshot();
+
+	if (!LargeObjectExistsWithSnapshot(lobjId, snapshot))
+	{
+		Assert(is_missing != NULL);
+		*is_missing = true;
+		return false;
+	}
+
+	if (lo_compat_privileges)
+		return true;
+
+	aclresult = pg_largeobject_aclcheck_snapshot(lobjId,
+												 roleid,
+												 priv,
+												 snapshot);
+	return aclresult == ACLCHECK_OK;
+}
+
+/*
+ * has_largeobject_privilege_name_id
+ *		Check user privileges on a large object given
+ *		name username, large object oid, and text priv name.
+ */
+Datum
+has_largeobject_privilege_name_id(PG_FUNCTION_ARGS)
+{
+	Name		username = PG_GETARG_NAME(0);
+	Oid			roleid = get_role_oid_or_public(NameStr(*username));
+	Oid			lobjId = PG_GETARG_OID(1);
+	text	   *priv_type_text = PG_GETARG_TEXT_PP(2);
+	AclMode		mode;
+	bool		is_missing = false;
+	bool		result;
+
+	mode = convert_largeobject_priv_string(priv_type_text);
+	result = has_lo_priv_byid(roleid, lobjId, mode, &is_missing);
+
+	if (is_missing)
+		PG_RETURN_NULL();
+
+	PG_RETURN_BOOL(result);
+}
+
+/*
+ * has_largeobject_privilege_id
+ *		Check user privileges on a large object given
+ *		large object oid, and text priv name.
+ *		current_user is assumed
+ */
+Datum
+has_largeobject_privilege_id(PG_FUNCTION_ARGS)
+{
+	Oid			lobjId = PG_GETARG_OID(0);
+	Oid			roleid = GetUserId();
+	text	   *priv_type_text = PG_GETARG_TEXT_PP(1);
+	AclMode		mode;
+	bool		is_missing = false;
+	bool		result;
+
+	mode = convert_largeobject_priv_string(priv_type_text);
+	result = has_lo_priv_byid(roleid, lobjId, mode, &is_missing);
+
+	if (is_missing)
+		PG_RETURN_NULL();
+
+	PG_RETURN_BOOL(result);
+}
+
+/*
+ * has_largeobject_privilege_id_id
+ *		Check user privileges on a large object given
+ *		roleid, large object oid, and text priv name.
+ */
+Datum
+has_largeobject_privilege_id_id(PG_FUNCTION_ARGS)
+{
+	Oid			roleid = PG_GETARG_OID(0);
+	Oid			lobjId = PG_GETARG_OID(1);
+	text	   *priv_type_text = PG_GETARG_TEXT_PP(2);
+	AclMode		mode;
+	bool		is_missing = false;
+	bool		result;
+
+	mode = convert_largeobject_priv_string(priv_type_text);
+	result = has_lo_priv_byid(roleid, lobjId, mode, &is_missing);
+
+	if (is_missing)
+		PG_RETURN_NULL();
+
+	PG_RETURN_BOOL(result);
+}
+
+/*
+ * convert_largeobject_priv_string
+ *		Convert text string to AclMode value.
+ */
+static AclMode
+convert_largeobject_priv_string(text *priv_type_text)
+{
+	static const priv_map largeobject_priv_map[] = {
+		{"SELECT", ACL_SELECT},
+		{"SELECT WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_SELECT)},
+		{"UPDATE", ACL_UPDATE},
+		{"UPDATE WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_UPDATE)},
+		{NULL, 0}
+	};
+
+	return convert_any_priv_string(priv_type_text, largeobject_priv_map);
+}
 
 /*
  * pg_has_role variants
@@ -4629,8 +5012,8 @@ pg_has_role_id_id(PG_FUNCTION_ARGS)
  *		Convert text string to AclMode value.
  *
  * We use USAGE to denote whether the privileges of the role are accessible
- * (has_privs), MEMBER to denote is_member, and MEMBER WITH GRANT OPTION
- * (or ADMIN OPTION) to denote is_admin.  There is no ACL bit corresponding
+ * (has_privs_of_role), MEMBER to denote is_member, and MEMBER WITH GRANT
+ * (or ADMIN) OPTION to denote is_admin.  There is no ACL bit corresponding
  * to MEMBER so we cheat and use ACL_CREATE for that.  This convention
  * is shared only with pg_role_aclcheck, below.
  */
@@ -4640,10 +5023,13 @@ convert_role_priv_string(text *priv_type_text)
 	static const priv_map role_priv_map[] = {
 		{"USAGE", ACL_USAGE},
 		{"MEMBER", ACL_CREATE},
+		{"SET", ACL_SET},
 		{"USAGE WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_CREATE)},
 		{"USAGE WITH ADMIN OPTION", ACL_GRANT_OPTION_FOR(ACL_CREATE)},
 		{"MEMBER WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_CREATE)},
 		{"MEMBER WITH ADMIN OPTION", ACL_GRANT_OPTION_FOR(ACL_CREATE)},
+		{"SET WITH GRANT OPTION", ACL_GRANT_OPTION_FOR(ACL_CREATE)},
+		{"SET WITH ADMIN OPTION", ACL_GRANT_OPTION_FOR(ACL_CREATE)},
 		{NULL, 0}
 	};
 
@@ -4659,11 +5045,6 @@ pg_role_aclcheck(Oid role_oid, Oid roleid, AclMode mode)
 {
 	if (mode & ACL_GRANT_OPTION_FOR(ACL_CREATE))
 	{
-		/*
-		 * XXX For roleid == role_oid, is_admin_of_role() also examines the
-		 * session and call stack.  That suits two-argument pg_has_role(), but
-		 * it gives the three-argument version a lamentable whimsy.
-		 */
 		if (is_admin_of_role(roleid, role_oid))
 			return ACLCHECK_OK;
 	}
@@ -4675,6 +5056,11 @@ pg_role_aclcheck(Oid role_oid, Oid roleid, AclMode mode)
 	if (mode & ACL_USAGE)
 	{
 		if (has_privs_of_role(roleid, role_oid))
+			return ACLCHECK_OK;
+	}
+	if (mode & ACL_SET)
+	{
+		if (member_can_set_role(roleid, role_oid))
 			return ACLCHECK_OK;
 	}
 	return ACLCHECK_NO_PRIV;
@@ -4689,11 +5075,22 @@ initialize_acl(void)
 {
 	if (!IsBootstrapProcessingMode())
 	{
+		cached_db_hash =
+			GetSysCacheHashValue1(DATABASEOID,
+								  ObjectIdGetDatum(MyDatabaseId));
+
 		/*
-		 * In normal mode, set a callback on any syscache invalidation of
-		 * pg_auth_members rows
+		 * In normal mode, set a callback on any syscache invalidation of rows
+		 * of pg_auth_members (for roles_is_member_of()) pg_database (for
+		 * roles_is_member_of())
 		 */
 		CacheRegisterSyscacheCallback(AUTHMEMROLEMEM,
+									  RoleMembershipCacheCallback,
+									  (Datum) 0);
+		CacheRegisterSyscacheCallback(AUTHOID,
+									  RoleMembershipCacheCallback,
+									  (Datum) 0);
+		CacheRegisterSyscacheCallback(DATABASEOID,
 									  RoleMembershipCacheCallback,
 									  (Datum) 0);
 	}
@@ -4704,139 +5101,125 @@ initialize_acl(void)
  *		Syscache inval callback function
  */
 static void
-RoleMembershipCacheCallback(Datum arg, int cacheid, uint32 hashvalue)
+RoleMembershipCacheCallback(Datum arg, SysCacheIdentifier cacheid,
+							uint32 hashvalue)
 {
-	/* Force membership caches to be recomputed on next use */
-	cached_privs_role = InvalidOid;
-	cached_member_role = InvalidOid;
-}
-
-
-/* Check if specified role has rolinherit set */
-static bool
-has_rolinherit(Oid roleid)
-{
-	bool		result = false;
-	HeapTuple	utup;
-
-	utup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleid));
-	if (HeapTupleIsValid(utup))
+	if (cacheid == DATABASEOID &&
+		hashvalue != cached_db_hash &&
+		hashvalue != 0)
 	{
-		result = ((Form_pg_authid) GETSTRUCT(utup))->rolinherit;
-		ReleaseSysCache(utup);
+		return;					/* ignore pg_database changes for other DBs */
 	}
-	return result;
-}
 
+	/* Force membership caches to be recomputed on next use */
+	cached_role[ROLERECURSE_MEMBERS] = InvalidOid;
+	cached_role[ROLERECURSE_PRIVS] = InvalidOid;
+	cached_role[ROLERECURSE_SETROLE] = InvalidOid;
+}
 
 /*
- * Get a list of roles that the specified roleid has the privileges of
- *
- * This is defined not to recurse through roles that don't have rolinherit
- * set; for such roles, membership implies the ability to do SET ROLE, but
- * the privileges are not available until you've done so.
- *
- * Since indirect membership testing is relatively expensive, we cache
- * a list of memberships.  Hence, the result is only guaranteed good until
- * the next call of roles_has_privs_of()!
- *
- * For the benefit of select_best_grantor, the result is defined to be
- * in breadth-first order, ie, closer relationships earlier.
+ * A helper function for roles_is_member_of() that provides an optimized
+ * implementation of list_append_unique_oid() via a Bloom filter.  The caller
+ * (i.e., roles_is_member_of()) is responsible for freeing bf once it is done
+ * using this function.
  */
-static List *
-roles_has_privs_of(Oid roleid)
+static inline List *
+roles_list_append(List *roles_list, bloom_filter **bf, Oid role)
 {
-	List	   *roles_list;
-	ListCell   *l;
-	List	   *new_cached_privs_roles;
-	MemoryContext oldctx;
-
-	/* If cache is already valid, just return the list */
-	if (OidIsValid(cached_privs_role) && cached_privs_role == roleid)
-		return cached_privs_roles;
+	unsigned char *roleptr = (unsigned char *) &role;
 
 	/*
-	 * Find all the roles that roleid is a member of, including multi-level
-	 * recursion.  The role itself will always be the first element of the
-	 * resulting list.
-	 *
-	 * Each element of the list is scanned to see if it adds any indirect
-	 * memberships.  We can use a single list as both the record of
-	 * already-found memberships and the agenda of roles yet to be scanned.
-	 * This is a bit tricky but works because the foreach() macro doesn't
-	 * fetch the next list element until the bottom of the loop.
+	 * If there is a previously-created Bloom filter, use it to try to
+	 * determine whether the role is missing from the list.  If it says yes,
+	 * that's a hard fact and we can go ahead and add the role.  If it says
+	 * no, that's only probabilistic and we'd better search the list.  Without
+	 * a filter, we must always do an ordinary linear search through the
+	 * existing list.
 	 */
-	roles_list = list_make1_oid(roleid);
-
-	foreach(l, roles_list)
+	if ((*bf && bloom_lacks_element(*bf, roleptr, sizeof(Oid))) ||
+		!list_member_oid(roles_list, role))
 	{
-		Oid			memberid = lfirst_oid(l);
-		CatCList   *memlist;
-		int			i;
-
-		/* Ignore non-inheriting roles */
-		if (!has_rolinherit(memberid))
-			continue;
-
-		/* Find roles that memberid is directly a member of */
-		memlist = SearchSysCacheList1(AUTHMEMMEMROLE,
-									  ObjectIdGetDatum(memberid));
-		for (i = 0; i < memlist->n_members; i++)
+		/*
+		 * If the list is large, we take on the overhead of creating and
+		 * populating a Bloom filter to speed up future calls to this
+		 * function.
+		 */
+		if (*bf == NULL &&
+			list_length(roles_list) > ROLES_LIST_BLOOM_THRESHOLD)
 		{
-			HeapTuple	tup = &memlist->members[i]->tuple;
-			Oid			otherid = ((Form_pg_auth_members) GETSTRUCT(tup))->roleid;
-
-			/*
-			 * Even though there shouldn't be any loops in the membership
-			 * graph, we must test for having already seen this role. It is
-			 * legal for instance to have both A->B and A->C->B.
-			 */
-			roles_list = list_append_unique_oid(roles_list, otherid);
+			*bf = bloom_create(ROLES_LIST_BLOOM_THRESHOLD * 10, work_mem, 0);
+			foreach_oid(roleid, roles_list)
+				bloom_add_element(*bf, (unsigned char *) &roleid, sizeof(Oid));
 		}
-		ReleaseSysCacheList(memlist);
+
+		/*
+		 * Finally, add the role to the list and the Bloom filter, if it
+		 * exists.
+		 */
+		roles_list = lappend_oid(roles_list, role);
+		if (*bf)
+			bloom_add_element(*bf, roleptr, sizeof(Oid));
 	}
 
-	/*
-	 * Copy the completed list into TopMemoryContext so it will persist.
-	 */
-	oldctx = MemoryContextSwitchTo(TopMemoryContext);
-	new_cached_privs_roles = list_copy(roles_list);
-	MemoryContextSwitchTo(oldctx);
-	list_free(roles_list);
-
-	/*
-	 * Now safe to assign to state variable
-	 */
-	cached_privs_role = InvalidOid; /* just paranoia */
-	list_free(cached_privs_roles);
-	cached_privs_roles = new_cached_privs_roles;
-	cached_privs_role = roleid;
-
-	/* And now we can return the answer */
-	return cached_privs_roles;
+	return roles_list;
 }
-
 
 /*
  * Get a list of roles that the specified roleid is a member of
  *
- * This is defined to recurse through roles regardless of rolinherit.
+ * Type ROLERECURSE_MEMBERS recurses through all grants; ROLERECURSE_PRIVS
+ * recurses only through inheritable grants; and ROLERECURSE_SETROLE recurses
+ * only through grants with set_option.
  *
  * Since indirect membership testing is relatively expensive, we cache
  * a list of memberships.  Hence, the result is only guaranteed good until
  * the next call of roles_is_member_of()!
+ *
+ * For the benefit of select_best_grantor, the result is defined to be
+ * in breadth-first order, ie, closer relationships earlier.
+ *
+ * If admin_of is not InvalidOid, this function sets *admin_role, either
+ * to the OID of the first role in the result list that directly possesses
+ * ADMIN OPTION on the role corresponding to admin_of, or to InvalidOid if
+ * there is no such role.
  */
 static List *
-roles_is_member_of(Oid roleid)
+roles_is_member_of(Oid roleid, enum RoleRecurseType type,
+				   Oid admin_of, Oid *admin_role)
 {
+	Oid			dba;
 	List	   *roles_list;
 	ListCell   *l;
-	List	   *new_cached_membership_roles;
+	List	   *new_cached_roles;
 	MemoryContext oldctx;
+	bloom_filter *bf = NULL;
 
-	/* If cache is already valid, just return the list */
-	if (OidIsValid(cached_member_role) && cached_member_role == roleid)
-		return cached_membership_roles;
+	Assert(OidIsValid(admin_of) == (admin_role != NULL));
+	if (admin_role != NULL)
+		*admin_role = InvalidOid;
+
+	/* If cache is valid and ADMIN OPTION not sought, just return the list */
+	if (cached_role[type] == roleid && !OidIsValid(admin_of) &&
+		OidIsValid(cached_role[type]))
+		return cached_roles[type];
+
+	/*
+	 * Role expansion happens in a non-database backend when guc.c checks
+	 * ROLE_PG_READ_ALL_SETTINGS for a physical walsender SHOW command.  In
+	 * that case, no role gets pg_database_owner.
+	 */
+	if (!OidIsValid(MyDatabaseId))
+		dba = InvalidOid;
+	else
+	{
+		HeapTuple	dbtup;
+
+		dbtup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
+		if (!HeapTupleIsValid(dbtup))
+			elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
+		dba = ((Form_pg_database) GETSTRUCT(dbtup))->datdba;
+		ReleaseSysCache(dbtup);
+	}
 
 	/*
 	 * Find all the roles that roleid is a member of, including multi-level
@@ -4863,45 +5246,74 @@ roles_is_member_of(Oid roleid)
 		for (i = 0; i < memlist->n_members; i++)
 		{
 			HeapTuple	tup = &memlist->members[i]->tuple;
-			Oid			otherid = ((Form_pg_auth_members) GETSTRUCT(tup))->roleid;
+			Form_pg_auth_members form = (Form_pg_auth_members) GETSTRUCT(tup);
+			Oid			otherid = form->roleid;
+
+			/*
+			 * While otherid==InvalidOid shouldn't appear in the catalog, the
+			 * OidIsValid() avoids crashing if that arises.
+			 */
+			if (otherid == admin_of && form->admin_option &&
+				OidIsValid(admin_of) && !OidIsValid(*admin_role))
+				*admin_role = memberid;
+
+			/* If we're supposed to ignore non-heritable grants, do so. */
+			if (type == ROLERECURSE_PRIVS && !form->inherit_option)
+				continue;
+
+			/* If we're supposed to ignore non-SET grants, do so. */
+			if (type == ROLERECURSE_SETROLE && !form->set_option)
+				continue;
 
 			/*
 			 * Even though there shouldn't be any loops in the membership
 			 * graph, we must test for having already seen this role. It is
 			 * legal for instance to have both A->B and A->C->B.
 			 */
-			roles_list = list_append_unique_oid(roles_list, otherid);
+			roles_list = roles_list_append(roles_list, &bf, otherid);
 		}
 		ReleaseSysCacheList(memlist);
+
+		/* implement pg_database_owner implicit membership */
+		if (memberid == dba && OidIsValid(dba))
+			roles_list = roles_list_append(roles_list, &bf,
+										   ROLE_PG_DATABASE_OWNER);
 	}
+
+	/*
+	 * Free the Bloom filter created by roles_list_append(), if there is one.
+	 */
+	if (bf)
+		bloom_free(bf);
 
 	/*
 	 * Copy the completed list into TopMemoryContext so it will persist.
 	 */
 	oldctx = MemoryContextSwitchTo(TopMemoryContext);
-	new_cached_membership_roles = list_copy(roles_list);
+	new_cached_roles = list_copy(roles_list);
 	MemoryContextSwitchTo(oldctx);
 	list_free(roles_list);
 
 	/*
 	 * Now safe to assign to state variable
 	 */
-	cached_member_role = InvalidOid;	/* just paranoia */
-	list_free(cached_membership_roles);
-	cached_membership_roles = new_cached_membership_roles;
-	cached_member_role = roleid;
+	cached_role[type] = InvalidOid; /* just paranoia */
+	list_free(cached_roles[type]);
+	cached_roles[type] = new_cached_roles;
+	cached_role[type] = roleid;
 
 	/* And now we can return the answer */
-	return cached_membership_roles;
+	return cached_roles[type];
 }
 
 
 /*
  * Does member have the privileges of role (directly or indirectly)?
  *
- * This is defined not to recurse through roles that don't have rolinherit
- * set; for such roles, membership implies the ability to do SET ROLE, but
- * the privileges are not available until you've done so.
+ * This is defined not to recurse through grants that are not inherited,
+ * and only inherited grants confer the associated privileges automatically.
+ *
+ * See also member_can_set_role, below.
  */
 bool
 has_privs_of_role(Oid member, Oid role)
@@ -4918,14 +5330,70 @@ has_privs_of_role(Oid member, Oid role)
 	 * Find all the roles that member has the privileges of, including
 	 * multi-level recursion, then see if target role is any one of them.
 	 */
-	return list_member_oid(roles_has_privs_of(member), role);
+	return list_member_oid(roles_is_member_of(member, ROLERECURSE_PRIVS,
+											  InvalidOid, NULL),
+						   role);
 }
 
+/*
+ * Can member use SET ROLE to this role?
+ *
+ * There must be a chain of grants from 'member' to 'role' each of which
+ * permits SET ROLE; that is, each of which has set_option = true.
+ *
+ * It doesn't matter whether the grants are inheritable. That's a separate
+ * question; see has_privs_of_role.
+ *
+ * This function should be used to determine whether the session user can
+ * use SET ROLE to become the target user. We also use it to determine whether
+ * the session user can change an existing object to be owned by the target
+ * user, or create new objects owned by the target user.
+ */
+bool
+member_can_set_role(Oid member, Oid role)
+{
+	/* Fast path for simple case */
+	if (member == role)
+		return true;
+
+	/* Superusers have every privilege, so can always SET ROLE */
+	if (superuser_arg(member))
+		return true;
+
+	/*
+	 * Find all the roles that member can access via SET ROLE, including
+	 * multi-level recursion, then see if target role is any one of them.
+	 */
+	return list_member_oid(roles_is_member_of(member, ROLERECURSE_SETROLE,
+											  InvalidOid, NULL),
+						   role);
+}
+
+/*
+ * Permission violation error unless able to SET ROLE to target role.
+ */
+void
+check_can_set_role(Oid member, Oid role)
+{
+	if (!member_can_set_role(member, role))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be able to SET ROLE \"%s\"",
+						GetUserNameFromId(role, false))));
+}
 
 /*
  * Is member a member of role (directly or indirectly)?
  *
- * This is defined to recurse through roles regardless of rolinherit.
+ * This is defined to recurse through grants whether they are inherited or not.
+ *
+ * Do not use this for privilege checking, instead use has_privs_of_role().
+ * Don't use it for determining whether it's possible to SET ROLE to some
+ * other role; for that, use member_can_set_role(). And don't use it for
+ * determining whether it's OK to create an object owned by some other role:
+ * use member_can_set_role() for that, too.
+ *
+ * In short, calling this function is the wrong thing to do nearly everywhere.
  */
 bool
 is_member_of_role(Oid member, Oid role)
@@ -4942,21 +5410,9 @@ is_member_of_role(Oid member, Oid role)
 	 * Find all the roles that member is a member of, including multi-level
 	 * recursion, then see if target role is any one of them.
 	 */
-	return list_member_oid(roles_is_member_of(member), role);
-}
-
-/*
- * check_is_member_of_role
- *		is_member_of_role with a standard permission-violation error if not
- */
-void
-check_is_member_of_role(Oid member, Oid role)
-{
-	if (!is_member_of_role(member, role))
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be member of role \"%s\"",
-						GetUserNameFromId(role, false))));
+	return list_member_oid(roles_is_member_of(member, ROLERECURSE_MEMBERS,
+											  InvalidOid, NULL),
+						   role);
 }
 
 /*
@@ -4964,6 +5420,8 @@ check_is_member_of_role(Oid member, Oid role)
  *
  * This is identical to is_member_of_role except we ignore superuser
  * status.
+ *
+ * Do not use this for privilege checking, instead use has_privs_of_role()
  */
 bool
 is_member_of_role_nosuper(Oid member, Oid role)
@@ -4976,7 +5434,9 @@ is_member_of_role_nosuper(Oid member, Oid role)
 	 * Find all the roles that member is a member of, including multi-level
 	 * recursion, then see if target role is any one of them.
 	 */
-	return list_member_oid(roles_is_member_of(member), role);
+	return list_member_oid(roles_is_member_of(member, ROLERECURSE_MEMBERS,
+											  InvalidOid, NULL),
+						   role);
 }
 
 
@@ -4984,111 +5444,78 @@ is_member_of_role_nosuper(Oid member, Oid role)
  * Is member an admin of role?	That is, is member the role itself (subject to
  * restrictions below), a member (directly or indirectly) WITH ADMIN OPTION,
  * or a superuser?
+ *
+ * See also has_admin_privs_of_role() below.
  */
 bool
 is_admin_of_role(Oid member, Oid role)
 {
-	bool		result = false;
-	List	   *roles_list;
-	ListCell   *l;
+	Oid			admin_role;
 
 	if (superuser_arg(member))
 		return true;
 
+	/* By policy, a role cannot have WITH ADMIN OPTION on itself. */
 	if (member == role)
+		return false;
 
-		/*
-		 * A role can admin itself when it matches the session user and we're
-		 * outside any security-restricted operation, SECURITY DEFINER or
-		 * similar context.  SQL-standard roles cannot self-admin.  However,
-		 * SQL-standard users are distinct from roles, and they are not
-		 * grantable like roles: PostgreSQL's role-user duality extends the
-		 * standard.  Checking for a session user match has the effect of
-		 * letting a role self-admin only when it's conspicuously behaving
-		 * like a user.  Note that allowing self-admin under a mere SET ROLE
-		 * would make WITH ADMIN OPTION largely irrelevant; any member could
-		 * SET ROLE to issue the otherwise-forbidden command.
-		 *
-		 * Withholding self-admin in a security-restricted operation prevents
-		 * object owners from harnessing the session user identity during
-		 * administrative maintenance.  Suppose Alice owns a database, has
-		 * issued "GRANT alice TO bob", and runs a daily ANALYZE.  Bob creates
-		 * an alice-owned SECURITY DEFINER function that issues "REVOKE alice
-		 * FROM carol".  If he creates an expression index calling that
-		 * function, Alice will attempt the REVOKE during each ANALYZE.
-		 * Checking InSecurityRestrictedOperation() thwarts that attack.
-		 *
-		 * Withholding self-admin in SECURITY DEFINER functions makes their
-		 * behavior independent of the calling user.  There's no security or
-		 * SQL-standard-conformance need for that restriction, though.
-		 *
-		 * A role cannot have actual WITH ADMIN OPTION on itself, because that
-		 * would imply a membership loop.  Therefore, we're done either way.
-		 */
-		return member == GetSessionUserId() &&
-			!InLocalUserIdChange() && !InSecurityRestrictedOperation();
-
-	/*
-	 * Find all the roles that member is a member of, including multi-level
-	 * recursion.  We build a list in the same way that is_member_of_role does
-	 * to track visited and unvisited roles.
-	 */
-	roles_list = list_make1_oid(member);
-
-	foreach(l, roles_list)
-	{
-		Oid			memberid = lfirst_oid(l);
-		CatCList   *memlist;
-		int			i;
-
-		/* Find roles that memberid is directly a member of */
-		memlist = SearchSysCacheList1(AUTHMEMMEMROLE,
-									  ObjectIdGetDatum(memberid));
-		for (i = 0; i < memlist->n_members; i++)
-		{
-			HeapTuple	tup = &memlist->members[i]->tuple;
-			Oid			otherid = ((Form_pg_auth_members) GETSTRUCT(tup))->roleid;
-
-			if (otherid == role &&
-				((Form_pg_auth_members) GETSTRUCT(tup))->admin_option)
-			{
-				/* Found what we came for, so can stop searching */
-				result = true;
-				break;
-			}
-
-			roles_list = list_append_unique_oid(roles_list, otherid);
-		}
-		ReleaseSysCacheList(memlist);
-		if (result)
-			break;
-	}
-
-	list_free(roles_list);
-
-	return result;
+	(void) roles_is_member_of(member, ROLERECURSE_MEMBERS, role, &admin_role);
+	return OidIsValid(admin_role);
 }
 
-
-/* does what it says ... */
-static int
-count_one_bits(AclMode mask)
+/*
+ * Does member hold ADMIN OPTION on role, either directly or through a role
+ * whose privileges member inherits?
+ *
+ * Unlike is_admin_of_role(), this does not recurse through grants that are not
+ * inherited.  Callers that must go on to record a grantor for the operation
+ * should use this rather than is_admin_of_role(), since select_best_admin()
+ * searches the same way.
+ */
+bool
+has_admin_privs_of_role(Oid member, Oid role)
 {
-	int			nbits = 0;
+	Oid			admin_role;
 
-	/* this code relies on AclMode being an unsigned type */
-	while (mask)
-	{
-		if (mask & 1)
-			nbits++;
-		mask >>= 1;
-	}
-	return nbits;
+	if (superuser_arg(member))
+		return true;
+
+	/* By policy, a role cannot have WITH ADMIN OPTION on itself. */
+	if (member == role)
+		return false;
+
+	(void) roles_is_member_of(member, ROLERECURSE_PRIVS, role, &admin_role);
+	return OidIsValid(admin_role);
 }
 
+/*
+ * Find a role whose privileges "member" inherits which has ADMIN OPTION
+ * on "role", ignoring super-userness.
+ *
+ * There might be more than one such role; prefer one which involves fewer
+ * hops. That is, if member has ADMIN OPTION, prefer that over all other
+ * options; if not, prefer a role from which member inherits more directly
+ * over more indirect inheritance.
+ */
+Oid
+select_best_admin(Oid member, Oid role)
+{
+	Oid			admin_role;
+
+	/* By policy, a role cannot have WITH ADMIN OPTION on itself. */
+	if (member == role)
+		return InvalidOid;
+
+	(void) roles_is_member_of(member, ROLERECURSE_PRIVS, role, &admin_role);
+	return admin_role;
+}
 
 /*
  * Select the effective grantor ID for a GRANT or REVOKE operation.
+ *
+ * If the GRANT/REVOKE has an explicit GRANTED BY clause, we always use
+ * exactly that role (which may result in granting/revoking no privileges).
+ * Otherwise, we seek a "best" grantor, starting with the current user.
  *
  * The grantor must always be either the object owner or some role that has
  * been explicitly granted grant options.  This ensures that all granted
@@ -5102,24 +5529,43 @@ count_one_bits(AclMode mask)
  * role has 'em all.  In this case we pick a role with the largest number
  * of desired options.  Ties are broken in favor of closer ancestors.
  *
- * roleId: the role attempting to do the GRANT/REVOKE
+ * grantedBy: the GRANTED BY clause of GRANT/REVOKE, or NULL if none
  * privileges: the privileges to be granted/revoked
  * acl: the ACL of the object in question
  * ownerId: the role owning the object in question
  * *grantorId: receives the OID of the role to do the grant as
- * *grantOptions: receives the grant options actually held by grantorId
- *
- * If no grant options exist, we set grantorId to roleId, grantOptions to 0.
+ * *grantOptions: receives grant options actually held by grantorId (maybe 0)
  */
 void
-select_best_grantor(Oid roleId, AclMode privileges,
+select_best_grantor(const RoleSpec *grantedBy, AclMode privileges,
 					const Acl *acl, Oid ownerId,
 					Oid *grantorId, AclMode *grantOptions)
 {
+	Oid			roleId = GetUserId();
 	AclMode		needed_goptions = ACL_GRANT_OPTION_FOR(privileges);
 	List	   *roles_list;
 	int			nrights;
 	ListCell   *l;
+
+	/*
+	 * If we have GRANTED BY, resolve it and verify current user is allowed to
+	 * specify that role.
+	 */
+	if (grantedBy)
+	{
+		Oid			grantor = get_rolespec_oid(grantedBy, false);
+
+		if (!has_privs_of_role(roleId, grantor))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("must inherit privileges of role \"%s\"",
+							GetUserNameFromId(grantor, false))));
+		/* Use exactly that grantor, whether it has privileges or not */
+		*grantorId = grantor;
+		*grantOptions = aclmask_direct(acl, grantor, ownerId,
+									   needed_goptions, ACLMASK_ALL);
+		return;
+	}
 
 	/*
 	 * The object owner is always treated as having all grant options, so if
@@ -5137,10 +5583,11 @@ select_best_grantor(Oid roleId, AclMode privileges,
 	/*
 	 * Otherwise we have to do a careful search to see if roleId has the
 	 * privileges of any suitable role.  Note: we can hang onto the result of
-	 * roles_has_privs_of() throughout this loop, because aclmask_direct()
+	 * roles_is_member_of() throughout this loop, because aclmask_direct()
 	 * doesn't query any role memberships.
 	 */
-	roles_list = roles_has_privs_of(roleId);
+	roles_list = roles_is_member_of(roleId, ROLERECURSE_PRIVS,
+									InvalidOid, NULL);
 
 	/* initialize candidate result as default */
 	*grantorId = roleId;
@@ -5168,7 +5615,7 @@ select_best_grantor(Oid roleId, AclMode privileges,
 		 */
 		if (otherprivs != ACL_NO_RIGHTS)
 		{
-			int			nnewrights = count_one_bits(otherprivs);
+			int			nnewrights = pg_popcount64(otherprivs);
 
 			if (nnewrights > nrights)
 			{
@@ -5191,7 +5638,8 @@ get_role_oid(const char *rolname, bool missing_ok)
 {
 	Oid			oid;
 
-	oid = GetSysCacheOid1(AUTHNAME, CStringGetDatum(rolname));
+	oid = GetSysCacheOid1(AUTHNAME, Anum_pg_authid_oid,
+						  CStringGetDatum(rolname));
 	if (!OidIsValid(oid) && !missing_ok)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
@@ -5231,6 +5679,7 @@ get_rolespec_oid(const RoleSpec *role, bool missing_ok)
 			oid = get_role_oid(role->rolename, missing_ok);
 			break;
 
+		case ROLESPEC_CURRENT_ROLE:
 		case ROLESPEC_CURRENT_USER:
 			oid = GetUserId();
 			break;
@@ -5273,14 +5722,15 @@ get_rolespec_tuple(const RoleSpec *role)
 						 errmsg("role \"%s\" does not exist", role->rolename)));
 			break;
 
+		case ROLESPEC_CURRENT_ROLE:
 		case ROLESPEC_CURRENT_USER:
-			tuple = SearchSysCache1(AUTHOID, GetUserId());
+			tuple = SearchSysCache1(AUTHOID, ObjectIdGetDatum(GetUserId()));
 			if (!HeapTupleIsValid(tuple))
 				elog(ERROR, "cache lookup failed for role %u", GetUserId());
 			break;
 
 		case ROLESPEC_SESSION_USER:
-			tuple = SearchSysCache1(AUTHOID, GetSessionUserId());
+			tuple = SearchSysCache1(AUTHOID, ObjectIdGetDatum(GetSessionUserId()));
 			if (!HeapTupleIsValid(tuple))
 				elog(ERROR, "cache lookup failed for role %u", GetSessionUserId());
 			break;
@@ -5319,7 +5769,7 @@ get_rolespec_name(const RoleSpec *role)
 
 /*
  * Given a RoleSpec, throw an error if the name is reserved, using detail_msg,
- * if provided.
+ * if provided (which must be already translated).
  *
  * If node is NULL, no error is thrown.  If detail_msg is NULL then no detail
  * message is provided.
@@ -5340,7 +5790,7 @@ check_rolespec_name(const RoleSpec *role, const char *detail_msg)
 					(errcode(ERRCODE_RESERVED_NAME),
 					 errmsg("role name \"%s\" is reserved",
 							role->rolename),
-					 errdetail("%s", detail_msg)));
+					 errdetail_internal("%s", detail_msg)));
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_RESERVED_NAME),

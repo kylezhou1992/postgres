@@ -7,7 +7,7 @@
  * already seen.  The hash key is computed from the grouping columns.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -18,10 +18,11 @@
  */
 #include "postgres.h"
 
-#include "executor/execdebug.h"
+#include "executor/executor.h"
 #include "executor/nodeRecursiveunion.h"
 #include "miscadmin.h"
 #include "utils/memutils.h"
+#include "utils/tuplestore.h"
 
 
 
@@ -35,17 +36,24 @@ build_hash_table(RecursiveUnionState *rustate)
 	TupleDesc	desc = ExecGetResultType(outerPlanState(rustate));
 
 	Assert(node->numCols > 0);
-	Assert(node->numGroups > 0);
 
+	/*
+	 * If both child plans deliver the same fixed tuple slot type, we can tell
+	 * BuildTupleHashTable to expect that slot type as input.  Otherwise,
+	 * we'll pass NULL denoting that any slot type is possible.
+	 */
 	rustate->hashtable = BuildTupleHashTable(&rustate->ps,
 											 desc,
+											 ExecGetCommonChildSlotOps(&rustate->ps),
 											 node->numCols,
 											 node->dupColIdx,
 											 rustate->eqfuncoids,
 											 rustate->hashfunctions,
+											 node->dupCollations,
 											 node->numGroups,
 											 0,
-											 rustate->tableContext,
+											 rustate->ps.state->es_query_cxt,
+											 rustate->tuplesContext,
 											 rustate->tempContext,
 											 false);
 }
@@ -92,7 +100,7 @@ ExecRecursiveUnion(PlanState *pstate)
 			if (plan->numCols > 0)
 			{
 				/* Find or build hashtable entry for this tuple's group */
-				LookupTupleHashEntry(node->hashtable, slot, &isnew);
+				LookupTupleHashEntry(node->hashtable, slot, &isnew, NULL);
 				/* Must reset temp context after each hashtable lookup */
 				MemoryContextReset(node->tempContext);
 				/* Ignore tuple if already seen */
@@ -113,19 +121,26 @@ ExecRecursiveUnion(PlanState *pstate)
 		slot = ExecProcNode(innerPlan);
 		if (TupIsNull(slot))
 		{
+			Tuplestorestate *swaptemp;
+
 			/* Done if there's nothing in the intermediate table */
 			if (node->intermediate_empty)
 				break;
 
-			/* done with old working table ... */
-			tuplestore_end(node->working_table);
+			/*
+			 * Now we let the intermediate table become the work table.  We
+			 * need a fresh intermediate table, so delete the tuples from the
+			 * current working table and use that as the new intermediate
+			 * table.  This saves a round of free/malloc from creating a new
+			 * tuple store.
+			 */
+			tuplestore_clear(node->working_table);
 
-			/* intermediate table becomes working table */
+			swaptemp = node->working_table;
 			node->working_table = node->intermediate_table;
+			node->intermediate_table = swaptemp;
 
-			/* create new empty intermediate table */
-			node->intermediate_table = tuplestore_begin_heap(false, false,
-															 work_mem);
+			/* mark the intermediate table as empty */
 			node->intermediate_empty = true;
 
 			/* reset the recursive term */
@@ -139,7 +154,7 @@ ExecRecursiveUnion(PlanState *pstate)
 		if (plan->numCols > 0)
 		{
 			/* Find or build hashtable entry for this tuple's group */
-			LookupTupleHashEntry(node->hashtable, slot, &isnew);
+			LookupTupleHashEntry(node->hashtable, slot, &isnew, NULL);
 			/* Must reset temp context after each hashtable lookup */
 			MemoryContextReset(node->tempContext);
 			/* Ignore tuple if already seen */
@@ -158,7 +173,7 @@ ExecRecursiveUnion(PlanState *pstate)
 }
 
 /* ----------------------------------------------------------------
- *		ExecInitRecursiveUnionScan
+ *		ExecInitRecursiveUnion
  * ----------------------------------------------------------------
  */
 RecursiveUnionState *
@@ -182,7 +197,7 @@ ExecInitRecursiveUnion(RecursiveUnion *node, EState *estate, int eflags)
 	rustate->hashfunctions = NULL;
 	rustate->hashtable = NULL;
 	rustate->tempContext = NULL;
-	rustate->tableContext = NULL;
+	rustate->tuplesContext = NULL;
 
 	/* initialize processing state */
 	rustate->recursing = false;
@@ -194,7 +209,8 @@ ExecInitRecursiveUnion(RecursiveUnion *node, EState *estate, int eflags)
 	 * If hashing, we need a per-tuple memory context for comparisons, and a
 	 * longer-lived context to store the hash table.  The table can't just be
 	 * kept in the per-query context because we want to be able to throw it
-	 * away when rescanning.
+	 * away when rescanning.  We can use a BumpContext to save storage,
+	 * because we will have no need to delete individual table entries.
 	 */
 	if (node->numCols > 0)
 	{
@@ -202,10 +218,10 @@ ExecInitRecursiveUnion(RecursiveUnion *node, EState *estate, int eflags)
 			AllocSetContextCreate(CurrentMemoryContext,
 								  "RecursiveUnion",
 								  ALLOCSET_DEFAULT_SIZES);
-		rustate->tableContext =
-			AllocSetContextCreate(CurrentMemoryContext,
-								  "RecursiveUnion hash table",
-								  ALLOCSET_DEFAULT_SIZES);
+		rustate->tuplesContext =
+			BumpContextCreate(CurrentMemoryContext,
+							  "RecursiveUnion hashed tuples",
+							  ALLOCSET_DEFAULT_SIZES);
 	}
 
 	/*
@@ -229,7 +245,7 @@ ExecInitRecursiveUnion(RecursiveUnion *node, EState *estate, int eflags)
 	 * RecursiveUnion nodes still have Result slots, which hold pointers to
 	 * tuples, so we have to initialize them.
 	 */
-	ExecInitResultTupleSlotTL(estate, &rustate->ps);
+	ExecInitResultTypeTL(&rustate->ps);
 
 	/*
 	 * Initialize result tuple type.  (Note: we have to set up the result type
@@ -261,7 +277,7 @@ ExecInitRecursiveUnion(RecursiveUnion *node, EState *estate, int eflags)
 }
 
 /* ----------------------------------------------------------------
- *		ExecEndRecursiveUnionScan
+ *		ExecEndRecursiveUnion
  *
  *		frees any storage allocated through C routines.
  * ----------------------------------------------------------------
@@ -273,16 +289,11 @@ ExecEndRecursiveUnion(RecursiveUnionState *node)
 	tuplestore_end(node->working_table);
 	tuplestore_end(node->intermediate_table);
 
-	/* free subsidiary stuff including hashtable */
+	/* free subsidiary stuff including hashtable data */
 	if (node->tempContext)
 		MemoryContextDelete(node->tempContext);
-	if (node->tableContext)
-		MemoryContextDelete(node->tableContext);
-
-	/*
-	 * clean out the upper tuple table
-	 */
-	ExecClearTuple(node->ps.ps_ResultTupleSlot);
+	if (node->tuplesContext)
+		MemoryContextDelete(node->tuplesContext);
 
 	/*
 	 * close down subplans
@@ -318,13 +329,9 @@ ExecReScanRecursiveUnion(RecursiveUnionState *node)
 	if (outerPlan->chgParam == NULL)
 		ExecReScan(outerPlan);
 
-	/* Release any hashtable storage */
-	if (node->tableContext)
-		MemoryContextResetAndDeleteChildren(node->tableContext);
-
-	/* And rebuild empty hashtable if needed */
+	/* Empty hashtable if needed */
 	if (plan->numCols > 0)
-		build_hash_table(node);
+		ResetTupleHashTable(node->hashtable);
 
 	/* reset processing state */
 	node->recursing = false;

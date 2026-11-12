@@ -4,7 +4,7 @@
  *	  Support for finding the values associated with Param nodes.
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/params.h
@@ -14,11 +14,10 @@
 #ifndef PARAMS_H
 #define PARAMS_H
 
-/* Forward declarations, to avoid including other headers */
-struct Bitmapset;
-struct ExprState;
-struct Param;
-struct ParseState;
+/* to avoid including other headers */
+typedef struct ExprState ExprState;
+typedef struct Param Param;
+typedef struct ParseState ParseState;
 
 
 /*
@@ -101,11 +100,11 @@ typedef ParamExternData *(*ParamFetchHook) (ParamListInfo params,
 											int paramid, bool speculative,
 											ParamExternData *workspace);
 
-typedef void (*ParamCompileHook) (ParamListInfo params, struct Param *param,
-								  struct ExprState *state,
+typedef void (*ParamCompileHook) (ParamListInfo params, Param *param,
+								  ExprState *state,
 								  Datum *resv, bool *resnull);
 
-typedef void (*ParserSetupHook) (struct ParseState *pstate, void *arg);
+typedef void (*ParserSetupHook) (ParseState *pstate, void *arg);
 
 typedef struct ParamListInfoData
 {
@@ -115,6 +114,7 @@ typedef struct ParamListInfoData
 	void	   *paramCompileArg;
 	ParserSetupHook parserSetup;	/* parser setup hook */
 	void	   *parserSetupArg;
+	char	   *paramValuesStr; /* params as a single string for errors */
 	int			numParams;		/* nominal/maximum # of Params represented */
 
 	/*
@@ -149,11 +149,21 @@ typedef struct ParamExecData
 	bool		isnull;
 } ParamExecData;
 
+/* type of argument for ParamsErrorCallback */
+typedef struct ParamsErrorCbData
+{
+	const char *portalName;
+	ParamListInfo params;
+} ParamsErrorCbData;
 
 /* Functions found in src/backend/nodes/params.c */
+extern ParamListInfo makeParamList(int numParams);
 extern ParamListInfo copyParamList(ParamListInfo from);
 extern Size EstimateParamListSpace(ParamListInfo paramLI);
 extern void SerializeParamList(ParamListInfo paramLI, char **start_address);
 extern ParamListInfo RestoreParamList(char **start_address);
+extern char *BuildParamLogString(ParamListInfo params, char **knownTextValues,
+								 int maxlen);
+extern void ParamsErrorCallback(void *arg);
 
 #endif							/* PARAMS_H */

@@ -35,12 +35,20 @@ CREATE AGGREGATE oldcnt (
 -- aggregate that only cares about null/nonnull input
 CREATE AGGREGATE newcnt ("any") (
    sfunc = int8inc_any, stype = int8,
+   support = int8inc_support,
    initcond = '0'
 );
 
 COMMENT ON AGGREGATE nosuchagg (*) IS 'should fail';
 COMMENT ON AGGREGATE newcnt (*) IS 'an agg(*) comment';
 COMMENT ON AGGREGATE newcnt ("any") IS 'an agg(any) comment';
+
+-- verify that newcnt's support function enables run-condition optimization
+EXPLAIN (COSTS OFF)
+SELECT * FROM
+  (SELECT newcnt(ten) OVER (RANGE BETWEEN CURRENT ROW AND CURRENT ROW) c
+   FROM tenk1) t
+WHERE c = 1;
 
 -- multi-argument aggregate
 create function sum3(int8,int8,int8) returns int8 as
@@ -72,13 +80,45 @@ create aggregate aggfns(integer,integer,text) (
    initcond = '{}'
 );
 
--- variadic aggregate
+-- check error cases that would require run-time type coercion
+create function least_accum(int8, int8) returns int8 language sql as
+  'select least($1, $2)';
+
+create aggregate least_agg(int4) (
+  stype = int8, sfunc = least_accum
+);  -- fails
+
+drop function least_accum(int8, int8);
+
+create function least_accum(anycompatible, anycompatible)
+returns anycompatible language sql as
+  'select least($1, $2)';
+
+create aggregate least_agg(int4) (
+  stype = int8, sfunc = least_accum
+);  -- fails
+
+create aggregate least_agg(int8) (
+  stype = int8, sfunc = least_accum
+);
+
+drop function least_accum(anycompatible, anycompatible) cascade;
+
+-- variadic aggregates
 create function least_accum(anyelement, variadic anyarray)
 returns anyelement language sql as
   'select least($1, min($2[i])) from generate_subscripts($2,1) g(i)';
 
 create aggregate least_agg(variadic items anyarray) (
   stype = anyelement, sfunc = least_accum
+);
+
+create function cleast_accum(anycompatible, variadic anycompatiblearray)
+returns anycompatible language sql as
+  'select least($1, min($2[i])) from generate_subscripts($2,1) g(i)';
+
+create aggregate cleast_agg(variadic items anycompatiblearray) (
+  stype = anycompatible, sfunc = cleast_accum
 );
 
 -- test ordered-set aggs using built-in support functions
@@ -171,6 +211,71 @@ SELECT aggfnoid, aggtransfn, aggcombinefn, aggtranstype::regtype,
        aggserialfn, aggdeserialfn, aggfinalmodify
 FROM pg_aggregate
 WHERE aggfnoid = 'myavg'::REGPROC;
+
+DROP AGGREGATE myavg (numeric);
+
+-- create or replace aggregate
+CREATE AGGREGATE myavg (numeric)
+(
+	stype = internal,
+	sfunc = numeric_avg_accum,
+	finalfunc = numeric_avg
+);
+
+CREATE OR REPLACE AGGREGATE myavg (numeric)
+(
+	stype = internal,
+	sfunc = numeric_avg_accum,
+	finalfunc = numeric_avg,
+	serialfunc = numeric_avg_serialize,
+	deserialfunc = numeric_avg_deserialize,
+	combinefunc = numeric_avg_combine,
+	finalfunc_modify = shareable  -- just to test a non-default setting
+);
+
+-- Ensure all these functions made it into the catalog again
+SELECT aggfnoid, aggtransfn, aggcombinefn, aggtranstype::regtype,
+       aggserialfn, aggdeserialfn, aggfinalmodify
+FROM pg_aggregate
+WHERE aggfnoid = 'myavg'::REGPROC;
+
+-- can change stype:
+CREATE OR REPLACE AGGREGATE myavg (numeric)
+(
+	stype = numeric,
+	sfunc = numeric_add
+);
+SELECT aggfnoid, aggtransfn, aggcombinefn, aggtranstype::regtype,
+       aggserialfn, aggdeserialfn, aggfinalmodify
+FROM pg_aggregate
+WHERE aggfnoid = 'myavg'::REGPROC;
+
+-- can't change return type:
+CREATE OR REPLACE AGGREGATE myavg (numeric)
+(
+	stype = numeric,
+	sfunc = numeric_add,
+	finalfunc = numeric_out
+);
+
+-- can't change to a different kind:
+CREATE OR REPLACE AGGREGATE myavg (order by numeric)
+(
+	stype = numeric,
+	sfunc = numeric_add
+);
+
+-- can't change plain function to aggregate:
+create function sum4(int8,int8,int8,int8) returns int8 as
+'select $1 + $2 + $3 + $4' language sql strict immutable;
+
+CREATE OR REPLACE AGGREGATE sum3 (int8,int8,int8)
+(
+	stype = int8,
+	sfunc = sum4
+);
+
+drop function sum4(int8,int8,int8,int8);
 
 DROP AGGREGATE myavg (numeric);
 

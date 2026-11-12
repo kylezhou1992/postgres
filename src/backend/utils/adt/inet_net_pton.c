@@ -29,8 +29,7 @@ static const char rcsid[] = "Id: inet_net_pton.c,v 1.4.2.3 2004/03/17 00:40:11 m
 #include <assert.h>
 #include <ctype.h>
 
-#include "utils/builtins.h" /* pgrminclude ignore */	/* needed on some
-														 * platforms */
+#include "utils/builtins.h"		/* needed on some platforms */
 #include "utils/inet.h"
 
 
@@ -42,7 +41,7 @@ static int	inet_cidr_pton_ipv6(const char *src, u_char *dst, size_t size);
 
 /*
  * int
- * inet_net_pton(af, src, dst, size)
+ * pg_inet_net_pton(af, src, dst, size)
  *	convert network number from presentation to network format.
  *	accepts hex octets, hex strings, decimal octets, and /CIDR.
  *	"size" is in bytes and describes "dst".
@@ -59,7 +58,7 @@ static int	inet_cidr_pton_ipv6(const char *src, u_char *dst, size_t size);
  *
  */
 int
-inet_net_pton(int af, const char *src, void *dst, size_t size)
+pg_inet_net_pton(int af, const char *src, void *dst, size_t size)
 {
 	switch (af)
 	{
@@ -116,8 +115,7 @@ inet_cidr_pton_ipv4(const char *src, u_char *dst, size_t size)
 		src++;					/* skip x or X. */
 		while ((ch = *src++) != '\0' && isxdigit((unsigned char) ch))
 		{
-			if (isupper((unsigned char) ch))
-				ch = tolower((unsigned char) ch);
+			ch = pg_ascii_tolower((unsigned char) ch);
 			n = strchr(xdigits, ch) - xdigits;
 			assert(n >= 0 && n <= 15);
 			if (dirty == 0)
@@ -189,7 +187,7 @@ inet_cidr_pton_ipv4(const char *src, u_char *dst, size_t size)
 			goto emsgsize;
 	}
 
-	/* Firey death and destruction unless we prefetched EOS. */
+	/* Fiery death and destruction unless we prefetched EOS. */
 	if (ch != '\0')
 		goto enoent;
 
@@ -241,7 +239,7 @@ emsgsize:
 
 /*
  * int
- * inet_net_pton(af, src, dst, *bits)
+ * inet_net_pton_ipv4(af, src, dst, *bits)
  *	convert network address from presentation to network format.
  *	accepts inet_pton()'s input for this "af" plus trailing "/CIDR".
  *	"dst" is assumed large enough for its "af".  "bits" is set to the
@@ -309,7 +307,7 @@ inet_net_pton_ipv4(const char *src, u_char *dst)
 			goto emsgsize;
 	}
 
-	/* Firey death and destruction unless we prefetched EOS. */
+	/* Fiery death and destruction unless we prefetched EOS. */
 	if (ch != '\0')
 		goto enoent;
 

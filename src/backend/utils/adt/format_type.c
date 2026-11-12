@@ -4,7 +4,7 @@
  *	  Display type names "nicely".
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -20,13 +20,14 @@
 #include "access/htup_details.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
+#include "lib/stringinfo.h"
+#include "mb/pg_wchar.h"
+#include "miscadmin.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/numeric.h"
 #include "utils/syscache.h"
-#include "mb/pg_wchar.h"
-
-#define MAX_INT32_LEN 11
 
 static char *printTypmod(const char *typname, int32 typmod, Oid typmodout);
 
@@ -63,7 +64,7 @@ format_type(PG_FUNCTION_ARGS)
 	Oid			type_oid;
 	int32		typemod;
 	char	   *result;
-	bits16		flags = FORMAT_TYPE_ALLOW_INVALID;
+	uint16		flags = FORMAT_TYPE_ALLOW_INVALID;
 
 	/* Since this function is not strict, we must test for null args */
 	if (PG_ARGISNULL(0))
@@ -98,16 +99,19 @@ format_type(PG_FUNCTION_ARGS)
  * - FORMAT_TYPE_ALLOW_INVALID
  *			if the type OID is invalid or unknown, return ??? or such instead
  *			of failing
+ * - FORMAT_TYPE_INVALID_AS_NULL
+ *			if the type OID is invalid or unknown, return NULL instead of ???
+ *			or such
  * - FORMAT_TYPE_FORCE_QUALIFY
  *			always schema-qualify type names, regardless of search_path
  *
  * Note that TYPEMOD_GIVEN is not interchangeable with "typemod == -1";
  * see the comments above for format_type().
  *
- * Returns a palloc'd string.
+ * Returns a palloc'd string, or NULL.
  */
 char *
-format_type_extended(Oid type_oid, int32 typemod, bits16 flags)
+format_type_extended(Oid type_oid, int32 typemod, uint16 flags)
 {
 	HeapTuple	tuple;
 	Form_pg_type typeform;
@@ -116,13 +120,20 @@ format_type_extended(Oid type_oid, int32 typemod, bits16 flags)
 	char	   *buf;
 	bool		with_typemod;
 
-	if (type_oid == InvalidOid && (flags & FORMAT_TYPE_ALLOW_INVALID) != 0)
-		return pstrdup("-");
+	if (type_oid == InvalidOid)
+	{
+		if ((flags & FORMAT_TYPE_INVALID_AS_NULL) != 0)
+			return NULL;
+		else if ((flags & FORMAT_TYPE_ALLOW_INVALID) != 0)
+			return pstrdup("-");
+	}
 
 	tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type_oid));
 	if (!HeapTupleIsValid(tuple))
 	{
-		if ((flags & FORMAT_TYPE_ALLOW_INVALID) != 0)
+		if ((flags & FORMAT_TYPE_INVALID_AS_NULL) != 0)
+			return NULL;
+		else if ((flags & FORMAT_TYPE_ALLOW_INVALID) != 0)
 			return pstrdup("???");
 		else
 			elog(ERROR, "cache lookup failed for type %u", type_oid);
@@ -130,22 +141,24 @@ format_type_extended(Oid type_oid, int32 typemod, bits16 flags)
 	typeform = (Form_pg_type) GETSTRUCT(tuple);
 
 	/*
-	 * Check if it's a regular (variable length) array type.  Fixed-length
-	 * array types such as "name" shouldn't get deconstructed.  As of Postgres
-	 * 8.1, rather than checking typlen we check the toast property, and don't
+	 * Check if it's a "true" array type.  Pseudo-array types such as "name"
+	 * shouldn't get deconstructed.  Also check the toast property, and don't
 	 * deconstruct "plain storage" array types --- this is because we don't
 	 * want to show oidvector as oid[].
 	 */
 	array_base_type = typeform->typelem;
 
-	if (array_base_type != InvalidOid && typeform->typstorage != 'p')
+	if (IsTrueArrayType(typeform) &&
+		typeform->typstorage != TYPSTORAGE_PLAIN)
 	{
 		/* Switch our attention to the array element type */
 		ReleaseSysCache(tuple);
 		tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(array_base_type));
 		if (!HeapTupleIsValid(tuple))
 		{
-			if ((flags & FORMAT_TYPE_ALLOW_INVALID) != 0)
+			if ((flags & FORMAT_TYPE_INVALID_AS_NULL) != 0)
+				return NULL;
+			else if ((flags & FORMAT_TYPE_ALLOW_INVALID) != 0)
 				return pstrdup("???[]");
 			else
 				elog(ERROR, "cache lookup failed for type %u", type_oid);
@@ -283,6 +296,10 @@ format_type_extended(Oid type_oid, int32 typemod, bits16 flags)
 			else
 				buf = pstrdup("character varying");
 			break;
+
+		case JSONOID:
+			buf = pstrdup("json");
+			break;
 	}
 
 	if (buf == NULL)
@@ -363,7 +380,7 @@ printTypmod(const char *typname, int32 typmod, Oid typmodout)
 	if (typmodout == InvalidOid)
 	{
 		/* Default behavior: just print the integer typmod with parens */
-		res = psprintf("%s(%d)", typname, (int) typmod);
+		res = psprintf("%s(%d)", typname, typmod);
 	}
 	else
 	{
@@ -432,38 +449,30 @@ Datum
 oidvectortypes(PG_FUNCTION_ARGS)
 {
 	oidvector  *oidArray = (oidvector *) PG_GETARG_POINTER(0);
-	char	   *result;
-	int			numargs = oidArray->dim1;
+	StringInfoData result;
+	int			numargs;
 	int			num;
-	size_t		total;
-	size_t		left;
 
-	total = 20 * numargs + 1;
-	result = palloc(total);
-	result[0] = '\0';
-	left = total - 1;
+	/* validate input before fetching dim1 */
+	check_valid_oidvector(oidArray);
+	numargs = oidArray->dim1;
+
+	initStringInfo(&result);
 
 	for (num = 0; num < numargs; num++)
 	{
-		char	   *typename = format_type_extended(oidArray->values[num], -1,
-													FORMAT_TYPE_ALLOW_INVALID);
-		size_t		slen = strlen(typename);
+		char	   *typename;
 
-		if (left < (slen + 2))
-		{
-			total += slen + 2;
-			result = repalloc(result, total);
-			left += slen + 2;
-		}
+		CHECK_FOR_INTERRUPTS();
+
+		typename = format_type_extended(oidArray->values[num], -1,
+										FORMAT_TYPE_ALLOW_INVALID);
 
 		if (num > 0)
-		{
-			strcat(result, ", ");
-			left -= 2;
-		}
-		strcat(result, typename);
-		left -= slen;
+			appendStringInfoString(&result, ", ");
+		appendStringInfoString(&result, typename);
+		pfree(typename);
 	}
 
-	PG_RETURN_TEXT_P(cstring_to_text(result));
+	PG_RETURN_TEXT_P(cstring_to_text_with_len(result.data, result.len));
 }

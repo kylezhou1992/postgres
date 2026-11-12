@@ -19,7 +19,7 @@
  * function in nodeWindowAgg.c for details.
  *
  *
- * Portions Copyright (c) 2000-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2000-2026, PostgreSQL Global Development Group
  *
  * src/include/windowapi.h
  *
@@ -27,6 +27,8 @@
  */
 #ifndef WINDOWAPI_H
 #define WINDOWAPI_H
+
+#include "fmgr.h"
 
 /* values of "seektype" */
 #define WINDOW_SEEK_CURRENT 0
@@ -41,6 +43,10 @@ typedef struct WindowObjectData *WindowObject;
 #define WindowObjectIsValid(winobj) \
 	((winobj) != NULL && IsA(winobj, WindowObjectData))
 
+extern void WinCheckAndInitializeNullTreatment(WindowObject winobj,
+											   bool allowNullTreatment,
+											   FunctionCallInfo fcinfo);
+
 extern void *WinGetPartitionLocalMemory(WindowObject winobj, Size sz);
 
 extern int64 WinGetCurrentPosition(WindowObject winobj);
@@ -51,14 +57,14 @@ extern void WinSetMarkPosition(WindowObject winobj, int64 markpos);
 extern bool WinRowsArePeers(WindowObject winobj, int64 pos1, int64 pos2);
 
 extern Datum WinGetFuncArgInPartition(WindowObject winobj, int argno,
-						 int relpos, int seektype, bool set_mark,
-						 bool *isnull, bool *isout);
+									  int relpos, int seektype, bool set_mark,
+									  bool *isnull, bool *isout);
 
 extern Datum WinGetFuncArgInFrame(WindowObject winobj, int argno,
-					 int relpos, int seektype, bool set_mark,
-					 bool *isnull, bool *isout);
+								  int relpos, int seektype, bool set_mark,
+								  bool *isnull, bool *isout);
 
 extern Datum WinGetFuncArgCurrent(WindowObject winobj, int argno,
-					 bool *isnull);
+								  bool *isnull);
 
 #endif							/* WINDOWAPI_H */

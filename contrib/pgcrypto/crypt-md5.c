@@ -8,8 +8,8 @@
 
 #include "postgres.h"
 
-#include "px.h"
 #include "px-crypt.h"
+#include "px.h"
 
 #define MD5_SIZE 16
 
@@ -33,11 +33,11 @@ _crypt_to64(char *s, unsigned long v, int n)
 char *
 px_crypt_md5(const char *pw, const char *salt, char *passwd, unsigned dstlen)
 {
-	static char *magic = "$1$"; /* This string is magic for this algorithm.
-								 * Having it this way, we can get better later
-								 * on */
-	static char *p;
-	static const char *sp,
+	static const char *magic = "$1$";	/* This string is magic for this
+										 * algorithm. Having it this way, we
+										 * can get better later on */
+	char	   *p;
+	const char *sp,
 			   *ep;
 	unsigned char final[MD5_SIZE];
 	int			sl,
@@ -65,17 +65,23 @@ px_crypt_md5(const char *pw, const char *salt, char *passwd, unsigned dstlen)
 	/* get the length of the true salt */
 	sl = ep - sp;
 
-	/* */
+	/* we need two PX_MD objects */
 	err = px_find_digest("md5", &ctx);
 	if (err)
 		return NULL;
 	err = px_find_digest("md5", &ctx1);
+	if (err)
+	{
+		/* this path is possible under low-memory circumstances */
+		px_md_free(ctx);
+		return NULL;
+	}
 
 	/* The password first, since that is what is most unknown */
 	px_md_update(ctx, (const uint8 *) pw, strlen(pw));
 
 	/* Then our magic string */
-	px_md_update(ctx, (uint8 *) magic, strlen(magic));
+	px_md_update(ctx, (const uint8 *) magic, strlen(magic));
 
 	/* Then the raw salt */
 	px_md_update(ctx, (const uint8 *) sp, sl);
@@ -89,7 +95,7 @@ px_crypt_md5(const char *pw, const char *salt, char *passwd, unsigned dstlen)
 		px_md_update(ctx, final, pl > MD5_SIZE ? MD5_SIZE : pl);
 
 	/* Don't leave anything around in vm they could use. */
-	px_memset(final, 0, sizeof final);
+	explicit_bzero(final, sizeof final);
 
 	/* Then something really weird... */
 	for (i = strlen(pw); i; i >>= 1)
@@ -154,7 +160,7 @@ px_crypt_md5(const char *pw, const char *salt, char *passwd, unsigned dstlen)
 	*p = '\0';
 
 	/* Don't leave anything around in vm they could use. */
-	px_memset(final, 0, sizeof final);
+	explicit_bzero(final, sizeof final);
 
 	px_md_free(ctx1);
 	px_md_free(ctx);

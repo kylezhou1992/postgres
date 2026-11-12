@@ -1,10 +1,10 @@
 /*-------------------------------------------------------------------------
  *
  * makefuncs.c
- *	  creator functions for primitive nodes. The functions here are for
- *	  the most frequently created nodes.
+ *	  creator functions for various nodes. The functions here are for the
+ *	  most frequently created nodes.
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,7 +17,6 @@
 
 #include "catalog/pg_class.h"
 #include "catalog/pg_type.h"
-#include "fmgr.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "utils/lsyscache.h"
@@ -52,7 +51,7 @@ makeSimpleA_Expr(A_Expr_Kind kind, char *name,
 	A_Expr	   *a = makeNode(A_Expr);
 
 	a->kind = kind;
-	a->name = list_make1(makeString((char *) name));
+	a->name = list_make1(makeString(name));
 	a->lexpr = lexpr;
 	a->rexpr = rexpr;
 	a->location = location;
@@ -64,7 +63,7 @@ makeSimpleA_Expr(A_Expr_Kind kind, char *name,
  *	  creates a Var node
  */
 Var *
-makeVar(Index varno,
+makeVar(int varno,
 		AttrNumber varattno,
 		Oid vartype,
 		int32 vartypmod,
@@ -81,13 +80,17 @@ makeVar(Index varno,
 	var->varlevelsup = varlevelsup;
 
 	/*
-	 * Since few if any routines ever create Var nodes with varnoold/varoattno
-	 * different from varno/varattno, we don't provide separate arguments for
-	 * them, but just initialize them to the given varno/varattno. This
-	 * reduces code clutter and chance of error for most callers.
+	 * Only a few callers need to make Var nodes with varreturningtype
+	 * different from VAR_RETURNING_DEFAULT, non-null varnullingrels, or with
+	 * varnosyn/varattnosyn different from varno/varattno.  We don't provide
+	 * separate arguments for them, but just initialize them to sensible
+	 * default values.  This reduces code clutter and chance of error for most
+	 * callers.
 	 */
-	var->varnoold = varno;
-	var->varoattno = varattno;
+	var->varreturningtype = VAR_RETURNING_DEFAULT;
+	var->varnullingrels = NULL;
+	var->varnosyn = (Index) varno;
+	var->varattnosyn = varattno;
 
 	/* Likewise, we just set location to "unknown" here */
 	var->location = -1;
@@ -101,7 +104,7 @@ makeVar(Index varno,
  *		TargetEntry
  */
 Var *
-makeVarFromTargetEntry(Index varno,
+makeVarFromTargetEntry(int varno,
 					   TargetEntry *tle)
 {
 	return makeVar(varno,
@@ -132,7 +135,7 @@ makeVarFromTargetEntry(Index varno,
  */
 Var *
 makeWholeRowVar(RangeTblEntry *rte,
-				Index varno,
+				int varno,
 				Index varlevelsup,
 				bool allowScalar)
 {
@@ -146,8 +149,57 @@ makeWholeRowVar(RangeTblEntry *rte,
 			/* relation: the rowtype is a named composite type */
 			toid = get_rel_type_id(rte->relid);
 			if (!OidIsValid(toid))
-				elog(ERROR, "could not find type OID for relation %u",
-					 rte->relid);
+				ereport(ERROR,
+						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						 errmsg("relation \"%s\" does not have a composite type",
+								get_rel_name(rte->relid))));
+			result = makeVar(varno,
+							 InvalidAttrNumber,
+							 toid,
+							 -1,
+							 InvalidOid,
+							 varlevelsup);
+			break;
+
+		case RTE_SUBQUERY:
+
+			/*
+			 * For a standard subquery, the Var should be of RECORD type.
+			 * However, if we're looking at a subquery that was expanded from
+			 * a view or SRF (only possible during planning), we must use the
+			 * appropriate rowtype, so that the resulting Var has the same
+			 * type that we would have produced from the original RTE.
+			 */
+			if (OidIsValid(rte->relid))
+			{
+				/* Subquery was expanded from a view */
+				toid = get_rel_type_id(rte->relid);
+				if (!OidIsValid(toid))
+					ereport(ERROR,
+							(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+							 errmsg("relation \"%s\" does not have a composite type",
+									get_rel_name(rte->relid))));
+			}
+			else if (rte->functions)
+			{
+				/*
+				 * Subquery was expanded from a set-returning function.  That
+				 * would not have happened if there's more than one function
+				 * or ordinality was requested.  We also needn't worry about
+				 * the allowScalar case, since the planner doesn't use that.
+				 * Otherwise this must match the RTE_FUNCTION code below.
+				 */
+				Assert(!allowScalar);
+				fexpr = ((RangeTblFunction *) linitial(rte->functions))->funcexpr;
+				toid = exprType(fexpr);
+				if (!type_is_rowtype(toid))
+					toid = RECORDOID;
+			}
+			else
+			{
+				/* Normal subquery-in-FROM */
+				toid = RECORDOID;
+			}
 			result = makeVar(varno,
 							 InvalidAttrNumber,
 							 toid,
@@ -212,8 +264,8 @@ makeWholeRowVar(RangeTblEntry *rte,
 		default:
 
 			/*
-			 * RTE is a join, subselect, tablefunc, or VALUES.  We represent
-			 * this as a whole-row Var of RECORD type. (Note that in most
+			 * RTE is a join, tablefunc, VALUES, CTE, etc.  We represent these
+			 * cases as a whole-row Var of RECORD type.  (Note that in most
 			 * cases the Var will be expanded to a RowExpr during planning,
 			 * but that is not our concern here.)
 			 */
@@ -434,6 +486,30 @@ makeRangeVar(char *schemaname, char *relname, int location)
 }
 
 /*
+ * makeNotNullConstraint -
+ *		creates a Constraint node for NOT NULL constraints
+ */
+Constraint *
+makeNotNullConstraint(String *colname)
+{
+	Constraint *notnull;
+
+	notnull = makeNode(Constraint);
+	notnull->contype = CONSTR_NOTNULL;
+	notnull->conname = NULL;
+	notnull->is_no_inherit = false;
+	notnull->deferrable = false;
+	notnull->initdeferred = false;
+	notnull->location = -1;
+	notnull->keys = list_make1(colname);
+	notnull->is_enforced = true;
+	notnull->skip_validation = false;
+	notnull->initially_valid = true;
+
+	return notnull;
+}
+
+/*
  * makeTypeName -
  *	build a TypeName node for an unqualified name.
  *
@@ -496,7 +572,6 @@ makeColumnDef(const char *colname, Oid typeOid, int32 typmod, Oid collOid)
 	n->is_local = true;
 	n->is_not_null = false;
 	n->is_from_type = false;
-	n->is_from_parent = false;
 	n->storage = 0;
 	n->raw_default = NULL;
 	n->cooked_default = NULL;
@@ -533,6 +608,22 @@ makeFuncExpr(Oid funcid, Oid rettype, List *args,
 	funcexpr->location = -1;
 
 	return funcexpr;
+}
+
+/*
+ * makeStringConst -
+ * 	build a A_Const node of type T_String for given string
+ */
+Node *
+makeStringConst(char *str, int location)
+{
+	A_Const    *n = makeNode(A_Const);
+
+	n->val.sval.type = T_String;
+	n->val.sval.sval = str;
+	n->location = location;
+
+	return (Node *) n;
 }
 
 /*
@@ -582,7 +673,7 @@ makeDefElemExtended(char *nameSpace, char *name, Node *arg,
  * supply.  Any non-default parameters have to be inserted by the caller.
  */
 FuncCall *
-makeFuncCall(List *name, List *args, int location)
+makeFuncCall(List *name, List *args, CoercionForm funcformat, int location)
 {
 	FuncCall   *n = makeNode(FuncCall);
 
@@ -590,12 +681,206 @@ makeFuncCall(List *name, List *args, int location)
 	n->args = args;
 	n->agg_order = NIL;
 	n->agg_filter = NULL;
+	n->over = NULL;
 	n->agg_within_group = false;
 	n->agg_star = false;
 	n->agg_distinct = false;
 	n->func_variadic = false;
-	n->over = NULL;
+	n->funcformat = funcformat;
 	n->location = location;
+	return n;
+}
+
+/*
+ * make_opclause
+ *	  Creates an operator clause given its operator info, left operand
+ *	  and right operand (pass NULL to create single-operand clause),
+ *	  and collation info.
+ */
+Expr *
+make_opclause(Oid opno, Oid opresulttype, bool opretset,
+			  Expr *leftop, Expr *rightop,
+			  Oid opcollid, Oid inputcollid)
+{
+	OpExpr	   *expr = makeNode(OpExpr);
+
+	expr->opno = opno;
+	expr->opfuncid = InvalidOid;
+	expr->opresulttype = opresulttype;
+	expr->opretset = opretset;
+	expr->opcollid = opcollid;
+	expr->inputcollid = inputcollid;
+	if (rightop)
+		expr->args = list_make2(leftop, rightop);
+	else
+		expr->args = list_make1(leftop);
+	expr->location = -1;
+	return (Expr *) expr;
+}
+
+/*
+ * make_andclause
+ *
+ * Creates an 'and' clause given a list of its subclauses.
+ */
+Expr *
+make_andclause(List *andclauses)
+{
+	BoolExpr   *expr = makeNode(BoolExpr);
+
+	expr->boolop = AND_EXPR;
+	expr->args = andclauses;
+	expr->location = -1;
+	return (Expr *) expr;
+}
+
+/*
+ * make_orclause
+ *
+ * Creates an 'or' clause given a list of its subclauses.
+ */
+Expr *
+make_orclause(List *orclauses)
+{
+	BoolExpr   *expr = makeNode(BoolExpr);
+
+	expr->boolop = OR_EXPR;
+	expr->args = orclauses;
+	expr->location = -1;
+	return (Expr *) expr;
+}
+
+/*
+ * make_notclause
+ *
+ * Create a 'not' clause given the expression to be negated.
+ */
+Expr *
+make_notclause(Expr *notclause)
+{
+	BoolExpr   *expr = makeNode(BoolExpr);
+
+	expr->boolop = NOT_EXPR;
+	expr->args = list_make1(notclause);
+	expr->location = -1;
+	return (Expr *) expr;
+}
+
+/*
+ * make_and_qual
+ *
+ * Variant of make_andclause for ANDing two qual conditions together.
+ * Qual conditions have the property that a NULL nodetree is interpreted
+ * as 'true'.
+ *
+ * NB: this makes no attempt to preserve AND/OR flatness; so it should not
+ * be used on a qual that has already been run through prepqual.c.
+ */
+Node *
+make_and_qual(Node *qual1, Node *qual2)
+{
+	if (qual1 == NULL)
+		return qual2;
+	if (qual2 == NULL)
+		return qual1;
+	return (Node *) make_andclause(list_make2(qual1, qual2));
+}
+
+/*
+ * The planner and executor usually represent qualification expressions
+ * as lists of boolean expressions with implicit AND semantics.
+ *
+ * These functions convert between an AND-semantics expression list and the
+ * ordinary representation of a boolean expression.
+ *
+ * Note that an empty list is considered equivalent to TRUE.
+ */
+Expr *
+make_ands_explicit(List *andclauses)
+{
+	if (andclauses == NIL)
+		return (Expr *) makeBoolConst(true, false);
+	else if (list_length(andclauses) == 1)
+		return (Expr *) linitial(andclauses);
+	else
+		return make_andclause(andclauses);
+}
+
+List *
+make_ands_implicit(Expr *clause)
+{
+	/*
+	 * NB: because the parser sets the qual field to NULL in a query that has
+	 * no WHERE clause, we must consider a NULL input clause as TRUE, even
+	 * though one might more reasonably think it FALSE.
+	 */
+	if (clause == NULL)
+		return NIL;				/* NULL -> NIL list == TRUE */
+	else if (is_andclause(clause))
+		return ((BoolExpr *) clause)->args;
+	else if (IsA(clause, Const) &&
+			 !((Const *) clause)->constisnull &&
+			 DatumGetBool(((Const *) clause)->constvalue))
+		return NIL;				/* constant TRUE input -> NIL list */
+	else
+		return list_make1(clause);
+}
+
+/*
+ * makeIndexInfo
+ *	  create an IndexInfo node
+ */
+IndexInfo *
+makeIndexInfo(int numattrs, int numkeyattrs, Oid amoid, List *expressions,
+			  List *predicates, bool unique, bool nulls_not_distinct,
+			  bool isready, bool concurrent, bool summarizing,
+			  bool withoutoverlaps)
+{
+	IndexInfo  *n = makeNode(IndexInfo);
+
+	n->ii_NumIndexAttrs = numattrs;
+	n->ii_NumIndexKeyAttrs = numkeyattrs;
+	Assert(n->ii_NumIndexKeyAttrs != 0);
+	Assert(n->ii_NumIndexKeyAttrs <= n->ii_NumIndexAttrs);
+	n->ii_Unique = unique;
+	n->ii_NullsNotDistinct = nulls_not_distinct;
+	n->ii_ReadyForInserts = isready;
+	n->ii_CheckedUnchanged = false;
+	n->ii_IndexUnchanged = false;
+	n->ii_Concurrent = concurrent;
+	n->ii_Summarizing = summarizing;
+	n->ii_WithoutOverlaps = withoutoverlaps;
+
+	/* summarizing indexes cannot contain non-key attributes */
+	Assert(!summarizing || (numkeyattrs == numattrs));
+
+	/* expressions */
+	n->ii_Expressions = expressions;
+	n->ii_ExpressionsState = NIL;
+
+	/* predicates  */
+	n->ii_Predicate = predicates;
+	n->ii_PredicateState = NULL;
+
+	/* exclusion constraints */
+	n->ii_ExclusionOps = NULL;
+	n->ii_ExclusionProcs = NULL;
+	n->ii_ExclusionStrats = NULL;
+
+	/* speculative inserts */
+	n->ii_UniqueOps = NULL;
+	n->ii_UniqueProcs = NULL;
+	n->ii_UniqueStrats = NULL;
+
+	/* initialize index-build state to default */
+	n->ii_BrokenHotChain = false;
+	n->ii_ParallelWorkers = 0;
+
+	/* set up for possible use by index AM */
+	n->ii_Am = amoid;
+	n->ii_AmCache = NULL;
+	n->ii_Context = CurrentMemoryContext;
+
 	return n;
 }
 
@@ -627,4 +912,181 @@ makeVacuumRelation(RangeVar *relation, Oid oid, List *va_cols)
 	v->oid = oid;
 	v->va_cols = va_cols;
 	return v;
+}
+
+/*
+ * makeJsonFormat -
+ *	  creates a JsonFormat node
+ */
+JsonFormat *
+makeJsonFormat(JsonFormatType type, JsonEncoding encoding, int location)
+{
+	JsonFormat *jf = makeNode(JsonFormat);
+
+	jf->format_type = type;
+	jf->encoding = encoding;
+	jf->location = location;
+
+	return jf;
+}
+
+/*
+ * makeJsonValueExpr -
+ *	  creates a JsonValueExpr node
+ */
+JsonValueExpr *
+makeJsonValueExpr(Expr *raw_expr, Expr *formatted_expr,
+				  JsonFormat *format)
+{
+	JsonValueExpr *jve = makeNode(JsonValueExpr);
+
+	jve->raw_expr = raw_expr;
+	jve->formatted_expr = formatted_expr;
+	jve->format = format;
+
+	return jve;
+}
+
+/*
+ * makeJsonBehavior -
+ *	  creates a JsonBehavior node
+ */
+JsonBehavior *
+makeJsonBehavior(JsonBehaviorType btype, Node *expr, int location)
+{
+	JsonBehavior *behavior = makeNode(JsonBehavior);
+
+	behavior->btype = btype;
+	behavior->expr = expr;
+	behavior->location = location;
+
+	return behavior;
+}
+
+/*
+ * makeJsonTableDefaultPlan -
+ *	   creates a JsonTablePlanSpec node to represent a "default" JSON_TABLE plan
+ *	   with given join strategy
+ */
+Node *
+makeJsonTableDefaultPlan(JsonTablePlanJoinType join_type, int location)
+{
+	JsonTablePlanSpec *n = makeNode(JsonTablePlanSpec);
+
+	n->plan_type = JSTP_DEFAULT;
+	n->join_type = join_type;
+	n->location = location;
+
+	return (Node *) n;
+}
+
+/*
+ * makeJsonTableSimplePlan -
+ *	   creates a JsonTablePlanSpec node to represent a "simple" JSON_TABLE plan
+ *	   for given PATH
+ */
+Node *
+makeJsonTableSimplePlan(char *pathname, int location)
+{
+	JsonTablePlanSpec *n = makeNode(JsonTablePlanSpec);
+
+	n->plan_type = JSTP_SIMPLE;
+	n->pathname = pathname;
+	n->location = location;
+
+	return (Node *) n;
+}
+
+/*
+ * makeJsonTableJoinedPlan -
+ *	   creates a JsonTablePlanSpec node to represent join between the given
+ *	   pair of plans
+ */
+Node *
+makeJsonTableJoinedPlan(JsonTablePlanJoinType type, Node *plan1, Node *plan2,
+						int location)
+{
+	JsonTablePlanSpec *n = makeNode(JsonTablePlanSpec);
+
+	n->plan_type = JSTP_JOINED;
+	n->join_type = type;
+	n->plan1 = castNode(JsonTablePlanSpec, plan1);
+	n->plan2 = castNode(JsonTablePlanSpec, plan2);
+	n->location = location;
+
+	return (Node *) n;
+}
+
+/*
+ * makeJsonKeyValue -
+ *	  creates a JsonKeyValue node
+ */
+Node *
+makeJsonKeyValue(Node *key, Node *value)
+{
+	JsonKeyValue *n = makeNode(JsonKeyValue);
+
+	n->key = (Expr *) key;
+	n->value = castNode(JsonValueExpr, value);
+
+	return (Node *) n;
+}
+
+/*
+ * makeJsonIsPredicate -
+ *	  creates a JsonIsPredicate node
+ */
+Node *
+makeJsonIsPredicate(Node *expr, JsonFormat *format, JsonValueType item_type,
+					bool unique_keys, Oid exprBaseType, int location)
+{
+	JsonIsPredicate *n = makeNode(JsonIsPredicate);
+
+	Assert(expr != NULL);
+
+	n->expr = expr;
+	n->format = format;
+	n->item_type = item_type;
+	n->unique_keys = unique_keys;
+	n->exprBaseType = exprBaseType;
+	n->location = location;
+
+	return (Node *) n;
+}
+
+/*
+ * makeJsonTablePathSpec -
+ *		Make JsonTablePathSpec node from given path string and name (if any)
+ */
+JsonTablePathSpec *
+makeJsonTablePathSpec(char *string, char *name, int string_location,
+					  int name_location)
+{
+	JsonTablePathSpec *pathspec = makeNode(JsonTablePathSpec);
+
+	Assert(string != NULL);
+	pathspec->string = makeStringConst(string, string_location);
+	if (name != NULL)
+		pathspec->name = pstrdup(name);
+
+	pathspec->name_location = name_location;
+	pathspec->location = string_location;
+
+	return pathspec;
+}
+
+/*
+ * makeJsonTablePath -
+ *		Make JsonTablePath node for given path string and name
+ */
+JsonTablePath *
+makeJsonTablePath(Const *pathvalue, char *pathname)
+{
+	JsonTablePath *path = makeNode(JsonTablePath);
+
+	Assert(IsA(pathvalue, Const));
+	path->value = pathvalue;
+	path->name = pathname;
+
+	return path;
 }

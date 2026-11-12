@@ -5,8 +5,8 @@
  * allow a manage nested conditionals.
  *
  * It is used by:
- * - "psql" interpretor for handling \if ... \endif
- * - "pgbench" interpretor for handling \if ... \endif
+ * - "psql" interpreter for handling \if ... \endif
+ * - "pgbench" interpreter for handling \if ... \endif
  * - "pgbench" syntax checker to test for proper nesting
  *
  * The stack holds the state of enclosing conditionals (are we in
@@ -14,7 +14,7 @@
  * a true branch?) so that the interpreter knows whether to execute
  * code and whether to evaluate conditions.
  *
- * Copyright (c) 2000-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  *
  * src/include/fe_utils/conditional.h
  *
@@ -39,7 +39,7 @@ typedef enum ifState
 								 * false parent branch */
 	IFSTATE_ELSE_TRUE,			/* currently in an \else that is true and all
 								 * parent branches (if any) are true */
-	IFSTATE_ELSE_FALSE			/* currently in an \else that is false or
+	IFSTATE_ELSE_FALSE,			/* currently in an \else that is false or
 								 * ignored */
 } ifState;
 
@@ -49,29 +49,30 @@ typedef enum ifState
  * query_len is used to determine what accumulated text to throw away at the
  * end of an inactive branch.  (We could, perhaps, teach the lexer to not add
  * stuff to the query buffer in the first place when inside an inactive branch;
- * but that would be very invasive.)  We also need to save and restore the
- * lexer's parenthesis nesting depth when throwing away text.  (We don't need
- * to save and restore any of its other state, such as comment nesting depth,
- * because a backslash command could never appear inside a comment or SQL
- * literal.)
+ * but that would be very invasive.)  We also need to save and restore some
+ * lexer state, such as parenthesis nesting depth, when throwing away text.
  */
+typedef struct PsqlScanStateSave PsqlScanStateSave; /* opaque outside lexer */
+
 typedef struct IfStackElem
 {
 	ifState		if_state;		/* current state, see enum above */
 	int			query_len;		/* length of query_buf at last branch start */
-	int			paren_depth;	/* parenthesis depth at last branch start */
+	PsqlScanStateSave *lex_state;	/* lexer state at last branch start */
 	struct IfStackElem *next;	/* next surrounding \if, if any */
 } IfStackElem;
 
 typedef struct ConditionalStackData
 {
 	IfStackElem *head;
-}			ConditionalStackData;
+} ConditionalStackData;
 
 typedef struct ConditionalStackData *ConditionalStack;
 
 
 extern ConditionalStack conditional_stack_create(void);
+
+extern void conditional_stack_reset(ConditionalStack cstack);
 
 extern void conditional_stack_destroy(ConditionalStack cstack);
 
@@ -93,8 +94,9 @@ extern void conditional_stack_set_query_len(ConditionalStack cstack, int len);
 
 extern int	conditional_stack_get_query_len(ConditionalStack cstack);
 
-extern void conditional_stack_set_paren_depth(ConditionalStack cstack, int depth);
+extern void conditional_stack_set_lex_state(ConditionalStack cstack,
+											PsqlScanStateSave *lex_state);
 
-extern int	conditional_stack_get_paren_depth(ConditionalStack cstack);
+extern PsqlScanStateSave *conditional_stack_get_lex_state(ConditionalStack cstack);
 
 #endif							/* CONDITIONAL_H */

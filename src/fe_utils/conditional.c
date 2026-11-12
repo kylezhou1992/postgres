@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  * A stack of automaton states to handle nested conditionals.
  *
- * Copyright (c) 2000-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  *
  * src/fe_utils/conditional.c
  *
@@ -17,10 +17,23 @@
 ConditionalStack
 conditional_stack_create(void)
 {
-	ConditionalStack cstack = pg_malloc(sizeof(ConditionalStackData));
+	ConditionalStack cstack = pg_malloc_object(ConditionalStackData);
 
 	cstack->head = NULL;
 	return cstack;
+}
+
+/*
+ * Destroy all the elements from the stack. The stack itself is not freed.
+ */
+void
+conditional_stack_reset(ConditionalStack cstack)
+{
+	if (!cstack)
+		return;					/* nothing to do here */
+
+	while (conditional_stack_pop(cstack))
+		continue;
 }
 
 /*
@@ -29,8 +42,7 @@ conditional_stack_create(void)
 void
 conditional_stack_destroy(ConditionalStack cstack)
 {
-	while (conditional_stack_pop(cstack))
-		continue;
+	conditional_stack_reset(cstack);
 	free(cstack);
 }
 
@@ -40,11 +52,11 @@ conditional_stack_destroy(ConditionalStack cstack)
 void
 conditional_stack_push(ConditionalStack cstack, ifState new_state)
 {
-	IfStackElem *p = (IfStackElem *) pg_malloc(sizeof(IfStackElem));
+	IfStackElem *p = pg_malloc_object(IfStackElem);
 
 	p->if_state = new_state;
 	p->query_len = -1;
-	p->paren_depth = -1;
+	p->lex_state = NULL;
 	p->next = cstack->head;
 	cstack->head = p;
 }
@@ -61,6 +73,8 @@ conditional_stack_pop(ConditionalStack cstack)
 	if (!p)
 		return false;
 	cstack->head = cstack->head->next;
+	if (p->lex_state)
+		free(p->lex_state);
 	free(p);
 	return true;
 }
@@ -155,23 +169,29 @@ conditional_stack_get_query_len(ConditionalStack cstack)
 }
 
 /*
- * Save current parenthesis nesting depth in topmost stack entry.
+ * Save current lexer state in topmost stack entry.
+ *
+ * The lexer state is presumed to be a single pg_malloc'd chunk.
+ * It will be freed automatically when the stack entry is popped.
  */
 void
-conditional_stack_set_paren_depth(ConditionalStack cstack, int depth)
+conditional_stack_set_lex_state(ConditionalStack cstack,
+								PsqlScanStateSave *lex_state)
 {
 	Assert(!conditional_stack_empty(cstack));
-	cstack->head->paren_depth = depth;
+	if (cstack->head->lex_state)	/* free old state, if any */
+		free(cstack->head->lex_state);
+	cstack->head->lex_state = lex_state;
 }
 
 /*
- * Fetch last-recorded parenthesis nesting depth from topmost stack entry.
- * Will return -1 if no stack or it was never saved.
+ * Fetch last-recorded lexer state from topmost stack entry.
+ * Will return NULL if no stack or it was never saved.
  */
-int
-conditional_stack_get_paren_depth(ConditionalStack cstack)
+PsqlScanStateSave *
+conditional_stack_get_lex_state(ConditionalStack cstack)
 {
 	if (conditional_stack_empty(cstack))
-		return -1;
-	return cstack->head->paren_depth;
+		return NULL;
+	return cstack->head->lex_state;
 }

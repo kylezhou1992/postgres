@@ -99,6 +99,7 @@ The remaining code is authored by Andrew Dunstan <amdunstan@ncshp.org> and
 #include "postgres.h"
 
 #include "utils/builtins.h"
+#include "utils/formatting.h"
 
 /* turn off assertions for embedded function */
 #define NDEBUG
@@ -117,7 +118,7 @@ The remaining code is authored by Andrew Dunstan <amdunstan@ncshp.org> and
 #include <ctype.h>
 
 /* prototype for the main function we got from the perl module */
-static void DoubleMetaphone(char *, char **);
+static void DoubleMetaphone(const char *str, Oid collid, char **codes);
 
 #ifndef DMETAPHONE_MAIN
 
@@ -142,7 +143,7 @@ dmetaphone(PG_FUNCTION_ARGS)
 	arg = PG_GETARG_TEXT_PP(0);
 	aptr = text_to_cstring(arg);
 
-	DoubleMetaphone(aptr, codes);
+	DoubleMetaphone(aptr, PG_GET_COLLATION(), codes);
 	code = codes[0];
 	if (!code)
 		code = "";
@@ -171,7 +172,7 @@ dmetaphone_alt(PG_FUNCTION_ARGS)
 	arg = PG_GETARG_TEXT_PP(0);
 	aptr = text_to_cstring(arg);
 
-	DoubleMetaphone(aptr, codes);
+	DoubleMetaphone(aptr, PG_GET_COLLATION(), codes);
 	code = codes[1];
 	if (!code)
 		code = "";
@@ -191,7 +192,7 @@ dmetaphone_alt(PG_FUNCTION_ARGS)
 					  (v = (t*)repalloc((v),((n)*sizeof(t))))
 
 /*
- * Don't do pfree - it seems to cause a segv sometimes - which might have just
+ * Don't do pfree - it seems to cause a SIGSEGV sometimes - which might have just
  * been caused by reloading the module in development.
  * So we rely on context cleanup - Tom Lane says pfree shouldn't be necessary
  * in a case like this.
@@ -278,13 +279,17 @@ IncreaseBuffer(metastring *s, int chars_needed)
 }
 
 
-static void
-MakeUpper(metastring *s)
+static metastring *
+MakeUpper(metastring *s, Oid collid)
 {
-	char	   *i;
+	char	   *newstr;
+	metastring *newms;
 
-	for (i = s->str; *i; i++)
-		*i = toupper((unsigned char) *i);
+	newstr = str_toupper(s->str, s->length, collid);
+	newms = NewMetaString(newstr);
+	DestroyMetaString(s);
+
+	return newms;
 }
 
 
@@ -308,13 +313,13 @@ IsVowel(metastring *s, int pos)
 static int
 SlavoGermanic(metastring *s)
 {
-	if ((char *) strstr(s->str, "W"))
+	if (strstr(s->str, "W"))
 		return 1;
-	else if ((char *) strstr(s->str, "K"))
+	else if (strstr(s->str, "K"))
 		return 1;
-	else if ((char *) strstr(s->str, "CZ"))
+	else if (strstr(s->str, "CZ"))
 		return 1;
-	else if ((char *) strstr(s->str, "WITZ"))
+	else if (strstr(s->str, "WITZ"))
 		return 1;
 	else
 		return 0;
@@ -327,7 +332,7 @@ GetAt(metastring *s, int pos)
 	if ((pos < 0) || (pos >= s->length))
 		return '\0';
 
-	return ((char) *(s->str + pos));
+	return *(s->str + pos);
 }
 
 
@@ -342,10 +347,10 @@ SetAt(metastring *s, int pos, char c)
 
 
 /*
-   Caveats: the START value is 0 based
-*/
+ * Caveats: the START value is 0 based
+ */
 static int
-StringAt(metastring *s, int start, int length,...)
+StringAt(metastring *s, int start, int length, ...)
 {
 	char	   *test;
 	char	   *pos;
@@ -392,7 +397,7 @@ MetaphAdd(metastring *s, const char *new_str)
 
 
 static void
-DoubleMetaphone(char *str, char **codes)
+DoubleMetaphone(const char *str, Oid collid, char **codes)
 {
 	int			length;
 	metastring *original;
@@ -414,7 +419,7 @@ DoubleMetaphone(char *str, char **codes)
 	primary->free_string_on_destroy = 0;
 	secondary->free_string_on_destroy = 0;
 
-	MakeUpper(original);
+	original = MakeUpper(original, collid);
 
 	/* skip these when at start of word */
 	if (StringAt(original, 0, 2, "GN", "KN", "PN", "WR", "PS", ""))
@@ -531,8 +536,7 @@ DoubleMetaphone(char *str, char **codes)
 					}
 
 					/* germanic, greek, or otherwise 'ch' for 'kh' sound */
-					if (
-						(StringAt(original, 0, 4, "VAN ", "VON ", "")
+					if ((StringAt(original, 0, 4, "VAN ", "VON ", "")
 						 || StringAt(original, 0, 3, "SCH", ""))
 					/* 'architect but not 'arch', 'orchestra', 'orchid' */
 						|| StringAt(original, (current - 2), 6, "ORCHES",
@@ -606,8 +610,7 @@ DoubleMetaphone(char *str, char **codes)
 						&& !StringAt(original, (current + 2), 2, "HU", ""))
 					{
 						/* 'accident', 'accede' 'succeed' */
-						if (
-							((current == 1)
+						if (((current == 1)
 							 && (GetAt(original, current - 1) == 'A'))
 							|| StringAt(original, (current - 1), 5, "UCCEE",
 										"UCCES", ""))
@@ -754,8 +757,7 @@ DoubleMetaphone(char *str, char **codes)
 					 * Parker's rule (with some further refinements) - e.g.,
 					 * 'hugh'
 					 */
-					if (
-						((current > 1)
+					if (((current > 1)
 						 && StringAt(original, (current - 2), 1,
 									 "B", "H", "D", ""))
 					/* e.g., 'bough' */
@@ -806,11 +808,10 @@ DoubleMetaphone(char *str, char **codes)
 						MetaphAdd(primary, "KN");
 						MetaphAdd(secondary, "N");
 					}
-					else
-						/* not e.g. 'cagney' */
-						if (!StringAt(original, (current + 2), 2, "EY", "")
-							&& (GetAt(original, current + 1) != 'Y')
-							&& !SlavoGermanic(original))
+					/* not e.g. 'cagney' */
+					else if (!StringAt(original, (current + 2), 2, "EY", "")
+							 && (GetAt(original, current + 1) != 'Y')
+							 && !SlavoGermanic(original))
 					{
 						MetaphAdd(primary, "N");
 						MetaphAdd(secondary, "KN");
@@ -848,14 +849,12 @@ DoubleMetaphone(char *str, char **codes)
 				}
 
 				/* -ger-,  -gy- */
-				if (
-					(StringAt(original, (current + 1), 2, "ER", "")
+				if ((StringAt(original, (current + 1), 2, "ER", "")
 					 || (GetAt(original, current + 1) == 'Y'))
 					&& !StringAt(original, 0, 6,
 								 "DANGER", "RANGER", "MANGER", "")
 					&& !StringAt(original, (current - 1), 1, "E", "I", "")
-					&& !StringAt(original, (current - 1), 3, "RGY", "OGY",
-								 ""))
+					&& !StringAt(original, (current - 1), 3, "RGY", "OGY", ""))
 				{
 					MetaphAdd(primary, "K");
 					MetaphAdd(secondary, "J");
@@ -869,8 +868,7 @@ DoubleMetaphone(char *str, char **codes)
 								"AGGI", "OGGI", ""))
 				{
 					/* obvious germanic */
-					if (
-						(StringAt(original, 0, 4, "VAN ", "VON ", "")
+					if ((StringAt(original, 0, 4, "VAN ", "VON ", "")
 						 || StringAt(original, 0, 3, "SCH", ""))
 						|| StringAt(original, (current + 1), 2, "ET", ""))
 					{
@@ -1436,7 +1434,7 @@ main(int argc, char **argv)
 
 	if (argc > 1)
 	{
-		DoubleMetaphone(argv[1], codes);
+		DoubleMetaphone(argv[1], DEFAULT_COLLATION_OID, codes);
 		printf("%s|%s\n", codes[0], codes[1]);
 	}
 }

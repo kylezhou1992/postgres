@@ -53,7 +53,7 @@ gin_extract_hstore(PG_FUNCTION_ARGS)
 
 	*nentries = 2 * count;
 	if (count)
-		entries = (Datum *) palloc(sizeof(Datum) * 2 * count);
+		entries = palloc_array(Datum, 2 * count);
 
 	for (i = 0; i < count; ++i)
 	{
@@ -103,7 +103,7 @@ gin_extract_hstore_query(PG_FUNCTION_ARGS)
 		text	   *item;
 
 		*nentries = 1;
-		entries = (Datum *) palloc(sizeof(Datum));
+		entries = palloc_object(Datum);
 		item = makeitem(VARDATA_ANY(query), VARSIZE_ANY_EXHDR(query), KEYFLAG);
 		entries[0] = PointerGetDatum(item);
 	}
@@ -118,18 +118,16 @@ gin_extract_hstore_query(PG_FUNCTION_ARGS)
 					j;
 		text	   *item;
 
-		deconstruct_array(query,
-						  TEXTOID, -1, false, 'i',
-						  &key_datums, &key_nulls, &key_count);
+		deconstruct_array_builtin(query, TEXTOID, &key_datums, &key_nulls, &key_count);
 
-		entries = (Datum *) palloc(sizeof(Datum) * key_count);
+		entries = palloc_array(Datum, key_count);
 
 		for (i = 0, j = 0; i < key_count; ++i)
 		{
 			/* Nulls in the array are ignored, cf hstoreArrayToPairs */
 			if (key_nulls[i])
 				continue;
-			item = makeitem(VARDATA(key_datums[i]), VARSIZE(key_datums[i]) - VARHDRSZ, KEYFLAG);
+			item = makeitem(VARDATA(DatumGetPointer(key_datums[i])), VARSIZE(DatumGetPointer(key_datums[i])) - VARHDRSZ, KEYFLAG);
 			entries[j++] = PointerGetDatum(item);
 		}
 
@@ -154,11 +152,13 @@ gin_consistent_hstore(PG_FUNCTION_ARGS)
 {
 	bool	   *check = (bool *) PG_GETARG_POINTER(0);
 	StrategyNumber strategy = PG_GETARG_UINT16(1);
-
-	/* HStore	   *query = PG_GETARG_HSTORE_P(2); */
+#ifdef NOT_USED
+	HStore	   *query = PG_GETARG_HSTORE_P(2);
+#endif
 	int32		nkeys = PG_GETARG_INT32(3);
-
-	/* Pointer	   *extra_data = (Pointer *) PG_GETARG_POINTER(4); */
+#ifdef NOT_USED
+	Pointer    *extra_data = (Pointer *) PG_GETARG_POINTER(4);
+#endif
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(5);
 	bool		res = true;
 	int32		i;

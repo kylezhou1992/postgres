@@ -9,7 +9,7 @@
 
 #include "postgres_fe.h"
 
-#include "extern.h"
+#include "preproc_extern.h"
 
 /*
  * assignment handling function (descriptor)
@@ -18,13 +18,12 @@
 static struct assignment *assignments;
 
 void
-push_assignment(char *var, enum ECPGdtype value)
+push_assignment(const char *var, enum ECPGdtype value)
 {
 	struct assignment *new = (struct assignment *) mm_alloc(sizeof(struct assignment));
 
 	new->next = assignments;
-	new->variable = mm_alloc(strlen(var) + 1);
-	strcpy(new->variable, var);
+	new->variable = mm_strdup(var);
 	new->value = value;
 	assignments = new;
 }
@@ -73,7 +72,7 @@ ECPGnumeric_lvalue(char *name)
 static struct descriptor *descriptors;
 
 void
-add_descriptor(char *name, char *connection)
+add_descriptor(const char *name, const char *connection)
 {
 	struct descriptor *new;
 
@@ -83,20 +82,16 @@ add_descriptor(char *name, char *connection)
 	new = (struct descriptor *) mm_alloc(sizeof(struct descriptor));
 
 	new->next = descriptors;
-	new->name = mm_alloc(strlen(name) + 1);
-	strcpy(new->name, name);
+	new->name = mm_strdup(name);
 	if (connection)
-	{
-		new->connection = mm_alloc(strlen(connection) + 1);
-		strcpy(new->connection, connection);
-	}
+		new->connection = mm_strdup(connection);
 	else
-		new->connection = connection;
+		new->connection = NULL;
 	descriptors = new;
 }
 
 void
-drop_descriptor(char *name, char *connection)
+drop_descriptor(const char *name, const char *connection)
 {
 	struct descriptor *i;
 	struct descriptor **lastptr = &descriptors;
@@ -113,20 +108,21 @@ drop_descriptor(char *name, char *connection)
 					&& strcmp(connection, i->connection) == 0))
 			{
 				*lastptr = i->next;
-				if (i->connection)
-					free(i->connection);
+				free(i->connection);
 				free(i->name);
 				free(i);
 				return;
 			}
 		}
 	}
-	mmerror(PARSE_ERROR, ET_WARNING, "descriptor \"%s\" does not exist", name);
+	if (connection)
+		mmerror(PARSE_ERROR, ET_WARNING, "descriptor %s bound to connection %s does not exist", name, connection);
+	else
+		mmerror(PARSE_ERROR, ET_WARNING, "descriptor %s bound to the default connection does not exist", name);
 }
 
-struct descriptor
-		   *
-lookup_descriptor(char *name, char *connection)
+struct descriptor *
+lookup_descriptor(const char *name, const char *connection)
 {
 	struct descriptor *i;
 
@@ -141,14 +137,23 @@ lookup_descriptor(char *name, char *connection)
 				|| (connection && i->connection
 					&& strcmp(connection, i->connection) == 0))
 				return i;
+			if (connection && !i->connection)
+			{
+				/* overwrite descriptor's connection */
+				i->connection = mm_strdup(connection);
+				return i;
+			}
 		}
 	}
-	mmerror(PARSE_ERROR, ET_WARNING, "descriptor \"%s\" does not exist", name);
+	if (connection)
+		mmerror(PARSE_ERROR, ET_WARNING, "descriptor %s bound to connection %s does not exist", name, connection);
+	else
+		mmerror(PARSE_ERROR, ET_WARNING, "descriptor %s bound to the default connection does not exist", name);
 	return NULL;
 }
 
 void
-output_get_descr_header(char *desc_name)
+output_get_descr_header(const char *desc_name)
 {
 	struct assignment *results;
 
@@ -167,7 +172,7 @@ output_get_descr_header(char *desc_name)
 }
 
 void
-output_get_descr(char *desc_name, char *index)
+output_get_descr(const char *desc_name, const char *index)
 {
 	struct assignment *results;
 
@@ -200,7 +205,7 @@ output_get_descr(char *desc_name, char *index)
 }
 
 void
-output_set_descr_header(char *desc_name)
+output_set_descr_header(const char *desc_name)
 {
 	struct assignment *results;
 
@@ -261,7 +266,7 @@ descriptor_item_name(enum ECPGdtype itemcode)
 }
 
 void
-output_set_descr(char *desc_name, char *index)
+output_set_descr(const char *desc_name, const char *index)
 {
 	struct assignment *results;
 
@@ -315,11 +320,12 @@ output_set_descr(char *desc_name, char *index)
 	whenever_action(2 | 1);
 }
 
-/* I consider dynamic allocation overkill since at most two descriptor
-   variables are possible per statement. (input and output descriptor)
-   And descriptors are no normal variables, so they don't belong into
-   the variable list.
-*/
+/*
+ * I consider dynamic allocation overkill since at most two descriptor
+ * variables are possible per statement. (input and output descriptor)
+ * And descriptors are no normal variables, so they don't belong into
+ * the variable list.
+ */
 
 #define MAX_DESCRIPTOR_NAMELEN 128
 struct variable *
@@ -339,11 +345,17 @@ descriptor_variable(const char *name, int input)
 struct variable *
 sqlda_variable(const char *name)
 {
-	struct variable *p = (struct variable *) mm_alloc(sizeof(struct variable));
+	/*
+	 * Presently, sqlda variables are only needed for the duration of the
+	 * current statement.  Rather than add infrastructure to manage them,
+	 * let's just loc_alloc them.
+	 */
+	struct variable *p = (struct variable *) loc_alloc(sizeof(struct variable));
 
-	p->name = mm_strdup(name);
-	p->type = (struct ECPGtype *) mm_alloc(sizeof(struct ECPGtype));
+	p->name = loc_strdup(name);
+	p->type = (struct ECPGtype *) loc_alloc(sizeof(struct ECPGtype));
 	p->type->type = ECPGt_sqlda;
+	p->type->type_name = NULL;
 	p->type->size = NULL;
 	p->type->struct_sizeof = NULL;
 	p->type->u.element = NULL;

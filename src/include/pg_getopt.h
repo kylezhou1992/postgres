@@ -1,20 +1,30 @@
 /*
+ * Postgres files that use getopt(3) always include this file.
+ * We must cope with three different scenarios:
+ * 1. We're using the platform's getopt(), and we should just import the
+ *    appropriate declarations.
+ * 2. The platform lacks getopt(), and we must declare everything.
+ * 3. The platform has getopt(), but we're not using it because we don't
+ *    like its behavior.  The declarations we make here must be compatible
+ *    with both the platform's getopt() and our src/port/getopt.c.
+ *
  * Portions Copyright (c) 1987, 1993, 1994
  * The Regents of the University of California.  All rights reserved.
  *
- * Portions Copyright (c) 2003-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2003-2026, PostgreSQL Global Development Group
  *
  * src/include/pg_getopt.h
  */
+/* IWYU pragma: always_keep */
 #ifndef PG_GETOPT_H
 #define PG_GETOPT_H
 
 /* POSIX says getopt() is provided by unistd.h */
-#include <unistd.h>
+#include <unistd.h>				/* IWYU pragma: export */
 
 /* rely on the system's getopt.h if present */
 #ifdef HAVE_GETOPT_H
-#include <getopt.h>
+#include <getopt.h>				/* IWYU pragma: export */
 #endif
 
 /*
@@ -24,10 +34,10 @@
  */
 #ifndef HAVE_GETOPT_H
 
-extern char *optarg;
-extern int	optind;
-extern int	opterr;
-extern int	optopt;
+extern PGDLLIMPORT char *optarg;
+extern PGDLLIMPORT int optind;
+extern PGDLLIMPORT int opterr;
+extern PGDLLIMPORT int optopt;
 
 #endif							/* HAVE_GETOPT_H */
 
@@ -36,9 +46,10 @@ extern int	optopt;
  * Cygwin, however, doesn't like this either.
  */
 #if defined(HAVE_INT_OPTRESET) && !defined(__CYGWIN__)
-extern int	optreset;
+extern PGDLLIMPORT int optreset;
 #endif
 
+/* Provide getopt() declaration if the platform doesn't have it */
 #ifndef HAVE_GETOPT
 extern int	getopt(int nargc, char *const *nargv, const char *ostr);
 #endif

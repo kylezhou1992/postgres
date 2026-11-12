@@ -1,18 +1,20 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  *
  * src/bin/psql/crosstabview.c
  */
 #include "postgres_fe.h"
 
+#include "catalog/pg_type_d.h"
 #include "common.h"
+#include "common/int.h"
+#include "common/logging.h"
 #include "crosstabview.h"
 #include "pqexpbuffer.h"
 #include "psqlscanslash.h"
 #include "settings.h"
-
 
 /*
  * Value/position from the resultset that goes into the horizontal or vertical
@@ -77,14 +79,16 @@ typedef struct _avl_tree
 } avl_tree;
 
 
-static bool printCrosstab(const PGresult *results,
-			  int num_columns, pivot_field *piv_columns, int field_for_columns,
-			  int num_rows, pivot_field *piv_rows, int field_for_rows,
-			  int field_for_data);
+static bool printCrosstab(const PGresult *result,
+						  int num_columns, pivot_field *piv_columns, int field_for_columns,
+						  int num_rows, pivot_field *piv_rows, int field_for_rows,
+						  int field_for_data);
+static char *displayValue(char *value, Oid ftype, char *default_null);
+
 static void avlInit(avl_tree *tree);
 static void avlMergeValue(avl_tree *tree, char *name, char *sort_value);
-static int avlCollectFields(avl_tree *tree, avl_node *node,
-				 pivot_field *fields, int idx);
+static int	avlCollectFields(avl_tree *tree, avl_node *node,
+							 pivot_field *fields, int idx);
 static void avlFree(avl_tree *tree, avl_node *node);
 static void rankSort(int num_columns, pivot_field *piv_columns);
 static int	indexOfColumn(char *arg, const PGresult *res);
@@ -100,7 +104,7 @@ static int	rankCompare(const void *a, const void *b);
  * then call printCrosstab() for the actual output.
  */
 bool
-PrintResultsInCrosstab(const PGresult *res)
+PrintResultInCrosstab(const PGresult *res)
 {
 	bool		retval = false;
 	avl_tree	piv_columns;
@@ -120,13 +124,13 @@ PrintResultsInCrosstab(const PGresult *res)
 
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
-		psql_error("\\crosstabview: statement did not return a result set\n");
+		pg_log_error("\\crosstabview: statement did not return a result set");
 		goto error_return;
 	}
 
 	if (PQnfields(res) < 3)
 	{
-		psql_error("\\crosstabview: query must return at least three columns\n");
+		pg_log_error("\\crosstabview: query must return at least three columns");
 		goto error_return;
 	}
 
@@ -153,7 +157,7 @@ PrintResultsInCrosstab(const PGresult *res)
 	/* Insist that header columns be distinct */
 	if (field_for_columns == field_for_rows)
 	{
-		psql_error("\\crosstabview: vertical and horizontal headers must be different columns\n");
+		pg_log_error("\\crosstabview: vertical and horizontal headers must be different columns");
 		goto error_return;
 	}
 
@@ -169,7 +173,7 @@ PrintResultsInCrosstab(const PGresult *res)
 		 */
 		if (PQnfields(res) != 3)
 		{
-			psql_error("\\crosstabview: data column must be specified when query returns more than three columns\n");
+			pg_log_error("\\crosstabview: data column must be specified when query returns more than three columns");
 			goto error_return;
 		}
 
@@ -225,8 +229,8 @@ PrintResultsInCrosstab(const PGresult *res)
 
 		if (piv_columns.count > CROSSTABVIEW_MAX_COLUMNS)
 		{
-			psql_error("\\crosstabview: maximum number of columns (%d) exceeded\n",
-					   CROSSTABVIEW_MAX_COLUMNS);
+			pg_log_error("\\crosstabview: maximum number of columns (%d) exceeded",
+						 CROSSTABVIEW_MAX_COLUMNS);
 			goto error_return;
 		}
 
@@ -244,11 +248,9 @@ PrintResultsInCrosstab(const PGresult *res)
 	num_columns = piv_columns.count;
 	num_rows = piv_rows.count;
 
-	array_columns = (pivot_field *)
-		pg_malloc(sizeof(pivot_field) * num_columns);
+	array_columns = pg_malloc_array(pivot_field, num_columns);
 
-	array_rows = (pivot_field *)
-		pg_malloc(sizeof(pivot_field) * num_rows);
+	array_rows = pg_malloc_array(pivot_field, num_rows);
 
 	avlCollectFields(&piv_columns, piv_columns.root, array_columns, 0);
 	avlCollectFields(&piv_rows, piv_rows.root, array_rows, 0);
@@ -261,7 +263,7 @@ PrintResultsInCrosstab(const PGresult *res)
 		rankSort(num_columns, array_columns);
 
 	/*
-	 * Fourth part: print the crosstab'ed results.
+	 * Fourth part: print the crosstab'ed result.
 	 */
 	retval = printCrosstab(res,
 						   num_columns, array_columns, field_for_columns,
@@ -282,17 +284,19 @@ error_return:
  * if successful, false otherwise.
  */
 static bool
-printCrosstab(const PGresult *results,
+printCrosstab(const PGresult *result,
 			  int num_columns, pivot_field *piv_columns, int field_for_columns,
 			  int num_rows, pivot_field *piv_rows, int field_for_rows,
 			  int field_for_data)
 {
 	printQueryOpt popt = pset.popt;
 	printTableContent cont;
-	int			i,
-				rn;
+	int			rn;
 	char		col_align;
 	int		   *horiz_map;
+	Oid			col_ftype = PQftype(result, field_for_columns);
+	Oid			row_ftype = PQftype(result, field_for_rows);
+	Oid			data_ftype = PQftype(result, field_for_data);
 	bool		retval = false;
 
 	printTableInit(&cont, &popt.topt, popt.title, num_columns + 1, num_rows);
@@ -301,52 +305,48 @@ printCrosstab(const PGresult *results,
 
 	/* The name of the first column is kept unchanged by the pivoting */
 	printTableAddHeader(&cont,
-						PQfname(results, field_for_rows),
+						PQfname(result, field_for_rows),
 						false,
-						column_type_alignment(PQftype(results,
-													  field_for_rows)));
+						column_type_alignment(row_ftype));
 
 	/*
 	 * To iterate over piv_columns[] by piv_columns[].rank, create a reverse
 	 * map associating each piv_columns[].rank to its index in piv_columns.
 	 * This avoids an O(N^2) loop later.
 	 */
-	horiz_map = (int *) pg_malloc(sizeof(int) * num_columns);
-	for (i = 0; i < num_columns; i++)
+	horiz_map = pg_malloc_array(int, num_columns);
+	for (int i = 0; i < num_columns; i++)
 		horiz_map[piv_columns[i].rank] = i;
 
 	/*
 	 * The display alignment depends on its PQftype().
 	 */
-	col_align = column_type_alignment(PQftype(results, field_for_data));
+	col_align = column_type_alignment(data_ftype);
 
-	for (i = 0; i < num_columns; i++)
+	for (int i = 0; i < num_columns; i++)
 	{
 		char	   *colname;
 
-		colname = piv_columns[horiz_map[i]].name ?
-			piv_columns[horiz_map[i]].name :
-			(popt.nullPrint ? popt.nullPrint : "");
+		colname = displayValue(piv_columns[horiz_map[i]].name, col_ftype, "");
 
 		printTableAddHeader(&cont, colname, false, col_align);
 	}
 	pg_free(horiz_map);
 
 	/* Step 2: set row names in the first output column (vertical header) */
-	for (i = 0; i < num_rows; i++)
+	for (int i = 0; i < num_rows; i++)
 	{
 		int			k = piv_rows[i].rank;
+		int			idx = k * (num_columns + 1);
 
-		cont.cells[k * (num_columns + 1)] = piv_rows[i].name ?
-			piv_rows[i].name :
-			(popt.nullPrint ? popt.nullPrint : "");
+		cont.cells[idx] = displayValue(piv_rows[i].name, row_ftype, "");
 	}
 	cont.cellsadded = num_rows * (num_columns + 1);
 
 	/*
 	 * Step 3: fill in the content cells.
 	 */
-	for (rn = 0; rn < PQntuples(results); rn++)
+	for (rn = 0; rn < PQntuples(result); rn++)
 	{
 		int			row_number;
 		int			col_number;
@@ -355,8 +355,8 @@ printCrosstab(const PGresult *results,
 		pivot_field elt;
 
 		/* Find target row */
-		if (!PQgetisnull(results, rn, field_for_rows))
-			elt.name = PQgetvalue(results, rn, field_for_rows);
+		if (!PQgetisnull(result, rn, field_for_rows))
+			elt.name = PQgetvalue(result, rn, field_for_rows);
 		else
 			elt.name = NULL;
 		rp = (pivot_field *) bsearch(&elt,
@@ -368,8 +368,8 @@ printCrosstab(const PGresult *results,
 		row_number = rp->rank;
 
 		/* Find target column */
-		if (!PQgetisnull(results, rn, field_for_columns))
-			elt.name = PQgetvalue(results, rn, field_for_columns);
+		if (!PQgetisnull(result, rn, field_for_columns))
+			elt.name = PQgetvalue(result, rn, field_for_columns);
 		else
 			elt.name = NULL;
 
@@ -385,6 +385,7 @@ printCrosstab(const PGresult *results,
 		if (col_number >= 0 && row_number >= 0)
 		{
 			int			idx;
+			char	   *value;
 
 			/* index into the cont.cells array */
 			idx = 1 + col_number + row_number * (num_columns + 1);
@@ -394,17 +395,17 @@ printCrosstab(const PGresult *results,
 			 */
 			if (cont.cells[idx] != NULL)
 			{
-				psql_error("\\crosstabview: query result contains multiple data values for row \"%s\", column \"%s\"\n",
-						   rp->name ? rp->name :
-						   (popt.nullPrint ? popt.nullPrint : "(null)"),
-						   cp->name ? cp->name :
-						   (popt.nullPrint ? popt.nullPrint : "(null)"));
+				pg_log_error("\\crosstabview: query result contains multiple data values for row \"%s\", column \"%s\"",
+							 displayValue(rp->name, row_ftype, "(null)"),
+							 displayValue(cp->name, col_ftype, "(null)"));
 				goto error;
 			}
 
-			cont.cells[idx] = !PQgetisnull(results, rn, field_for_data) ?
-				PQgetvalue(results, rn, field_for_data) :
-				(popt.nullPrint ? popt.nullPrint : "");
+			if (PQgetisnull(result, rn, field_for_data))
+				value = NULL;
+			else
+				value = PQgetvalue(result, rn, field_for_data);
+			cont.cells[idx] = displayValue(value, data_ftype, "");
 		}
 	}
 
@@ -412,7 +413,7 @@ printCrosstab(const PGresult *results,
 	 * The non-initialized cells must be set to an empty string for the print
 	 * functions
 	 */
-	for (i = 0; i < cont.cellsadded; i++)
+	for (uint64 i = 0; i < cont.cellsadded; i++)
 	{
 		if (cont.cells[i] == NULL)
 			cont.cells[i] = "";
@@ -428,6 +429,30 @@ error:
 }
 
 /*
+ * Return the display representation of one cell value in \crosstabview,
+ * following pset substitutions.
+ *
+ * The returned pointer is not to be freed.
+ */
+static char *
+displayValue(char *value, Oid ftype, char *default_null)
+{
+	printQueryOpt popt = pset.popt;
+
+	if (value == NULL)
+		value = popt.nullPrint ? popt.nullPrint : default_null;
+	else if (ftype == BOOLOID)
+	{
+		if (value[0] == 't' && popt.truePrint)
+			value = popt.truePrint;
+		else if (value[0] == 'f' && popt.falsePrint)
+			value = popt.falsePrint;
+	}
+
+	return value;
+}
+
+/*
  * The avl* functions below provide a minimalistic implementation of AVL binary
  * trees, to efficiently collect the distinct values that will form the horizontal
  * and vertical headers. It only supports adding new values, no removal or even
@@ -436,7 +461,7 @@ error:
 static void
 avlInit(avl_tree *tree)
 {
-	tree->end = (avl_node *) pg_malloc0(sizeof(avl_node));
+	tree->end = pg_malloc0_object(avl_node);
 	tree->end->children[0] = tree->end->children[1] = tree->end;
 	tree->count = 0;
 	tree->root = tree->end;
@@ -531,8 +556,7 @@ avlInsertNode(avl_tree *tree, avl_node **node, pivot_field field)
 
 	if (current == tree->end)
 	{
-		avl_node   *new_node = (avl_node *)
-		pg_malloc(sizeof(avl_node));
+		avl_node   *new_node = pg_malloc_object(avl_node);
 
 		new_node->height = 1;
 		new_node->field = field;
@@ -590,7 +614,7 @@ rankSort(int num_columns, pivot_field *piv_columns)
 								 * every header entry] */
 	int			i;
 
-	hmap = (int *) pg_malloc(sizeof(int) * num_columns * 2);
+	hmap = pg_malloc_array(int, num_columns * 2);
 	for (i = 0; i < num_columns; i++)
 	{
 		char	   *val = piv_columns[i].sort_value;
@@ -642,8 +666,8 @@ indexOfColumn(char *arg, const PGresult *res)
 		idx = atoi(arg) - 1;
 		if (idx < 0 || idx >= PQnfields(res))
 		{
-			psql_error("\\crosstabview: column number %d is out of range 1..%d\n",
-					   idx + 1, PQnfields(res));
+			pg_log_error("\\crosstabview: column number %d is out of range 1..%d",
+						 idx + 1, PQnfields(res));
 			return -1;
 		}
 	}
@@ -667,7 +691,7 @@ indexOfColumn(char *arg, const PGresult *res)
 				if (idx >= 0)
 				{
 					/* another idx was already found for the same name */
-					psql_error("\\crosstabview: ambiguous column name: \"%s\"\n", arg);
+					pg_log_error("\\crosstabview: ambiguous column name: \"%s\"", arg);
 					return -1;
 				}
 				idx = i;
@@ -675,7 +699,7 @@ indexOfColumn(char *arg, const PGresult *res)
 		}
 		if (idx == -1)
 		{
-			psql_error("\\crosstabview: column name not found: \"%s\"\n", arg);
+			pg_log_error("\\crosstabview: column name not found: \"%s\"", arg);
 			return -1;
 		}
 	}
@@ -709,5 +733,5 @@ pivotFieldCompare(const void *a, const void *b)
 static int
 rankCompare(const void *a, const void *b)
 {
-	return *((const int *) a) - *((const int *) b);
+	return pg_cmp_s32(*(const int *) a, *(const int *) b);
 }

@@ -3,7 +3,7 @@
  * amutils.c
  *	  SQL-level APIs related to index access methods.
  *
- * Copyright (c) 2016-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2026, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -89,9 +89,7 @@ static const struct am_propname am_propnames[] =
 static IndexAMProperty
 lookup_prop_name(const char *name)
 {
-	int			i;
-
-	for (i = 0; i < lengthof(am_propnames); i++)
+	for (size_t i = 0; i < lengthof(am_propnames); i++)
 	{
 		if (pg_strcasecmp(am_propnames[i].name, name) == 0)
 			return am_propnames[i].prop;
@@ -119,7 +117,6 @@ test_indoption(HeapTuple tuple, int attno, bool guard,
 			   bool *res)
 {
 	Datum		datum;
-	bool		isnull;
 	int2vector *indoption;
 	int16		indoption_val;
 
@@ -129,9 +126,7 @@ test_indoption(HeapTuple tuple, int attno, bool guard,
 		return true;
 	}
 
-	datum = SysCacheGetAttr(INDEXRELID, tuple,
-							Anum_pg_index_indoption, &isnull);
-	Assert(!isnull);
+	datum = SysCacheGetAttrNotNull(INDEXRELID, tuple, Anum_pg_index_indoption);
 
 	indoption = ((int2vector *) DatumGetPointer(datum));
 	indoption_val = indoption->values[attno - 1];
@@ -159,7 +154,7 @@ indexam_property(FunctionCallInfo fcinfo,
 	bool		isnull = false;
 	int			natts = 0;
 	IndexAMProperty prop;
-	IndexAmRoutine *routine;
+	const IndexAmRoutine *routine;
 
 	/* Try to convert property name to enum (no error if not known) */
 	prop = lookup_prop_name(propname);
@@ -444,4 +439,27 @@ pg_index_column_has_property(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 
 	return indexam_property(fcinfo, propname, InvalidOid, relid, attno);
+}
+
+/*
+ * Return the name of the given phase, as used for progress reporting by the
+ * given AM.
+ */
+Datum
+pg_indexam_progress_phasename(PG_FUNCTION_ARGS)
+{
+	Oid			amoid = PG_GETARG_OID(0);
+	int64		phasenum = PG_GETARG_INT64(1);
+	const IndexAmRoutine *routine;
+	char	   *name;
+
+	routine = GetIndexAmRoutineByAmId(amoid, true);
+	if (routine == NULL || !routine->ambuildphasename)
+		PG_RETURN_NULL();
+
+	name = routine->ambuildphasename(phasenum);
+	if (!name)
+		PG_RETURN_NULL();
+
+	PG_RETURN_DATUM(CStringGetTextDatum(name));
 }

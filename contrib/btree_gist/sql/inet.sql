@@ -16,7 +16,7 @@ SELECT count(*) FROM inettmp WHERE a >= '89.225.196.191';
 
 SELECT count(*) FROM inettmp WHERE a >  '89.225.196.191';
 
-CREATE INDEX inetidx ON inettmp USING gist ( a );
+CREATE INDEX inetidx ON inettmp USING gist ( a gist_inet_ops );
 
 SET enable_seqscan=off;
 
@@ -42,7 +42,7 @@ DROP INDEX inetidx;
 
 CREATE INDEX ON inettmp USING gist (a gist_inet_ops, a inet_ops);
 
--- likewise here (checks for core planner bug)
+-- this can be an index-only scan, as long as the planner uses the right column
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM inettmp WHERE a  = '89.225.196.191'::inet;
 

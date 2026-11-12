@@ -3,7 +3,7 @@
  * fdwapi.h
  *	  API for foreign-data wrappers
  *
- * Copyright (c) 2010-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *
  * src/include/foreign/fdwapi.h
  *
@@ -14,10 +14,10 @@
 
 #include "access/parallel.h"
 #include "nodes/execnodes.h"
-#include "nodes/relation.h"
+#include "nodes/pathnodes.h"
 
-/* To avoid including explain.h here, reference ExplainState thus: */
-struct ExplainState;
+/* avoid including explain_state.h here */
+typedef struct ExplainState ExplainState;
 
 
 /*
@@ -65,7 +65,8 @@ typedef void (*GetForeignUpperPaths_function) (PlannerInfo *root,
 											   RelOptInfo *output_rel,
 											   void *extra);
 
-typedef void (*AddForeignUpdateTargets_function) (Query *parsetree,
+typedef void (*AddForeignUpdateTargets_function) (PlannerInfo *root,
+												  Index rtindex,
 												  RangeTblEntry *target_rte,
 												  Relation target_relation);
 
@@ -84,6 +85,14 @@ typedef TupleTableSlot *(*ExecForeignInsert_function) (EState *estate,
 													   ResultRelInfo *rinfo,
 													   TupleTableSlot *slot,
 													   TupleTableSlot *planSlot);
+
+typedef TupleTableSlot **(*ExecForeignBatchInsert_function) (EState *estate,
+															 ResultRelInfo *rinfo,
+															 TupleTableSlot **slots,
+															 TupleTableSlot **planSlots,
+															 int *numSlots);
+
+typedef int (*GetForeignModifyBatchSize_function) (ResultRelInfo *rinfo);
 
 typedef TupleTableSlot *(*ExecForeignUpdate_function) (EState *estate,
 													   ResultRelInfo *rinfo,
@@ -121,22 +130,23 @@ typedef void (*EndDirectModify_function) (ForeignScanState *node);
 typedef RowMarkType (*GetForeignRowMarkType_function) (RangeTblEntry *rte,
 													   LockClauseStrength strength);
 
-typedef HeapTuple (*RefetchForeignRow_function) (EState *estate,
-												 ExecRowMark *erm,
-												 Datum rowid,
-												 bool *updated);
+typedef void (*RefetchForeignRow_function) (EState *estate,
+											ExecRowMark *erm,
+											Datum rowid,
+											TupleTableSlot *slot,
+											bool *updated);
 
 typedef void (*ExplainForeignScan_function) (ForeignScanState *node,
-											 struct ExplainState *es);
+											 ExplainState *es);
 
 typedef void (*ExplainForeignModify_function) (ModifyTableState *mtstate,
 											   ResultRelInfo *rinfo,
 											   List *fdw_private,
 											   int subplan_index,
-											   struct ExplainState *es);
+											   ExplainState *es);
 
 typedef void (*ExplainDirectModify_function) (ForeignScanState *node,
-											  struct ExplainState *es);
+											  ExplainState *es);
 
 typedef int (*AcquireSampleRowsFunc) (Relation relation, int elevel,
 									  HeapTuple *rows, int targrows,
@@ -147,8 +157,16 @@ typedef bool (*AnalyzeForeignTable_function) (Relation relation,
 											  AcquireSampleRowsFunc *func,
 											  BlockNumber *totalpages);
 
+typedef bool (*ImportForeignStatistics_function) (Relation relation,
+												  List *va_cols,
+												  int elevel);
+
 typedef List *(*ImportForeignSchema_function) (ImportForeignSchemaStmt *stmt,
 											   Oid serverOid);
+
+typedef void (*ExecForeignTruncate_function) (List *rels,
+											  DropBehavior behavior,
+											  bool restart_seqs);
 
 typedef Size (*EstimateDSMForeignScan_function) (ForeignScanState *node,
 												 ParallelContext *pcxt);
@@ -168,6 +186,14 @@ typedef bool (*IsForeignScanParallelSafe_function) (PlannerInfo *root,
 typedef List *(*ReparameterizeForeignPathByChild_function) (PlannerInfo *root,
 															List *fdw_private,
 															RelOptInfo *child_rel);
+
+typedef bool (*IsForeignPathAsyncCapable_function) (ForeignPath *path);
+
+typedef void (*ForeignAsyncRequest_function) (AsyncRequest *areq);
+
+typedef void (*ForeignAsyncConfigureWait_function) (AsyncRequest *areq);
+
+typedef void (*ForeignAsyncNotify_function) (AsyncRequest *areq);
 
 /*
  * FdwRoutine is the struct returned by a foreign-data wrapper's handler
@@ -208,6 +234,8 @@ typedef struct FdwRoutine
 	PlanForeignModify_function PlanForeignModify;
 	BeginForeignModify_function BeginForeignModify;
 	ExecForeignInsert_function ExecForeignInsert;
+	ExecForeignBatchInsert_function ExecForeignBatchInsert;
+	GetForeignModifyBatchSize_function GetForeignModifyBatchSize;
 	ExecForeignUpdate_function ExecForeignUpdate;
 	ExecForeignDelete_function ExecForeignDelete;
 	EndForeignModify_function EndForeignModify;
@@ -231,9 +259,13 @@ typedef struct FdwRoutine
 
 	/* Support functions for ANALYZE */
 	AnalyzeForeignTable_function AnalyzeForeignTable;
+	ImportForeignStatistics_function ImportForeignStatistics;
 
 	/* Support functions for IMPORT FOREIGN SCHEMA */
 	ImportForeignSchema_function ImportForeignSchema;
+
+	/* Support functions for TRUNCATE */
+	ExecForeignTruncate_function ExecForeignTruncate;
 
 	/* Support functions for parallelism under Gather node */
 	IsForeignScanParallelSafe_function IsForeignScanParallelSafe;
@@ -245,6 +277,12 @@ typedef struct FdwRoutine
 
 	/* Support functions for path reparameterization. */
 	ReparameterizeForeignPathByChild_function ReparameterizeForeignPathByChild;
+
+	/* Support functions for asynchronous execution */
+	IsForeignPathAsyncCapable_function IsForeignPathAsyncCapable;
+	ForeignAsyncRequest_function ForeignAsyncRequest;
+	ForeignAsyncConfigureWait_function ForeignAsyncConfigureWait;
+	ForeignAsyncNotify_function ForeignAsyncNotify;
 } FdwRoutine;
 
 
@@ -255,7 +293,7 @@ extern FdwRoutine *GetFdwRoutineByServerId(Oid serverid);
 extern FdwRoutine *GetFdwRoutineByRelId(Oid relid);
 extern FdwRoutine *GetFdwRoutineForRelation(Relation relation, bool makecopy);
 extern bool IsImportableForeignTable(const char *tablename,
-						 ImportForeignSchemaStmt *stmt);
+									 ImportForeignSchemaStmt *stmt);
 extern Path *GetExistingLocalJoinPath(RelOptInfo *joinrel);
 
 #endif							/* FDWAPI_H */

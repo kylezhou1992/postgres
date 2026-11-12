@@ -3,10 +3,12 @@
  */
 #include "postgres.h"
 
-#include "catalog/pg_type.h"
+#include <limits.h>
 
 #include "_int.h"
-
+#include "catalog/pg_type.h"
+#include "common/int.h"
+#include "lib/qunique.h"
 
 /* arguments are assumed sorted & unique-ified */
 bool
@@ -40,7 +42,7 @@ inner_int_contains(ArrayType *a, ArrayType *b)
 			break;				/* db[j] is not in da */
 	}
 
-	return (n == nb) ? true : false;
+	return (n == nb);
 }
 
 /* arguments are assumed sorted */
@@ -184,36 +186,38 @@ rt__int_size(ArrayType *a, float *size)
 	*size = (float) ARRNELEMS(a);
 }
 
-/* qsort_arg comparison function for isort() */
-static int
+/* comparison function for isort() and _int_unique() */
+static inline int
 isort_cmp(const void *a, const void *b, void *arg)
 {
 	int32		aval = *((const int32 *) a);
 	int32		bval = *((const int32 *) b);
 
-	if (aval < bval)
-		return -1;
-	if (aval > bval)
-		return 1;
-
-	/*
-	 * Report if we have any duplicates.  If there are equal keys, qsort must
-	 * compare them at some point, else it wouldn't know whether one should go
-	 * before or after the other.
-	 */
-	*((bool *) arg) = true;
+	if (*((bool *) arg))
+	{
+		/* compare for ascending order */
+		if (aval < bval)
+			return -1;
+		if (aval > bval)
+			return 1;
+	}
+	else
+	{
+		if (aval > bval)
+			return -1;
+		if (aval < bval)
+			return 1;
+	}
 	return 0;
 }
 
-/* Sort the given data (len >= 2).  Return true if any duplicates found */
-bool
-isort(int32 *a, int len)
-{
-	bool		r = false;
-
-	qsort_arg(a, len, sizeof(int32), isort_cmp, (void *) &r);
-	return r;
-}
+#define ST_SORT isort
+#define ST_ELEMENT_TYPE int32
+#define ST_COMPARE(a, b, ascending) isort_cmp(a, b, ascending)
+#define ST_COMPARE_ARG_TYPE void
+#define ST_SCOPE
+#define ST_DEFINE
+#include "lib/sort_template.h"
 
 /* Create a new int array with room for "num" elements */
 ArrayType *
@@ -225,6 +229,7 @@ new_intArrayType(int num)
 	/* if no elements, return a zero-dimensional array */
 	if (num <= 0)
 	{
+		Assert(num == 0);
 		r = construct_empty_array(INT4OID);
 		return r;
 	}
@@ -252,7 +257,8 @@ resize_intArrayType(ArrayType *a, int num)
 	/* if no elements, return a zero-dimensional array */
 	if (num <= 0)
 	{
-		ARR_NDIM(a) = 0;
+		Assert(num == 0);
+		a = construct_empty_array(INT4OID);
 		return a;
 	}
 
@@ -288,50 +294,42 @@ copy_intArrayType(ArrayType *a)
 int
 internal_size(int *a, int len)
 {
-	int			i,
-				size = 0;
+	int			i;
+	int64		size = 0;
 
 	for (i = 0; i < len; i += 2)
 	{
 		if (!i || a[i] != a[i - 1]) /* do not count repeated range */
-			size += a[i + 1] - a[i] + 1;
+			size += (int64) (a[i + 1]) - (int64) (a[i]) + 1;
 	}
 
-	return size;
+	if (size > (int64) INT_MAX || size < (int64) INT_MIN)
+		return -1;				/* overflow */
+	return (int) size;
 }
 
 /* unique-ify elements of r in-place ... r must be sorted already */
 ArrayType *
 _int_unique(ArrayType *r)
 {
-	int		   *tmp,
-			   *dr,
-			   *data;
 	int			num = ARRNELEMS(r);
+	bool		ascending = true;
 
-	if (num < 2)
-		return r;
+	num = qunique_arg(ARRPTR(r), num, sizeof(int), isort_cmp,
+					  &ascending);
 
-	data = tmp = dr = ARRPTR(r);
-	while (tmp - data < num)
-	{
-		if (*tmp != *dr)
-			*(++dr) = *tmp++;
-		else
-			tmp++;
-	}
-	return resize_intArrayType(r, dr + 1 - ARRPTR(r));
+	return resize_intArrayType(r, num);
 }
 
 void
-gensign(BITVEC sign, int *a, int len)
+gensign(BITVECP sign, int *a, int len, int siglen)
 {
 	int			i;
 
 	/* we assume that the sign vector is previously zeroed */
 	for (i = 0; i < len; i++)
 	{
-		HASH(sign, *a);
+		HASH(sign, *a, siglen);
 		a++;
 	}
 }
@@ -387,29 +385,13 @@ intarray_concat_arrays(ArrayType *a, ArrayType *b)
 }
 
 ArrayType *
-int_to_intset(int32 n)
+int_to_intset(int32 elem)
 {
 	ArrayType  *result;
 	int32	   *aa;
 
 	result = new_intArrayType(1);
 	aa = ARRPTR(result);
-	aa[0] = n;
+	aa[0] = elem;
 	return result;
-}
-
-int
-compASC(const void *a, const void *b)
-{
-	if (*(const int32 *) a == *(const int32 *) b)
-		return 0;
-	return (*(const int32 *) a > *(const int32 *) b) ? 1 : -1;
-}
-
-int
-compDESC(const void *a, const void *b)
-{
-	if (*(const int32 *) a == *(const int32 *) b)
-		return 0;
-	return (*(const int32 *) a < *(const int32 *) b) ? 1 : -1;
 }

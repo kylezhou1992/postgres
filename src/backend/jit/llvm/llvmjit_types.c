@@ -16,7 +16,7 @@
  * bitcode.
  *
  *
- * Copyright (c) 2016-2018, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/jit/llvm/llvmjit_types.c
@@ -44,22 +44,42 @@
  * List of types needed for JITing. These have to be non-static, otherwise
  * clang/LLVM will omit them.  As this file will never be linked into
  * anything, that's harmless.
+ *
+ * They are also excluded from AddressSanitizer instrumentation, so that they
+ * keep the types they are declared with (clang adds a wrapper struct with a
+ * redzone when using address sanitizer).  This file is only ever compiled by
+ * clang, so a clang pragma is fine here.
  */
+#pragma clang attribute push (pg_attribute_no_sanitize_address(), \
+							  apply_to = variable(is_global))
+
 PGFunction	TypePGFunction;
 size_t		TypeSizeT;
+Datum		TypeDatum;
 bool		TypeStorageBool;
 
+ExecEvalSubroutine TypeExecEvalSubroutine;
+ExecEvalBoolSubroutine TypeExecEvalBoolSubroutine;
+
+NullableDatum StructNullableDatum;
 AggState	StructAggState;
 AggStatePerGroupData StructAggStatePerGroupData;
 AggStatePerTransData StructAggStatePerTransData;
 ExprContext StructExprContext;
 ExprEvalStep StructExprEvalStep;
 ExprState	StructExprState;
-FunctionCallInfoData StructFunctionCallInfoData;
+FunctionCallInfoBaseData StructFunctionCallInfoData;
 HeapTupleData StructHeapTupleData;
+HeapTupleHeaderData StructHeapTupleHeaderData;
 MemoryContextData StructMemoryContextData;
 TupleTableSlot StructTupleTableSlot;
-struct tupleDesc StructtupleDesc;
+HeapTupleTableSlot StructHeapTupleTableSlot;
+MinimalTupleTableSlot StructMinimalTupleTableSlot;
+TupleDescData StructTupleDescData;
+PlanState	StructPlanState;
+MinimalTupleData StructMinimalTupleData;
+
+#pragma clang attribute pop
 
 
 /*
@@ -71,15 +91,46 @@ extern Datum AttributeTemplate(PG_FUNCTION_ARGS);
 Datum
 AttributeTemplate(PG_FUNCTION_ARGS)
 {
+	StaticAssertVariableIsOfType(&AttributeTemplate, PGFunction);
+
 	PG_RETURN_NULL();
 }
 
 /*
- * Clang represents stdbool.h style booleans that are returned by functions
- * differently (as i1) than stored ones (as i8). Therefore we do not just need
- * TypeBool (above), but also a way to determine the width of a returned
- * integer. This allows us to keep compatible with non-stdbool using
- * architectures.
+ * And some more "templates" to give us examples of function types
+ * corresponding to function pointer types.
+ */
+
+extern void ExecEvalSubroutineTemplate(ExprState *state,
+									   struct ExprEvalStep *op,
+									   ExprContext *econtext);
+void
+ExecEvalSubroutineTemplate(ExprState *state,
+						   struct ExprEvalStep *op,
+						   ExprContext *econtext)
+{
+	StaticAssertVariableIsOfType(&ExecEvalSubroutineTemplate,
+								 ExecEvalSubroutine);
+}
+
+extern bool ExecEvalBoolSubroutineTemplate(ExprState *state,
+										   struct ExprEvalStep *op,
+										   ExprContext *econtext);
+bool
+ExecEvalBoolSubroutineTemplate(ExprState *state,
+							   struct ExprEvalStep *op,
+							   ExprContext *econtext)
+{
+	StaticAssertVariableIsOfType(&ExecEvalBoolSubroutineTemplate,
+								 ExecEvalBoolSubroutine);
+
+	return false;
+}
+
+/*
+ * Clang represents bool returned by functions differently (as i1) than stored
+ * ones (as i8).  Therefore we do not just need TypeStorageBool (above), but
+ * also a way to determine the width of a returned integer.
  */
 extern bool FunctionReturningBool(void);
 bool
@@ -95,13 +146,50 @@ FunctionReturningBool(void)
  */
 void	   *referenced_functions[] =
 {
+	ExecAggInitGroup,
+	ExecAggCopyTransValue,
+	ExecEvalPreOrderedDistinctSingle,
+	ExecEvalPreOrderedDistinctMulti,
+	ExecEvalAggOrderedTransDatum,
+	ExecEvalAggOrderedTransTuple,
+	ExecEvalArrayCoerce,
+	ExecEvalArrayExpr,
+	ExecEvalConstraintCheck,
+	ExecEvalConstraintNotNull,
+	ExecEvalConvertRowtype,
+	ExecEvalCurrentOfExpr,
+	ExecEvalFieldSelect,
+	ExecEvalFieldStoreDeForm,
+	ExecEvalFieldStoreForm,
+	ExecEvalFuncExprFusage,
+	ExecEvalFuncExprStrictFusage,
+	ExecEvalGroupingFunc,
+	ExecEvalMergeSupportFunc,
+	ExecEvalMinMax,
+	ExecEvalNextValueExpr,
+	ExecEvalParamExec,
+	ExecEvalParamExtern,
+	ExecEvalParamSet,
+	ExecEvalRow,
+	ExecEvalRowNotNull,
+	ExecEvalRowNull,
+	ExecEvalCoerceViaIOSafe,
+	ExecEvalSQLValueFunction,
+	ExecEvalScalarArrayOp,
+	ExecEvalHashedScalarArrayOp,
+	ExecEvalSubPlan,
+	ExecEvalSysVar,
+	ExecEvalWholeRowVar,
+	ExecEvalXmlExpr,
+	ExecEvalJsonConstructor,
+	ExecEvalJsonIsPredicate,
+	ExecEvalJsonCoercion,
+	ExecEvalJsonCoercionFinish,
+	ExecEvalJsonExprPath,
+	MakeExpandedObjectReadOnlyInternal,
+	slot_getmissingattrs,
+	slot_getsomeattrs_int,
 	strlen,
 	varsize_any,
-	slot_getsomeattrs,
-	slot_getmissingattrs,
-	heap_getsysattr,
-	MakeExpandedObjectReadOnlyInternal,
-	ExecEvalArrayRefSubscript,
-	ExecAggTransReparent,
-	ExecAggInitGroup
+	ExecInterpExprStillValid,
 };

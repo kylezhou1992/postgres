@@ -3,16 +3,16 @@
  *
  *	database server functions
  *
- *	Copyright (c) 2010-2018, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/server.c
  */
 
 #include "postgres_fe.h"
 
-#include "fe_utils/connect.h"
+#include "common/connect.h"
 #include "fe_utils/string_utils.h"
+#include "libpq/pqcomm.h"
 #include "pg_upgrade.h"
-
 
 static PGconn *get_db_conn(ClusterInfo *cluster, const char *db_name);
 
@@ -31,8 +31,7 @@ connectToServer(ClusterInfo *cluster, const char *db_name)
 
 	if (conn == NULL || PQstatus(conn) != CONNECTION_OK)
 	{
-		pg_log(PG_REPORT, "connection to database failed: %s",
-			   PQerrorMessage(conn));
+		pg_log(PG_REPORT, "%s", PQerrorMessage(conn));
 
 		if (conn)
 			PQfinish(conn);
@@ -51,6 +50,8 @@ connectToServer(ClusterInfo *cluster, const char *db_name)
  * get_db_conn()
  *
  * get database connection, using named database + standard params for cluster
+ *
+ * Caller must check for connection failure!
  */
 static PGconn *
 get_db_conn(ClusterInfo *cluster, const char *db_name)
@@ -70,6 +71,8 @@ get_db_conn(ClusterInfo *cluster, const char *db_name)
 		appendPQExpBufferStr(&conn_opts, " host=");
 		appendConnStrVal(&conn_opts, cluster->sockdir);
 	}
+	if (!protocol_negotiation_supported(cluster))
+		appendPQExpBufferStr(&conn_opts, " max_protocol_version=3.0");
 
 	conn = PQconnectdb(conn_opts.data);
 	termPQExpBuffer(&conn_opts);
@@ -118,7 +121,7 @@ cluster_conn_opts(ClusterInfo *cluster)
  *	message and calls exit() to kill the program.
  */
 PGresult *
-executeQueryOrDie(PGconn *conn, const char *fmt,...)
+executeQueryOrDie(PGconn *conn, const char *fmt, ...)
 {
 	static char query[QUERY_ALLOC];
 	va_list		args;
@@ -129,7 +132,7 @@ executeQueryOrDie(PGconn *conn, const char *fmt,...)
 	vsnprintf(query, sizeof(query), fmt, args);
 	va_end(args);
 
-	pg_log(PG_VERBOSE, "executing: %s\n", query);
+	pg_log(PG_VERBOSE, "executing: %s", query);
 	result = PQexec(conn, query);
 	status = PQresultStatus(result);
 
@@ -147,45 +150,6 @@ executeQueryOrDie(PGconn *conn, const char *fmt,...)
 }
 
 
-/*
- * get_major_server_version()
- *
- * gets the version (in unsigned int form) for the given datadir. Assumes
- * that datadir is an absolute path to a valid pgdata directory. The version
- * is retrieved by reading the PG_VERSION file.
- */
-uint32
-get_major_server_version(ClusterInfo *cluster)
-{
-	FILE	   *version_fd;
-	char		ver_filename[MAXPGPATH];
-	int			v1 = 0,
-				v2 = 0;
-
-	snprintf(ver_filename, sizeof(ver_filename), "%s/PG_VERSION",
-			 cluster->pgdata);
-	if ((version_fd = fopen(ver_filename, "r")) == NULL)
-		pg_fatal("could not open version file: %s\n", ver_filename);
-
-	if (fscanf(version_fd, "%63s", cluster->major_version_str) == 0 ||
-		sscanf(cluster->major_version_str, "%d.%d", &v1, &v2) < 1)
-		pg_fatal("could not parse PG_VERSION file from %s\n", cluster->pgdata);
-
-	fclose(version_fd);
-
-	if (v1 < 10)
-	{
-		/* old style, e.g. 9.6.1 */
-		return v1 * 10000 + v2 * 100;
-	}
-	else
-	{
-		/* new style, e.g. 10.1 */
-		return v1 * 10000;
-	}
-}
-
-
 static void
 stop_postmaster_atexit(void)
 {
@@ -200,6 +164,7 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 	PGconn	   *conn;
 	bool		pg_ctl_return = false;
 	char		socket_string[MAXPGPATH + 200];
+	PQExpBufferData pgoptions;
 
 	static bool exit_hook_registered = false;
 
@@ -211,7 +176,7 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 
 	socket_string[0] = '\0';
 
-#ifdef HAVE_UNIX_SOCKETS
+#if !defined(WIN32)
 	/* prevent TCP/IP connections, restrict socket access */
 	strcat(socket_string,
 		   " -c listen_addresses='' -c unix_socket_permissions=0700");
@@ -221,35 +186,36 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 		snprintf(socket_string + strlen(socket_string),
 				 sizeof(socket_string) - strlen(socket_string),
 				 " -c %s='%s'",
-				 (GET_MAJOR_VERSION(cluster->major_version) < 903) ?
-				 "unix_socket_directory" : "unix_socket_directories",
+				 "unix_socket_directories",
 				 cluster->sockdir);
 #endif
 
+	initPQExpBuffer(&pgoptions);
+
 	/*
-	 * Since PG 9.1, we have used -b to disable autovacuum.  For earlier
-	 * releases, setting autovacuum=off disables cleanup vacuum and analyze,
-	 * but freeze vacuums can still happen, so we set
-	 * autovacuum_freeze_max_age to its maximum.
-	 * (autovacuum_multixact_freeze_max_age was introduced after 9.1, so there
-	 * is no need to set that.)  We assume all datfrozenxid and relfrozenxid
-	 * values are less than a gap of 2000000000 from the current xid counter,
-	 * so autovacuum will not touch them.
+	 * Construct a parameter string which is passed to the server process.
 	 *
 	 * Turn off durability requirements to improve object creation speed, and
 	 * we only modify the new cluster, so only use it there.  If there is a
 	 * crash, the new cluster has to be recreated anyway.  fsync=off is a big
 	 * win on ext4.
 	 */
+	if (cluster == &new_cluster)
+		appendPQExpBufferStr(&pgoptions, " -c synchronous_commit=off -c fsync=off -c full_page_writes=off");
+
+	/*
+	 * Use -b to disable autovacuum and logical replication launcher
+	 * (effective in PG17 or later for the latter).
+	 */
 	snprintf(cmd, sizeof(cmd),
-			 "\"%s/pg_ctl\" -w -l \"%s\" -D \"%s\" -o \"-p %d%s%s %s%s\" start",
-			 cluster->bindir, SERVER_LOG_FILE, cluster->pgconfig, cluster->port,
-			 (cluster->controldata.cat_ver >=
-			  BINARY_UPGRADE_SERVER_FLAG_CAT_VER) ? " -b" :
-			 " -c autovacuum=off -c autovacuum_freeze_max_age=2000000000",
-			 (cluster == &new_cluster) ?
-			 " -c synchronous_commit=off -c fsync=off -c full_page_writes=off" : "",
+			 "\"%s/pg_ctl\" -w -l \"%s/%s\" -D \"%s\" -o \"-p %d -b%s %s%s\" start",
+			 cluster->bindir,
+			 log_opts.logdir,
+			 SERVER_LOG_FILE, cluster->pgconfig, cluster->port,
+			 pgoptions.data,
 			 cluster->pgopts ? cluster->pgopts : "", socket_string);
+
+	termPQExpBuffer(&pgoptions);
 
 	/*
 	 * Don't throw an error right away, let connecting throw the error because
@@ -292,17 +258,16 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 	if ((conn = get_db_conn(cluster, "template1")) == NULL ||
 		PQstatus(conn) != CONNECTION_OK)
 	{
-		pg_log(PG_REPORT, "\nconnection to database failed: %s",
-			   PQerrorMessage(conn));
+		pg_log(PG_REPORT, "\n%s", PQerrorMessage(conn));
 		if (conn)
 			PQfinish(conn);
 		if (cluster == &old_cluster)
 			pg_fatal("could not connect to source postmaster started with the command:\n"
-					 "%s\n",
+					 "%s",
 					 cmd);
 		else
 			pg_fatal("could not connect to target postmaster started with the command:\n"
-					 "%s\n",
+					 "%s",
 					 cmd);
 	}
 	PQfinish(conn);
@@ -315,9 +280,9 @@ start_postmaster(ClusterInfo *cluster, bool report_and_exit_on_error)
 	if (!pg_ctl_return)
 	{
 		if (cluster == &old_cluster)
-			pg_fatal("pg_ctl failed to start the source server, or connection failed\n");
+			pg_fatal("pg_ctl failed to start the source server, or connection failed");
 		else
-			pg_fatal("pg_ctl failed to start the target server, or connection failed\n");
+			pg_fatal("pg_ctl failed to start the target server, or connection failed");
 	}
 
 	return true;
@@ -362,7 +327,7 @@ check_pghost_envvar(void)
 	start = PQconndefaults();
 
 	if (!start)
-		pg_fatal("out of memory\n");
+		pg_fatal("out of memory");
 
 	for (option = start; option->keyword != NULL; option++)
 	{
@@ -374,8 +339,8 @@ check_pghost_envvar(void)
 			if (value && strlen(value) > 0 &&
 			/* check for 'local' host values */
 				(strcmp(value, "localhost") != 0 && strcmp(value, "127.0.0.1") != 0 &&
-				 strcmp(value, "::1") != 0 && value[0] != '/'))
-				pg_fatal("libpq environment variable %s has a non-local server value: %s\n",
+				 strcmp(value, "::1") != 0 && !is_unixsock_path(value)))
+				pg_fatal("libpq environment variable %s has a non-local server value: %s",
 						 option->envvar, value);
 		}
 	}

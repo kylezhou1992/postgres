@@ -3,7 +3,7 @@
  * _int_selfuncs.c
  *	  Functions for selectivity estimation of intarray operators
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -13,17 +13,17 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "_int.h"
 
+#include "_int.h"
 #include "access/htup_details.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_type.h"
-#include "utils/builtins.h"
-#include "utils/selfuncs.h"
-#include "utils/syscache.h"
-#include "utils/lsyscache.h"
+#include "commands/extension.h"
 #include "miscadmin.h"
+#include "utils/fmgrprotos.h"
+#include "utils/lsyscache.h"
+#include "utils/selfuncs.h"
 
 PG_FUNCTION_INFO_V1(_int_overlap_sel);
 PG_FUNCTION_INFO_V1(_int_contains_sel);
@@ -34,8 +34,8 @@ PG_FUNCTION_INFO_V1(_int_contained_joinsel);
 PG_FUNCTION_INFO_V1(_int_matchsel);
 
 
-static Selectivity int_query_opr_selec(ITEM *item, Datum *values, float4 *freqs,
-					int nmncelems, float4 minfreq);
+static Selectivity int_query_opr_selec(ITEM *item, Datum *mcelems, float4 *mcefreqs,
+									   int nmcelems, float4 minfreq);
 static int	compare_val_int4(const void *a, const void *b);
 
 /*
@@ -43,7 +43,7 @@ static int	compare_val_int4(const void *a, const void *b);
  *
  * The default array selectivity operators for the @>, && and @< operators
  * work fine for integer arrays. However, if we tried to just use arraycontsel
- * and arracontjoinsel directly as the cost estimator functions for our
+ * and arraycontjoinsel directly as the cost estimator functions for our
  * operators, they would not work as intended, because they look at the
  * operator's OID. Our operators behave exactly like the built-in anyarray
  * versions, but we must tell the cost estimator functions which built-in
@@ -151,7 +151,10 @@ _int_matchsel(PG_FUNCTION_ARGS)
 	 * query_int.
 	 */
 	if (vardata.vartype != INT4ARRAYOID)
+	{
+		ReleaseVariableStats(vardata);
 		PG_RETURN_FLOAT8(DEFAULT_EQ_SEL);
+	}
 
 	/*
 	 * Can't do anything useful if the something is not a constant, either.
@@ -171,14 +174,25 @@ _int_matchsel(PG_FUNCTION_ARGS)
 		PG_RETURN_FLOAT8(0.0);
 	}
 
-	/* The caller made sure the const is a query, so get it now */
+	/*
+	 * Verify that the Const is a query_int, else return a default estimate.
+	 * (This could only fail if someone attached this estimator to the wrong
+	 * operator.)
+	 */
+	if (((Const *) other)->consttype !=
+		get_function_sibling_type(fcinfo->flinfo->fn_oid, "query_int"))
+	{
+		ReleaseVariableStats(vardata);
+		PG_RETURN_FLOAT8(DEFAULT_EQ_SEL);
+	}
+
 	query = DatumGetQueryTypeP(((Const *) other)->constvalue);
 
 	/* Empty query matches nothing */
 	if (query->size == 0)
 	{
 		ReleaseVariableStats(vardata);
-		return (Selectivity) 0.0;
+		PG_RETURN_FLOAT8(0.0);
 	}
 
 	/*
@@ -211,8 +225,8 @@ _int_matchsel(PG_FUNCTION_ARGS)
 			 */
 			if (sslot.nnumbers == sslot.nvalues + 3)
 			{
-				/* Grab the lowest frequency. */
-				minfreq = sslot.numbers[sslot.nnumbers - (sslot.nnumbers - sslot.nvalues)];
+				/* Grab the minimal MCE frequency. */
+				minfreq = sslot.numbers[sslot.nvalues];
 
 				mcelems = sslot.values;
 				mcefreqs = sslot.numbers;
@@ -270,8 +284,11 @@ int_query_opr_selec(ITEM *item, Datum *mcelems, float4 *mcefreqs,
 		else
 		{
 			/*
-			 * The element is not in MCELEM.  Punt, but assume that the
-			 * selectivity cannot be more than minfreq / 2.
+			 * The element is not in MCELEM.  Estimate its frequency as half
+			 * that of the least-frequent MCE.  (We know it cannot be more
+			 * than minfreq, and it could be a great deal less.  Half seems
+			 * like a good compromise.)  For probably-historical reasons,
+			 * clamp to not more than DEFAULT_EQ_SEL.
 			 */
 			selec = Min(DEFAULT_EQ_SEL, minfreq / 2);
 		}
@@ -326,8 +343,13 @@ int_query_opr_selec(ITEM *item, Datum *mcelems, float4 *mcefreqs,
 static int
 compare_val_int4(const void *a, const void *b)
 {
-	int32		key = *(int32 *) a;
-	const Datum *t = (const Datum *) b;
+	int32		key = *(const int32 *) a;
+	int32		value = DatumGetInt32(*(const Datum *) b);
 
-	return key - DatumGetInt32(*t);
+	if (key < value)
+		return -1;
+	else if (key > value)
+		return 1;
+	else
+		return 0;
 }

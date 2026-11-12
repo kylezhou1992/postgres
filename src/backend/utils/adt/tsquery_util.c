@@ -3,7 +3,7 @@
  * tsquery_util.c
  *	  Utilities for tsquery datatype
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -14,8 +14,9 @@
 
 #include "postgres.h"
 
-#include "tsearch/ts_utils.h"
 #include "miscadmin.h"
+#include "tsearch/ts_utils.h"
+#include "varatt.h"
 
 /*
  * Build QTNode tree for a tsquery given in QueryItem array format.
@@ -23,7 +24,7 @@
 QTNode *
 QT2QTN(QueryItem *in, char *operand)
 {
-	QTNode	   *node = (QTNode *) palloc0(sizeof(QTNode));
+	QTNode	   *node = palloc0_object(QTNode);
 
 	/* since this function recurses, it could be driven to stack overflow. */
 	check_stack_depth();
@@ -32,7 +33,7 @@ QT2QTN(QueryItem *in, char *operand)
 
 	if (in->type == QI_OPR)
 	{
-		node->child = (QTNode **) palloc0(sizeof(QTNode *) * 2);
+		node->child = palloc0_array(QTNode *, 2);
 		node->child[0] = QT2QTN(in + 1, operand);
 		node->sign = node->child[0]->sign;
 		if (in->qoperator.oper == OP_NOT)
@@ -172,7 +173,7 @@ QTNSort(QTNode *in)
 	for (i = 0; i < in->nchild; i++)
 		QTNSort(in->child[i]);
 	if (in->nchild > 1 && in->valnode->qoperator.oper != OP_PHRASE)
-		qsort((void *) in->child, in->nchild, sizeof(QTNode *), cmpQTN);
+		qsort(in->child, in->nchild, sizeof(QTNode *), cmpQTN);
 }
 
 /*
@@ -186,7 +187,7 @@ QTNEq(QTNode *a, QTNode *b)
 	if (!(sign == a->sign && sign == b->sign))
 		return false;
 
-	return (QTNodeCompare(a, b) == 0) ? true : false;
+	return (QTNodeCompare(a, b) == 0);
 }
 
 /*
@@ -225,7 +226,7 @@ QTNTernary(QTNode *in)
 			int			oldnchild = in->nchild;
 
 			in->nchild += cc->nchild - 1;
-			in->child = (QTNode **) repalloc(in->child, in->nchild * sizeof(QTNode *));
+			in->child = repalloc_array(in->child, QTNode *, in->nchild);
 
 			if (i + 1 != oldnchild)
 				memmove(in->child + i + cc->nchild, in->child + i + 1,
@@ -261,10 +262,10 @@ QTNBinary(QTNode *in)
 
 	while (in->nchild > 2)
 	{
-		QTNode	   *nn = (QTNode *) palloc0(sizeof(QTNode));
+		QTNode	   *nn = palloc0_object(QTNode);
 
-		nn->valnode = (QueryItem *) palloc0(sizeof(QueryItem));
-		nn->child = (QTNode **) palloc0(sizeof(QTNode *) * 2);
+		nn->valnode = palloc0_object(QueryItem);
+		nn->child = palloc0_array(QTNode *, 2);
 
 		nn->nchild = 2;
 		nn->flags = QTN_NEEDFREE;
@@ -288,7 +289,7 @@ QTNBinary(QTNode *in)
  * Caller must initialize *sumlen and *nnode to zeroes.
  */
 static void
-cntsize(QTNode *in, int *sumlen, int *nnode)
+cntsize(QTNode *in, size_t *sumlen, size_t *nnode)
 {
 	/* since this function recurses, it could be driven to stack overflow. */
 	check_stack_depth();
@@ -326,10 +327,17 @@ fillQT(QTN2QTState *state, QTNode *in)
 
 	if (in->valnode->type == QI_VAL)
 	{
+		size_t		distance;
+
 		memcpy(state->curitem, in->valnode, sizeof(QueryOperand));
 
 		memcpy(state->curoperand, in->word, in->valnode->qoperand.length);
-		state->curitem->qoperand.distance = state->curoperand - state->operand;
+		distance = state->curoperand - state->operand;
+		if (distance > MAXSTRPOS)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("tsquery is too large")));
+		state->curitem->qoperand.distance = distance;
 		state->curoperand[in->valnode->qoperand.length] = '\0';
 		state->curoperand += in->valnode->qoperand.length + 1;
 		state->curitem++;
@@ -363,7 +371,7 @@ QTN2QT(QTNode *in)
 {
 	TSQuery		out;
 	int			len;
-	int			sumlen = 0,
+	size_t		sumlen = 0,
 				nnode = 0;
 	QTN2QTState state;
 
@@ -399,10 +407,10 @@ QTNCopy(QTNode *in)
 	/* since this function recurses, it could be driven to stack overflow. */
 	check_stack_depth();
 
-	out = (QTNode *) palloc(sizeof(QTNode));
+	out = palloc_object(QTNode);
 
 	*out = *in;
-	out->valnode = (QueryItem *) palloc(sizeof(QueryItem));
+	out->valnode = palloc_object(QueryItem);
 	*(out->valnode) = *(in->valnode);
 	out->flags |= QTN_NEEDFREE;
 
@@ -417,7 +425,7 @@ QTNCopy(QTNode *in)
 	{
 		int			i;
 
-		out->child = (QTNode **) palloc(sizeof(QTNode *) * in->nchild);
+		out->child = palloc_array(QTNode *, in->nchild);
 
 		for (i = 0; i < in->nchild; i++)
 			out->child[i] = QTNCopy(in->child[i]);

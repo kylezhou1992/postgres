@@ -3,7 +3,7 @@
  * brin_validate.c
  *	  Opclass validator for BRIN.
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -19,12 +19,11 @@
 #include "catalog/pg_amop.h"
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_opclass.h"
-#include "catalog/pg_opfamily.h"
 #include "catalog/pg_type.h"
 #include "utils/builtins.h"
-#include "utils/syscache.h"
+#include "utils/lsyscache.h"
 #include "utils/regproc.h"
-
+#include "utils/syscache.h"
 
 /*
  * Validator for a BRIN opclass.
@@ -43,8 +42,6 @@ brinvalidate(Oid opclassoid)
 	Oid			opfamilyoid;
 	Oid			opcintype;
 	char	   *opclassname;
-	HeapTuple	familytup;
-	Form_pg_opfamily familyform;
 	char	   *opfamilyname;
 	CatCList   *proclist,
 			   *oprlist;
@@ -66,12 +63,7 @@ brinvalidate(Oid opclassoid)
 	opclassname = NameStr(classform->opcname);
 
 	/* Fetch opfamily information */
-	familytup = SearchSysCache1(OPFAMILYOID, ObjectIdGetDatum(opfamilyoid));
-	if (!HeapTupleIsValid(familytup))
-		elog(ERROR, "cache lookup failed for operator family %u", opfamilyoid);
-	familyform = (Form_pg_opfamily) GETSTRUCT(familytup);
-
-	opfamilyname = NameStr(familyform->opfname);
+	opfamilyname = get_opfamily_name(opfamilyoid, false);
 
 	/* Fetch all operators and support functions of the opfamily */
 	oprlist = SearchSysCacheList1(AMOPSTRATEGY, ObjectIdGetDatum(opfamilyoid));
@@ -98,13 +90,16 @@ brinvalidate(Oid opclassoid)
 				break;
 			case BRIN_PROCNUM_CONSISTENT:
 				ok = check_amproc_signature(procform->amproc, BOOLOID, true,
-											3, 3, INTERNALOID, INTERNALOID,
-											INTERNALOID);
+											3, 4, INTERNALOID, INTERNALOID,
+											INTERNALOID, INT4OID);
 				break;
 			case BRIN_PROCNUM_UNION:
 				ok = check_amproc_signature(procform->amproc, BOOLOID, true,
 											3, 3, INTERNALOID, INTERNALOID,
 											INTERNALOID);
+				break;
+			case BRIN_PROCNUM_OPTIONS:
+				ok = check_amoptsproc_signature(procform->amproc);
 				break;
 			default:
 				/* Complain if it's not a valid optional proc number */
@@ -272,7 +267,6 @@ brinvalidate(Oid opclassoid)
 
 	ReleaseCatCacheList(proclist);
 	ReleaseCatCacheList(oprlist);
-	ReleaseSysCache(familytup);
 	ReleaseSysCache(classtup);
 
 	return result;

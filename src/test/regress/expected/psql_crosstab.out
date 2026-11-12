@@ -17,12 +17,12 @@ SELECT v, EXTRACT(year FROM d), count(*)
  FROM ctv_data
  GROUP BY 1, 2
  ORDER BY 1, 2;
- v  | date_part | count 
-----+-----------+-------
- v0 |      2014 |     2
- v0 |      2015 |     1
- v1 |      2015 |     3
- v2 |      2015 |     1
+ v  | extract | count 
+----+---------+-------
+ v0 |    2014 |     2
+ v0 |    2015 |     1
+ v1 |    2015 |     3
+ v2 |    2015 |     1
 (4 rows)
 
 -- basic usage with 3 columns
@@ -136,6 +136,35 @@ GROUP BY v, h ORDER BY h,v
     |        |    |    | -3 | 
 (3 rows)
 
+\pset null ''
+-- boolean display
+\pset display_true 'Aye'
+\pset display_false 'Nay'
+\pset null 'Wut'
+with rows (display_bools, col_key, val) as (values
+	(false, false, false),
+	(true, true, true),
+	(null, null, null),
+	(null, true, false),
+	(null, false, true),
+	(true, null, false),
+	(false, null, true)
+) select * from rows
+ \crosstabview display_bools col_key val
+ display_bools | Nay | Aye | Wut 
+---------------+-----+-----+-----
+ Nay           | Nay |     | Aye
+ Aye           |     | Aye | Nay
+ Wut           | Aye | Nay | Wut
+(3 rows)
+
+with rows (tst, col, val) as (values
+	(true, null, 42), (true, null, 142857)
+) select * from rows
+ \crosstabview tst col
+\crosstabview: query result contains multiple data values for row "Aye", column "Wut"
+\pset display_true 't'
+\pset display_false 'f'
 \pset null ''
 -- refer to columns by position
 SELECT v,h,string_agg(i::text, E'\n'), string_agg(c, E'\n')

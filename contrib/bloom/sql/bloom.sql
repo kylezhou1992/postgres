@@ -5,8 +5,9 @@ CREATE TABLE tst (
 	t	text
 );
 
-INSERT INTO tst SELECT i%10, substr(md5(i::text), 1, 1) FROM generate_series(1,2000) i;
+INSERT INTO tst SELECT i%10, substr(encode(sha256(i::text::bytea), 'hex'), 1, 1) FROM generate_series(1,2000) i;
 CREATE INDEX bloomidx ON tst USING bloom (i, t) WITH (col1 = 3);
+ALTER INDEX bloomidx SET (length=80);
 
 SET enable_seqscan=on;
 SET enable_bitmapscan=off;
@@ -29,7 +30,7 @@ SELECT count(*) FROM tst WHERE t = '5';
 SELECT count(*) FROM tst WHERE i = 7 AND t = '5';
 
 DELETE FROM tst;
-INSERT INTO tst SELECT i%10, substr(md5(i::text), 1, 1) FROM generate_series(1,2000) i;
+INSERT INTO tst SELECT i%10, substr(encode(sha256(i::text::bytea), 'hex'), 1, 1) FROM generate_series(1,2000) i;
 VACUUM ANALYZE tst;
 
 SELECT count(*) FROM tst WHERE i = 7;
@@ -38,7 +39,7 @@ SELECT count(*) FROM tst WHERE i = 7 AND t = '5';
 
 DELETE FROM tst WHERE i > 1 OR t = '5';
 VACUUM tst;
-INSERT INTO tst SELECT i%10, substr(md5(i::text), 1, 1) FROM generate_series(1,2000) i;
+INSERT INTO tst SELECT i%10, substr(encode(sha256(i::text::bytea), 'hex'), 1, 1) FROM generate_series(1,2000) i;
 
 SELECT count(*) FROM tst WHERE i = 7;
 SELECT count(*) FROM tst WHERE t = '5';
@@ -57,7 +58,7 @@ CREATE UNLOGGED TABLE tstu (
 	t	text
 );
 
-INSERT INTO tstu SELECT i%10, substr(md5(i::text), 1, 1) FROM generate_series(1,2000) i;
+INSERT INTO tstu SELECT i%10, substr(encode(sha256(i::text::bytea), 'hex'), 1, 1) FROM generate_series(1,2000) i;
 CREATE INDEX bloomidxu ON tstu USING bloom (i, t) WITH (col2 = 4);
 
 SET enable_seqscan=off;

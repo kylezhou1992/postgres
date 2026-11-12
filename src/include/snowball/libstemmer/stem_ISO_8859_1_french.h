@@ -1,5 +1,4 @@
-/* This file was generated automatically by the Snowball to ISO C compiler */
-/* http://snowballstem.org/ */
+/* Generated from french.sbl by Snowball 3.0.0 - https://snowballstem.org/ */
 
 #ifdef __cplusplus
 extern "C" {
@@ -13,4 +12,3 @@ extern int french_ISO_8859_1_stem(struct SN_env * z);
 #ifdef __cplusplus
 }
 #endif
-

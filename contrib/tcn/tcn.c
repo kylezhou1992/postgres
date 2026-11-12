@@ -3,7 +3,7 @@
  * tcn.c
  *	  triggered change notification support for PostgreSQL
  *
- * Portions Copyright (c) 2011-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2011-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,14 +16,17 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
-#include "executor/spi.h"
 #include "commands/async.h"
 #include "commands/trigger.h"
+#include "executor/spi.h"
 #include "lib/stringinfo.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "tcn",
+					.version = PG_VERSION
+);
 
 /*
  * Copy from s (for source) to r (for result), wrapping with q (quote)
@@ -63,12 +66,13 @@ triggered_change_notification(PG_FUNCTION_ARGS)
 	TupleDesc	tupdesc;
 	char	   *channel;
 	char		operation;
-	StringInfo	payload = makeStringInfo();
+	StringInfoData payload;
 	bool		foundPK;
 
 	List	   *indexoidlist;
 	ListCell   *indexoidscan;
 
+	initStringInfo(&payload);
 	/* make sure it's called as a trigger */
 	if (!CALLED_AS_TRIGGER(fcinfo))
 		ereport(ERROR,
@@ -136,7 +140,7 @@ triggered_change_notification(PG_FUNCTION_ARGS)
 			elog(ERROR, "cache lookup failed for index %u", indexoid);
 		index = (Form_pg_index) GETSTRUCT(indexTuple);
 		/* we're only interested if it is the primary key and valid */
-		if (index->indisprimary && IndexIsValid(index))
+		if (index->indisprimary && index->indisvalid)
 		{
 			int			indnkeyatts = index->indnkeyatts;
 
@@ -146,22 +150,22 @@ triggered_change_notification(PG_FUNCTION_ARGS)
 
 				foundPK = true;
 
-				strcpy_quoted(payload, RelationGetRelationName(rel), '"');
-				appendStringInfoCharMacro(payload, ',');
-				appendStringInfoCharMacro(payload, operation);
+				strcpy_quoted(&payload, RelationGetRelationName(rel), '"');
+				appendStringInfoCharMacro(&payload, ',');
+				appendStringInfoCharMacro(&payload, operation);
 
 				for (i = 0; i < indnkeyatts; i++)
 				{
 					int			colno = index->indkey.values[i];
 					Form_pg_attribute attr = TupleDescAttr(tupdesc, colno - 1);
 
-					appendStringInfoCharMacro(payload, ',');
-					strcpy_quoted(payload, NameStr(attr->attname), '"');
-					appendStringInfoCharMacro(payload, '=');
-					strcpy_quoted(payload, SPI_getvalue(trigtuple, tupdesc, colno), '\'');
+					appendStringInfoCharMacro(&payload, ',');
+					strcpy_quoted(&payload, NameStr(attr->attname), '"');
+					appendStringInfoCharMacro(&payload, '=');
+					strcpy_quoted(&payload, SPI_getvalue(trigtuple, tupdesc, colno), '\'');
 				}
 
-				Async_Notify(channel, payload->data);
+				Async_Notify(channel, payload.data);
 			}
 			ReleaseSysCache(indexTuple);
 			break;

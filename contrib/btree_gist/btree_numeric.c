@@ -1,27 +1,27 @@
 /*
  * contrib/btree_gist/btree_numeric.c
+ *
+ * Support for numeric data type.
  */
 #include "postgres.h"
 
-#include "btree_gist.h"
-
-#include <math.h>
 #include <float.h>
 
+#include "btree_gist.h"
 #include "btree_utils_var.h"
 #include "utils/builtins.h"
 #include "utils/numeric.h"
 #include "utils/rel.h"
+#include "utils/sortsupport.h"
 
-/*
-** Bytea ops
-*/
+/* GiST support functions */
 PG_FUNCTION_INFO_V1(gbt_numeric_compress);
 PG_FUNCTION_INFO_V1(gbt_numeric_union);
 PG_FUNCTION_INFO_V1(gbt_numeric_picksplit);
 PG_FUNCTION_INFO_V1(gbt_numeric_consistent);
 PG_FUNCTION_INFO_V1(gbt_numeric_penalty);
 PG_FUNCTION_INFO_V1(gbt_numeric_same);
+PG_FUNCTION_INFO_V1(gbt_numeric_sortsupport);
 
 
 /* define for comparison */
@@ -75,11 +75,15 @@ gbt_numeric_cmp(const void *a, const void *b, Oid collation, FmgrInfo *flinfo)
 }
 
 
+/*
+ * We could conceivably support internal-key truncation here, but it would
+ * require custom truncation code, and most values wouldn't be long enough
+ * to make it worthwhile.
+ */
 static const gbtree_vinfo tinfo =
 {
 	gbt_t_numeric,
-	0,
-	false,
+	false,						/* no truncation permitted */
 	gbt_numeric_gt,
 	gbt_numeric_ge,
 	gbt_numeric_eq,
@@ -91,9 +95,8 @@ static const gbtree_vinfo tinfo =
 
 
 /**************************************************
- * Text ops
+ * GiST support functions
  **************************************************/
-
 
 Datum
 gbt_numeric_compress(PG_FUNCTION_ARGS)
@@ -103,16 +106,15 @@ gbt_numeric_compress(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(gbt_var_compress(entry, &tinfo));
 }
 
-
-
 Datum
 gbt_numeric_consistent(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
-	void	   *query = (void *) DatumGetNumeric(PG_GETARG_DATUM(1));
+	void	   *query = DatumGetNumeric(PG_GETARG_DATUM(1));
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
-
-	/* Oid		subtype = PG_GETARG_OID(3); */
+#ifdef NOT_USED
+	Oid			subtype = PG_GETARG_OID(3);
+#endif
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 	bool		retval;
 	GBT_VARKEY *key = (GBT_VARKEY *) DatumGetPointer(entry->key);
@@ -126,8 +128,6 @@ gbt_numeric_consistent(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(retval);
 }
 
-
-
 Datum
 gbt_numeric_union(PG_FUNCTION_ARGS)
 {
@@ -137,7 +137,6 @@ gbt_numeric_union(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(gbt_var_union(entryvec, size, PG_GET_COLLATION(),
 									&tinfo, fcinfo->flinfo));
 }
-
 
 Datum
 gbt_numeric_same(PG_FUNCTION_ARGS)
@@ -149,7 +148,6 @@ gbt_numeric_same(PG_FUNCTION_ARGS)
 	*result = gbt_var_same(d1, d2, PG_GET_COLLATION(), &tinfo, fcinfo->flinfo);
 	PG_RETURN_POINTER(result);
 }
-
 
 Datum
 gbt_numeric_penalty(PG_FUNCTION_ARGS)
@@ -175,23 +173,17 @@ gbt_numeric_penalty(PG_FUNCTION_ARGS)
 	ok = gbt_var_key_readable(org);
 	uk = gbt_var_key_readable((GBT_VARKEY *) DatumGetPointer(uni));
 
-	us = DatumGetNumeric(DirectFunctionCall2(
-											 numeric_sub,
+	us = DatumGetNumeric(DirectFunctionCall2(numeric_sub,
 											 PointerGetDatum(uk.upper),
-											 PointerGetDatum(uk.lower)
-											 ));
+											 PointerGetDatum(uk.lower)));
 
-	os = DatumGetNumeric(DirectFunctionCall2(
-											 numeric_sub,
+	os = DatumGetNumeric(DirectFunctionCall2(numeric_sub,
 											 PointerGetDatum(ok.upper),
-											 PointerGetDatum(ok.lower)
-											 ));
+											 PointerGetDatum(ok.lower)));
 
-	ds = DatumGetNumeric(DirectFunctionCall2(
-											 numeric_sub,
+	ds = DatumGetNumeric(DirectFunctionCall2(numeric_sub,
 											 NumericGetDatum(us),
-											 NumericGetDatum(os)
-											 ));
+											 NumericGetDatum(os)));
 
 	if (numeric_is_nan(us))
 	{
@@ -202,18 +194,16 @@ gbt_numeric_penalty(PG_FUNCTION_ARGS)
 	}
 	else
 	{
-		Numeric		nul = DatumGetNumeric(DirectFunctionCall1(int4_numeric, Int32GetDatum(0)));
+		Numeric		nul = int64_to_numeric(0);
 
 		*result = 0.0;
 
-		if (DirectFunctionCall2(numeric_gt, NumericGetDatum(ds), NumericGetDatum(nul)))
+		if (DatumGetBool(DirectFunctionCall2(numeric_gt, NumericGetDatum(ds), NumericGetDatum(nul))))
 		{
 			*result += FLT_MIN;
-			os = DatumGetNumeric(DirectFunctionCall2(
-													 numeric_div,
+			os = DatumGetNumeric(DirectFunctionCall2(numeric_div,
 													 NumericGetDatum(ds),
-													 NumericGetDatum(us)
-													 ));
+													 NumericGetDatum(us)));
 			*result += (float4) DatumGetFloat8(DirectFunctionCall1(numeric_float8_no_overflow, NumericGetDatum(os)));
 		}
 	}
@@ -224,8 +214,6 @@ gbt_numeric_penalty(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(result);
 }
 
-
-
 Datum
 gbt_numeric_picksplit(PG_FUNCTION_ARGS)
 {
@@ -235,4 +223,36 @@ gbt_numeric_picksplit(PG_FUNCTION_ARGS)
 	gbt_var_picksplit(entryvec, v, PG_GET_COLLATION(),
 					  &tinfo, fcinfo->flinfo);
 	PG_RETURN_POINTER(v);
+}
+
+static int
+gbt_numeric_ssup_cmp(Datum x, Datum y, SortSupport ssup)
+{
+	GBT_VARKEY *key1 = PG_DETOAST_DATUM(x);
+	GBT_VARKEY *key2 = PG_DETOAST_DATUM(y);
+
+	GBT_VARKEY_R arg1 = gbt_var_key_readable(key1);
+	GBT_VARKEY_R arg2 = gbt_var_key_readable(key2);
+	Datum		result;
+
+	/* for leaf items we expect lower == upper, so only compare lower */
+	result = DirectFunctionCall2(numeric_cmp,
+								 PointerGetDatum(arg1.lower),
+								 PointerGetDatum(arg2.lower));
+
+	GBT_FREE_IF_COPY(key1, x);
+	GBT_FREE_IF_COPY(key2, y);
+
+	return DatumGetInt32(result);
+}
+
+Datum
+gbt_numeric_sortsupport(PG_FUNCTION_ARGS)
+{
+	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
+
+	ssup->comparator = gbt_numeric_ssup_cmp;
+	ssup->ssup_extra = NULL;
+
+	PG_RETURN_VOID();
 }

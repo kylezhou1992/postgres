@@ -4,7 +4,7 @@
  *	  implementation of insert algorithm
  *
  *
- * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -19,6 +19,8 @@
 #include "access/spgist_private.h"
 #include "access/spgxlog.h"
 #include "access/xloginsert.h"
+#include "common/int.h"
+#include "common/pg_prng.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
@@ -87,7 +89,7 @@ addNode(SpGistState *state, SpGistInnerTuple tuple, Datum label, int offset)
 	else if (offset > tuple->nNodes)
 		elog(ERROR, "invalid offset for adding node to SPGiST inner tuple");
 
-	nodes = palloc(sizeof(SpGistNodeTuple) * (tuple->nNodes + 1));
+	nodes = palloc_array(SpGistNodeTuple, tuple->nNodes + 1);
 	SGITITERATE(tuple, i, node)
 	{
 		if (i < offset)
@@ -109,9 +111,7 @@ addNode(SpGistState *state, SpGistInnerTuple tuple, Datum label, int offset)
 static int
 cmpOffsetNumbers(const void *a, const void *b)
 {
-	if (*(const OffsetNumber *) a == *(const OffsetNumber *) b)
-		return 0;
-	return (*(const OffsetNumber *) a > *(const OffsetNumber *) b) ? 1 : -1;
+	return pg_cmp_u16(*(const OffsetNumber *) a, *(const OffsetNumber *) b);
 }
 
 /*
@@ -165,8 +165,7 @@ spgPageIndexMultiDelete(SpGistState *state, Page page,
 		if (tuple == NULL || tuple->tupstate != tupstate)
 			tuple = spgFormDeadTuple(state, tupstate, blkno, offnum);
 
-		if (PageAddItem(page, (Item) tuple, tuple->size,
-						itemno, false, false) != itemno)
+		if (PageAddItem(page, tuple, tuple->size, itemno, false, false) != itemno)
 			elog(ERROR, "failed to add item of size %u to SPGiST index page",
 				 tuple->size);
 
@@ -220,9 +219,9 @@ addLeafTuple(Relation index, SpGistState *state, SpGistLeafTuple leafTuple,
 		SpGistBlockIsRoot(current->blkno))
 	{
 		/* Tuple is not part of a chain */
-		leafTuple->nextOffset = InvalidOffsetNumber;
+		SGLT_SET_NEXTOFFSET(leafTuple, InvalidOffsetNumber);
 		current->offnum = SpGistPageAddNewItem(state, current->page,
-											   (Item) leafTuple, leafTuple->size,
+											   leafTuple, leafTuple->size,
 											   NULL, false);
 
 		xlrec.offnumLeaf = current->offnum;
@@ -253,9 +252,9 @@ addLeafTuple(Relation index, SpGistState *state, SpGistLeafTuple leafTuple,
 											 PageGetItemId(current->page, current->offnum));
 		if (head->tupstate == SPGIST_LIVE)
 		{
-			leafTuple->nextOffset = head->nextOffset;
+			SGLT_SET_NEXTOFFSET(leafTuple, SGLT_GET_NEXTOFFSET(head));
 			offnum = SpGistPageAddNewItem(state, current->page,
-										  (Item) leafTuple, leafTuple->size,
+										  leafTuple, leafTuple->size,
 										  NULL, false);
 
 			/*
@@ -264,17 +263,17 @@ addLeafTuple(Relation index, SpGistState *state, SpGistLeafTuple leafTuple,
 			 */
 			head = (SpGistLeafTuple) PageGetItem(current->page,
 												 PageGetItemId(current->page, current->offnum));
-			head->nextOffset = offnum;
+			SGLT_SET_NEXTOFFSET(head, offnum);
 
 			xlrec.offnumLeaf = offnum;
 			xlrec.offnumHeadLeaf = current->offnum;
 		}
 		else if (head->tupstate == SPGIST_DEAD)
 		{
-			leafTuple->nextOffset = InvalidOffsetNumber;
+			SGLT_SET_NEXTOFFSET(leafTuple, InvalidOffsetNumber);
 			PageIndexTupleDelete(current->page, current->offnum);
 			if (PageAddItem(current->page,
-							(Item) leafTuple, leafTuple->size,
+							leafTuple, leafTuple->size,
 							current->offnum, false, false) != current->offnum)
 				elog(ERROR, "failed to add item of size %u to SPGiST index page",
 					 leafTuple->size);
@@ -289,14 +288,14 @@ addLeafTuple(Relation index, SpGistState *state, SpGistLeafTuple leafTuple,
 
 	MarkBufferDirty(current->buffer);
 
-	if (RelationNeedsWAL(index))
+	if (RelationNeedsWAL(index) && !state->isBuild)
 	{
 		XLogRecPtr	recptr;
 		int			flags;
 
 		XLogBeginInsert();
-		XLogRegisterData((char *) &xlrec, sizeof(xlrec));
-		XLogRegisterData((char *) leafTuple, leafTuple->size);
+		XLogRegisterData(&xlrec, sizeof(xlrec));
+		XLogRegisterData(leafTuple, leafTuple->size);
 
 		flags = REGBUF_STANDARD;
 		if (xlrec.newPage)
@@ -362,13 +361,13 @@ checkSplitConditions(Relation index, SpGistState *state,
 		{
 			/* We could see a DEAD tuple as first/only chain item */
 			Assert(i == current->offnum);
-			Assert(it->nextOffset == InvalidOffsetNumber);
+			Assert(SGLT_GET_NEXTOFFSET(it) == InvalidOffsetNumber);
 			/* Don't count it in result, because it won't go to other page */
 		}
 		else
 			elog(ERROR, "unexpected SPGiST tuple state: %d", it->tupstate);
 
-		i = it->nextOffset;
+		i = SGLT_GET_NEXTOFFSET(it);
 	}
 
 	*nToSplit = n;
@@ -394,7 +393,6 @@ moveLeafs(Relation index, SpGistState *state,
 				size;
 	Buffer		nbuf;
 	Page		npage;
-	SpGistLeafTuple it;
 	OffsetNumber r = InvalidOffsetNumber,
 				startOffset = InvalidOffsetNumber;
 	bool		replaceDead = false;
@@ -411,8 +409,8 @@ moveLeafs(Relation index, SpGistState *state,
 
 	/* Locate the tuples to be moved, and count up the space needed */
 	i = PageGetMaxOffsetNumber(current->page);
-	toDelete = (OffsetNumber *) palloc(sizeof(OffsetNumber) * i);
-	toInsert = (OffsetNumber *) palloc(sizeof(OffsetNumber) * (i + 1));
+	toDelete = palloc_array(OffsetNumber, i);
+	toInsert = palloc_array(OffsetNumber, i + 1);
 
 	size = newLeafTuple->size + sizeof(ItemIdData);
 
@@ -437,7 +435,7 @@ moveLeafs(Relation index, SpGistState *state,
 		{
 			/* We could see a DEAD tuple as first/only chain item */
 			Assert(i == current->offnum);
-			Assert(it->nextOffset == InvalidOffsetNumber);
+			Assert(SGLT_GET_NEXTOFFSET(it) == InvalidOffsetNumber);
 			/* We don't want to move it, so don't count it in size */
 			toDelete[nDelete] = i;
 			nDelete++;
@@ -446,7 +444,7 @@ moveLeafs(Relation index, SpGistState *state,
 		else
 			elog(ERROR, "unexpected SPGiST tuple state: %d", it->tupstate);
 
-		i = it->nextOffset;
+		i = SGLT_GET_NEXTOFFSET(it);
 	}
 
 	/* Find a leaf page that will hold them */
@@ -466,6 +464,8 @@ moveLeafs(Relation index, SpGistState *state,
 	{
 		for (i = 0; i < nDelete; i++)
 		{
+			SpGistLeafTuple it;
+
 			it = (SpGistLeafTuple) PageGetItem(current->page,
 											   PageGetItemId(current->page, toDelete[i]));
 			Assert(it->tupstate == SPGIST_LIVE);
@@ -475,10 +475,9 @@ moveLeafs(Relation index, SpGistState *state,
 			 * don't care).  We're modifying the tuple on the source page
 			 * here, but it's okay since we're about to delete it.
 			 */
-			it->nextOffset = r;
+			SGLT_SET_NEXTOFFSET(it, r);
 
-			r = SpGistPageAddNewItem(state, npage, (Item) it, it->size,
-									 &startOffset, false);
+			r = SpGistPageAddNewItem(state, npage, it, it->size, &startOffset, false);
 
 			toInsert[nInsert] = r;
 			nInsert++;
@@ -490,10 +489,8 @@ moveLeafs(Relation index, SpGistState *state,
 	}
 
 	/* add the new tuple as well */
-	newLeafTuple->nextOffset = r;
-	r = SpGistPageAddNewItem(state, npage,
-							 (Item) newLeafTuple, newLeafTuple->size,
-							 &startOffset, false);
+	SGLT_SET_NEXTOFFSET(newLeafTuple, r);
+	r = SpGistPageAddNewItem(state, npage, newLeafTuple, newLeafTuple->size, &startOffset, false);
 	toInsert[nInsert] = r;
 	nInsert++;
 	memcpy(leafptr, newLeafTuple, newLeafTuple->size);
@@ -516,7 +513,7 @@ moveLeafs(Relation index, SpGistState *state,
 	MarkBufferDirty(current->buffer);
 	MarkBufferDirty(nbuf);
 
-	if (RelationNeedsWAL(index))
+	if (RelationNeedsWAL(index) && !state->isBuild)
 	{
 		XLogRecPtr	recptr;
 
@@ -531,12 +528,12 @@ moveLeafs(Relation index, SpGistState *state,
 		xlrec.nodeI = parent->node;
 
 		XLogBeginInsert();
-		XLogRegisterData((char *) &xlrec, SizeOfSpgxlogMoveLeafs);
-		XLogRegisterData((char *) toDelete,
+		XLogRegisterData(&xlrec, SizeOfSpgxlogMoveLeafs);
+		XLogRegisterData(toDelete,
 						 sizeof(OffsetNumber) * nDelete);
-		XLogRegisterData((char *) toInsert,
+		XLogRegisterData(toInsert,
 						 sizeof(OffsetNumber) * nInsert);
-		XLogRegisterData((char *) leafdata, leafptr - leafdata);
+		XLogRegisterData(leafdata, leafptr - leafdata);
 
 		XLogRegisterBuffer(0, current->buffer, REGBUF_STANDARD);
 		XLogRegisterBuffer(1, nbuf, REGBUF_STANDARD | (xlrec.newPage ? REGBUF_WILL_INIT : 0));
@@ -637,7 +634,7 @@ checkAllTheSame(spgPickSplitIn *in, spgPickSplitOut *out, bool tooBig,
 	{
 		Datum		theLabel = out->nodeLabels[theNode];
 
-		out->nodeLabels = (Datum *) palloc(sizeof(Datum) * out->nNodes);
+		out->nodeLabels = palloc_array(Datum, out->nNodes);
 		for (i = 0; i < out->nNodes; i++)
 			out->nodeLabels[i] = theLabel;
 	}
@@ -669,7 +666,8 @@ checkAllTheSame(spgPickSplitIn *in, spgPickSplitOut *out, bool tooBig,
  * will eventually terminate if lack of balance is the issue.  If the tuple
  * is too big, we assume that repeated picksplit operations will eventually
  * make it small enough by repeated prefix-stripping.  A broken opclass could
- * make this an infinite loop, though.
+ * make this an infinite loop, though, so spgdoinsert() checks that the
+ * leaf datums get smaller each time.
  */
 static bool
 doPickSplit(Relation index, SpGistState *state,
@@ -690,14 +688,16 @@ doPickSplit(Relation index, SpGistState *state,
 			   *nodes;
 	Buffer		newInnerBuffer,
 				newLeafBuffer;
-	ItemPointerData *heapPtrs;
 	uint8	   *leafPageSelect;
 	int		   *leafSizes;
 	OffsetNumber *toDelete;
 	OffsetNumber *toInsert;
 	OffsetNumber redirectTuplePos = InvalidOffsetNumber;
 	OffsetNumber startOffsets[2];
+	SpGistLeafTuple *oldLeafs;
 	SpGistLeafTuple *newLeafs;
+	Datum		leafDatums[INDEX_MAX_KEYS];
+	bool		leafIsnulls[INDEX_MAX_KEYS];
 	int			spaceToDelete;
 	int			currentFreeSpace;
 	int			totalLeafSizes;
@@ -717,12 +717,12 @@ doPickSplit(Relation index, SpGistState *state,
 	 */
 	max = PageGetMaxOffsetNumber(current->page);
 	n = max + 1;
-	in.datums = (Datum *) palloc(sizeof(Datum) * n);
-	heapPtrs = (ItemPointerData *) palloc(sizeof(ItemPointerData) * n);
-	toDelete = (OffsetNumber *) palloc(sizeof(OffsetNumber) * n);
-	toInsert = (OffsetNumber *) palloc(sizeof(OffsetNumber) * n);
-	newLeafs = (SpGistLeafTuple *) palloc(sizeof(SpGistLeafTuple) * n);
-	leafPageSelect = (uint8 *) palloc(sizeof(uint8) * n);
+	in.datums = palloc_array(Datum, n);
+	toDelete = palloc_array(OffsetNumber, n);
+	toInsert = palloc_array(OffsetNumber, n);
+	oldLeafs = palloc_array(SpGistLeafTuple, n);
+	newLeafs = palloc_array(SpGistLeafTuple, n);
+	leafPageSelect = palloc_array(uint8, n);
 
 	STORE_STATE(state, xlrec.stateSrc);
 
@@ -731,13 +731,6 @@ doPickSplit(Relation index, SpGistState *state,
 	 * also, count up the amount of space that will be freed from current.
 	 * (Note that in the non-root case, we won't actually delete the old
 	 * tuples, only replace them with redirects or placeholders.)
-	 *
-	 * Note: the SGLTDATUM calls here are safe even when dealing with a nulls
-	 * page.  For a pass-by-value data type we will fetch a word that must
-	 * exist even though it may contain garbage (because of the fact that leaf
-	 * tuples must have size at least SGDTSIZE).  For a pass-by-reference type
-	 * we are just computing a pointer that isn't going to get dereferenced.
-	 * So it's not worth guarding the calls with isNulls checks.
 	 */
 	nToInsert = 0;
 	nToDelete = 0;
@@ -757,8 +750,9 @@ doPickSplit(Relation index, SpGistState *state,
 											   PageGetItemId(current->page, i));
 			if (it->tupstate == SPGIST_LIVE)
 			{
-				in.datums[nToInsert] = SGLTDATUM(it, state);
-				heapPtrs[nToInsert] = it->heapPtr;
+				in.datums[nToInsert] =
+					isNulls ? (Datum) 0 : SGLTDATUM(it, state);
+				oldLeafs[nToInsert] = it;
 				nToInsert++;
 				toDelete[nToDelete] = i;
 				nToDelete++;
@@ -782,8 +776,9 @@ doPickSplit(Relation index, SpGistState *state,
 											   PageGetItemId(current->page, i));
 			if (it->tupstate == SPGIST_LIVE)
 			{
-				in.datums[nToInsert] = SGLTDATUM(it, state);
-				heapPtrs[nToInsert] = it->heapPtr;
+				in.datums[nToInsert] =
+					isNulls ? (Datum) 0 : SGLTDATUM(it, state);
+				oldLeafs[nToInsert] = it;
 				nToInsert++;
 				toDelete[nToDelete] = i;
 				nToDelete++;
@@ -795,7 +790,7 @@ doPickSplit(Relation index, SpGistState *state,
 			{
 				/* We could see a DEAD tuple as first/only chain item */
 				Assert(i == current->offnum);
-				Assert(it->nextOffset == InvalidOffsetNumber);
+				Assert(SGLT_GET_NEXTOFFSET(it) == InvalidOffsetNumber);
 				toDelete[nToDelete] = i;
 				nToDelete++;
 				/* replacing it with redirect will save no space */
@@ -803,7 +798,7 @@ doPickSplit(Relation index, SpGistState *state,
 			else
 				elog(ERROR, "unexpected SPGiST tuple state: %d", it->tupstate);
 
-			i = it->nextOffset;
+			i = SGLT_GET_NEXTOFFSET(it);
 		}
 	}
 	in.nTuples = nToInsert;
@@ -814,8 +809,9 @@ doPickSplit(Relation index, SpGistState *state,
 	 * space to include it; and in any case it has to be included in the input
 	 * for the picksplit function.  So don't increment nToInsert yet.
 	 */
-	in.datums[in.nTuples] = SGLTDATUM(newLeafTuple, state);
-	heapPtrs[in.nTuples] = newLeafTuple->heapPtr;
+	in.datums[in.nTuples] =
+		isNulls ? (Datum) 0 : SGLTDATUM(newLeafTuple, state);
+	oldLeafs[in.nTuples] = newLeafTuple;
 	in.nTuples++;
 
 	memset(&out, 0, sizeof(out));
@@ -837,9 +833,19 @@ doPickSplit(Relation index, SpGistState *state,
 		totalLeafSizes = 0;
 		for (i = 0; i < in.nTuples; i++)
 		{
-			newLeafs[i] = spgFormLeafTuple(state, heapPtrs + i,
-										   out.leafTupleDatums[i],
-										   false);
+			if (state->leafTupDesc->natts > 1)
+				spgDeformLeafTuple(oldLeafs[i],
+								   state->leafTupDesc,
+								   leafDatums,
+								   leafIsnulls,
+								   isNulls);
+
+			leafDatums[spgKeyColumn] = out.leafTupleDatums[i];
+			leafIsnulls[spgKeyColumn] = false;
+
+			newLeafs[i] = spgFormLeafTuple(state, &oldLeafs[i]->heapPtr,
+										   leafDatums,
+										   leafIsnulls);
 			totalLeafSizes += newLeafs[i]->size + sizeof(ItemIdData);
 		}
 	}
@@ -852,7 +858,7 @@ doPickSplit(Relation index, SpGistState *state,
 		out.hasPrefix = false;
 		out.nNodes = 1;
 		out.nodeLabels = NULL;
-		out.mapTuplesToNodes = palloc0(sizeof(int) * in.nTuples);
+		out.mapTuplesToNodes = palloc0_array(int, in.nTuples);
 
 		/*
 		 * Form new leaf tuples and count up the total space needed.
@@ -860,9 +866,22 @@ doPickSplit(Relation index, SpGistState *state,
 		totalLeafSizes = 0;
 		for (i = 0; i < in.nTuples; i++)
 		{
-			newLeafs[i] = spgFormLeafTuple(state, heapPtrs + i,
-										   (Datum) 0,
-										   true);
+			if (state->leafTupDesc->natts > 1)
+				spgDeformLeafTuple(oldLeafs[i],
+								   state->leafTupDesc,
+								   leafDatums,
+								   leafIsnulls,
+								   isNulls);
+
+			/*
+			 * Nulls tree can contain only null key values.
+			 */
+			leafDatums[spgKeyColumn] = (Datum) 0;
+			leafIsnulls[spgKeyColumn] = true;
+
+			newLeafs[i] = spgFormLeafTuple(state, &oldLeafs[i]->heapPtr,
+										   leafDatums,
+										   leafIsnulls);
 			totalLeafSizes += newLeafs[i]->size + sizeof(ItemIdData);
 		}
 	}
@@ -895,8 +914,8 @@ doPickSplit(Relation index, SpGistState *state,
 	 * out.nNodes with a value larger than the number of tuples on the input
 	 * page, we can't allocate these arrays before here.
 	 */
-	nodes = (SpGistNodeTuple *) palloc(sizeof(SpGistNodeTuple) * out.nNodes);
-	leafSizes = (int *) palloc0(sizeof(int) * out.nNodes);
+	nodes = palloc_array(SpGistNodeTuple, out.nNodes);
+	leafSizes = palloc0_array(int, out.nNodes);
 
 	/*
 	 * Form nodes of inner tuple and inner tuple itself
@@ -1035,7 +1054,7 @@ doPickSplit(Relation index, SpGistState *state,
 		 * do so, even if totalLeafSizes is less than the available space,
 		 * because we can't split a group across pages.
 		 */
-		nodePageSelect = (uint8 *) palloc(sizeof(uint8) * out.nNodes);
+		nodePageSelect = palloc_array(uint8, out.nNodes);
 
 		curspace = currentFreeSpace;
 		newspace = PageGetExactFreeSpace(BufferGetPage(newLeafBuffer));
@@ -1196,14 +1215,14 @@ doPickSplit(Relation index, SpGistState *state,
 		if (ItemPointerIsValid(&nodes[n]->t_tid))
 		{
 			Assert(ItemPointerGetBlockNumber(&nodes[n]->t_tid) == leafBlock);
-			it->nextOffset = ItemPointerGetOffsetNumber(&nodes[n]->t_tid);
+			SGLT_SET_NEXTOFFSET(it, ItemPointerGetOffsetNumber(&nodes[n]->t_tid));
 		}
 		else
-			it->nextOffset = InvalidOffsetNumber;
+			SGLT_SET_NEXTOFFSET(it, InvalidOffsetNumber);
 
 		/* Insert it on page */
 		newoffset = SpGistPageAddNewItem(state, BufferGetPage(leafBuffer),
-										 (Item) it, it->size,
+										 it, it->size,
 										 &startOffsets[leafPageSelect[i]],
 										 false);
 		toInsert[i] = newoffset;
@@ -1245,7 +1264,7 @@ doPickSplit(Relation index, SpGistState *state,
 		current->page = parent->page;
 		xlrec.offnumInner = current->offnum =
 			SpGistPageAddNewItem(state, current->page,
-								 (Item) innerTuple, innerTuple->size,
+								 innerTuple, innerTuple->size,
 								 NULL, false);
 
 		/*
@@ -1279,7 +1298,7 @@ doPickSplit(Relation index, SpGistState *state,
 		current->page = BufferGetPage(current->buffer);
 		xlrec.offnumInner = current->offnum =
 			SpGistPageAddNewItem(state, current->page,
-								 (Item) innerTuple, innerTuple->size,
+								 innerTuple, innerTuple->size,
 								 NULL, false);
 
 		/* Done modifying new current buffer, mark it dirty */
@@ -1317,7 +1336,7 @@ doPickSplit(Relation index, SpGistState *state,
 		xlrec.innerIsParent = false;
 
 		xlrec.offnumInner = current->offnum =
-			PageAddItem(current->page, (Item) innerTuple, innerTuple->size,
+			PageAddItem(current->page, innerTuple, innerTuple->size,
 						InvalidOffsetNumber, false, false);
 		if (current->offnum != FirstOffsetNumber)
 			elog(ERROR, "failed to add item of size %u to SPGiST index page",
@@ -1334,7 +1353,7 @@ doPickSplit(Relation index, SpGistState *state,
 		saveCurrent.buffer = InvalidBuffer;
 	}
 
-	if (RelationNeedsWAL(index))
+	if (RelationNeedsWAL(index) && !state->isBuild)
 	{
 		XLogRecPtr	recptr;
 		int			flags;
@@ -1342,15 +1361,15 @@ doPickSplit(Relation index, SpGistState *state,
 		XLogBeginInsert();
 
 		xlrec.nInsert = nToInsert;
-		XLogRegisterData((char *) &xlrec, SizeOfSpgxlogPickSplit);
+		XLogRegisterData(&xlrec, SizeOfSpgxlogPickSplit);
 
-		XLogRegisterData((char *) toDelete,
+		XLogRegisterData(toDelete,
 						 sizeof(OffsetNumber) * xlrec.nDelete);
-		XLogRegisterData((char *) toInsert,
+		XLogRegisterData(toInsert,
 						 sizeof(OffsetNumber) * xlrec.nInsert);
-		XLogRegisterData((char *) leafPageSelect,
+		XLogRegisterData(leafPageSelect,
 						 sizeof(uint8) * xlrec.nInsert);
-		XLogRegisterData((char *) innerTuple, innerTuple->size);
+		XLogRegisterData(innerTuple, innerTuple->size);
 		XLogRegisterData(leafdata, leafptr - leafdata);
 
 		/* Old leaf page */
@@ -1524,20 +1543,20 @@ spgAddNodeAction(Relation index, SpGistState *state,
 
 		PageIndexTupleDelete(current->page, current->offnum);
 		if (PageAddItem(current->page,
-						(Item) newInnerTuple, newInnerTuple->size,
+						newInnerTuple, newInnerTuple->size,
 						current->offnum, false, false) != current->offnum)
 			elog(ERROR, "failed to add item of size %u to SPGiST index page",
 				 newInnerTuple->size);
 
 		MarkBufferDirty(current->buffer);
 
-		if (RelationNeedsWAL(index))
+		if (RelationNeedsWAL(index) && !state->isBuild)
 		{
 			XLogRecPtr	recptr;
 
 			XLogBeginInsert();
-			XLogRegisterData((char *) &xlrec, sizeof(xlrec));
-			XLogRegisterData((char *) newInnerTuple, newInnerTuple->size);
+			XLogRegisterData(&xlrec, sizeof(xlrec));
+			XLogRegisterData(newInnerTuple, newInnerTuple->size);
 
 			XLogRegisterBuffer(0, current->buffer, REGBUF_STANDARD);
 
@@ -1608,7 +1627,7 @@ spgAddNodeAction(Relation index, SpGistState *state,
 		/* insert new ... */
 		xlrec.offnumNew = current->offnum =
 			SpGistPageAddNewItem(state, current->page,
-								 (Item) newInnerTuple, newInnerTuple->size,
+								 newInnerTuple, newInnerTuple->size,
 								 NULL, false);
 
 		MarkBufferDirty(current->buffer);
@@ -1631,7 +1650,7 @@ spgAddNodeAction(Relation index, SpGistState *state,
 								  current->blkno, current->offnum);
 
 		PageIndexTupleDelete(saveCurrent.page, saveCurrent.offnum);
-		if (PageAddItem(saveCurrent.page, (Item) dt, dt->size,
+		if (PageAddItem(saveCurrent.page, dt, dt->size,
 						saveCurrent.offnum,
 						false, false) != saveCurrent.offnum)
 			elog(ERROR, "failed to add item of size %u to SPGiST index page",
@@ -1644,7 +1663,7 @@ spgAddNodeAction(Relation index, SpGistState *state,
 
 		MarkBufferDirty(saveCurrent.buffer);
 
-		if (RelationNeedsWAL(index))
+		if (RelationNeedsWAL(index) && !state->isBuild)
 		{
 			XLogRecPtr	recptr;
 			int			flags;
@@ -1662,8 +1681,8 @@ spgAddNodeAction(Relation index, SpGistState *state,
 			if (xlrec.parentBlk == 2)
 				XLogRegisterBuffer(2, parent->buffer, REGBUF_STANDARD);
 
-			XLogRegisterData((char *) &xlrec, sizeof(xlrec));
-			XLogRegisterData((char *) newInnerTuple, newInnerTuple->size);
+			XLogRegisterData(&xlrec, sizeof(xlrec));
+			XLogRegisterData(newInnerTuple, newInnerTuple->size);
 
 			recptr = XLogInsert(RM_SPGIST_ID, XLOG_SPGIST_ADD_NODE);
 
@@ -1721,8 +1740,7 @@ spgSplitNodeAction(Relation index, SpGistState *state,
 	 * Construct new prefix tuple with requested number of nodes.  We'll fill
 	 * in the childNodeN'th node's downlink below.
 	 */
-	nodes = (SpGistNodeTuple *) palloc(sizeof(SpGistNodeTuple) *
-									   out->result.splitTuple.prefixNNodes);
+	nodes = palloc_array(SpGistNodeTuple, out->result.splitTuple.prefixNNodes);
 
 	for (i = 0; i < out->result.splitTuple.prefixNNodes; i++)
 	{
@@ -1750,7 +1768,7 @@ spgSplitNodeAction(Relation index, SpGistState *state,
 	 * same node datums, but with the prefix specified by the picksplit
 	 * function.
 	 */
-	nodes = palloc(sizeof(SpGistNodeTuple) * innerTuple->nNodes);
+	nodes = palloc_array(SpGistNodeTuple, innerTuple->nNodes);
 	SGITITERATE(innerTuple, i, node)
 	{
 		nodes[i] = node;
@@ -1795,7 +1813,7 @@ spgSplitNodeAction(Relation index, SpGistState *state,
 	 */
 	PageIndexTupleDelete(current->page, current->offnum);
 	xlrec.offnumPrefix = PageAddItem(current->page,
-									 (Item) prefixTuple, prefixTuple->size,
+									 prefixTuple, prefixTuple->size,
 									 current->offnum, false, false);
 	if (xlrec.offnumPrefix != current->offnum)
 		elog(ERROR, "failed to add item of size %u to SPGiST index page",
@@ -1809,7 +1827,7 @@ spgSplitNodeAction(Relation index, SpGistState *state,
 		postfixBlkno = current->blkno;
 		xlrec.offnumPostfix = postfixOffset =
 			SpGistPageAddNewItem(state, current->page,
-								 (Item) postfixTuple, postfixTuple->size,
+								 postfixTuple, postfixTuple->size,
 								 NULL, false);
 		xlrec.postfixBlkSame = true;
 	}
@@ -1818,7 +1836,7 @@ spgSplitNodeAction(Relation index, SpGistState *state,
 		postfixBlkno = BufferGetBlockNumber(newBuffer);
 		xlrec.offnumPostfix = postfixOffset =
 			SpGistPageAddNewItem(state, BufferGetPage(newBuffer),
-								 (Item) postfixTuple, postfixTuple->size,
+								 postfixTuple, postfixTuple->size,
 								 NULL, false);
 		MarkBufferDirty(newBuffer);
 		xlrec.postfixBlkSame = false;
@@ -1840,14 +1858,14 @@ spgSplitNodeAction(Relation index, SpGistState *state,
 
 	MarkBufferDirty(current->buffer);
 
-	if (RelationNeedsWAL(index))
+	if (RelationNeedsWAL(index) && !state->isBuild)
 	{
 		XLogRecPtr	recptr;
 
 		XLogBeginInsert();
-		XLogRegisterData((char *) &xlrec, sizeof(xlrec));
-		XLogRegisterData((char *) prefixTuple, prefixTuple->size);
-		XLogRegisterData((char *) postfixTuple, postfixTuple->size);
+		XLogRegisterData(&xlrec, sizeof(xlrec));
+		XLogRegisterData(prefixTuple, prefixTuple->size);
+		XLogRegisterData(postfixTuple, postfixTuple->size);
 
 		XLogRegisterBuffer(0, current->buffer, REGBUF_STANDARD);
 		if (newBuffer != InvalidBuffer)
@@ -1884,16 +1902,21 @@ spgSplitNodeAction(Relation index, SpGistState *state,
  * Insert one item into the index.
  *
  * Returns true on success, false if we failed to complete the insertion
- * because of conflict with a concurrent insert.  In the latter case,
- * caller should re-call spgdoinsert() with the same args.
+ * (typically because of conflict with a concurrent insert).  In the latter
+ * case, caller should re-call spgdoinsert() with the same args.
  */
 bool
 spgdoinsert(Relation index, SpGistState *state,
-			ItemPointer heapPtr, Datum datum, bool isnull)
+			const ItemPointerData *heapPtr, const Datum *datums, const bool *isnulls)
 {
+	bool		result = true;
+	TupleDesc	leafDescriptor = state->leafTupDesc;
+	bool		isnull = isnulls[spgKeyColumn];
 	int			level = 0;
-	Datum		leafDatum;
+	Datum		leafDatums[INDEX_MAX_KEYS];
 	int			leafSize;
+	int			bestLeafSize;
+	int			numNoProgressCycles = 0;
 	SPPageDesc	current,
 				parent;
 	FmgrInfo   *procinfo = NULL;
@@ -1909,8 +1932,8 @@ spgdoinsert(Relation index, SpGistState *state,
 	 * Prepare the leaf datum to insert.
 	 *
 	 * If an optional "compress" method is provided, then call it to form the
-	 * leaf datum from the input datum.  Otherwise store the input datum as
-	 * is.  Since we don't use index_form_tuple in this AM, we have to make
+	 * leaf key datum from the input datum.  Otherwise, store the input datum
+	 * as is.  Since we don't use index_form_tuple in this AM, we have to make
 	 * sure value to be inserted is not toasted; FormIndexDatum doesn't
 	 * guarantee that.  But we assume the "compress" method to return an
 	 * untoasted value.
@@ -1922,36 +1945,52 @@ spgdoinsert(Relation index, SpGistState *state,
 			FmgrInfo   *compressProcinfo = NULL;
 
 			compressProcinfo = index_getprocinfo(index, 1, SPGIST_COMPRESS_PROC);
-			leafDatum = FunctionCall1Coll(compressProcinfo,
-										  index->rd_indcollation[0],
-										  datum);
+			leafDatums[spgKeyColumn] =
+				FunctionCall1Coll(compressProcinfo,
+								  index->rd_indcollation[spgKeyColumn],
+								  datums[spgKeyColumn]);
 		}
 		else
 		{
 			Assert(state->attLeafType.type == state->attType.type);
 
 			if (state->attType.attlen == -1)
-				leafDatum = PointerGetDatum(PG_DETOAST_DATUM(datum));
+				leafDatums[spgKeyColumn] =
+					PointerGetDatum(PG_DETOAST_DATUM(datums[spgKeyColumn]));
 			else
-				leafDatum = datum;
+				leafDatums[spgKeyColumn] = datums[spgKeyColumn];
 		}
 	}
 	else
-		leafDatum = (Datum) 0;
+		leafDatums[spgKeyColumn] = (Datum) 0;
+
+	/* Likewise, ensure that any INCLUDE values are not toasted */
+	for (int i = spgFirstIncludeColumn; i < leafDescriptor->natts; i++)
+	{
+		if (!isnulls[i])
+		{
+			if (TupleDescCompactAttr(leafDescriptor, i)->attlen == -1)
+				leafDatums[i] = PointerGetDatum(PG_DETOAST_DATUM(datums[i]));
+			else
+				leafDatums[i] = datums[i];
+		}
+		else
+			leafDatums[i] = (Datum) 0;
+	}
 
 	/*
-	 * Compute space needed for a leaf tuple containing the given datum.
-	 *
-	 * If it isn't gonna fit, and the opclass can't reduce the datum size by
-	 * suffixing, bail out now rather than getting into an endless loop.
+	 * Compute space needed for a leaf tuple containing the given data.
 	 */
-	if (!isnull)
-		leafSize = SGLTHDRSZ + sizeof(ItemIdData) +
-			SpGistGetTypeSize(&state->attLeafType, leafDatum);
-	else
-		leafSize = SGDTSIZE + sizeof(ItemIdData);
+	leafSize = SpGistGetLeafTupleSize(leafDescriptor, leafDatums, isnulls);
+	/* Account for an item pointer, too */
+	leafSize += sizeof(ItemIdData);
 
-	if (leafSize > SPGIST_PAGE_CAPACITY && !state->config.longValuesOK)
+	/*
+	 * If it isn't gonna fit, and the opclass can't reduce the datum size by
+	 * suffixing, bail out now rather than doing a lot of useless work.
+	 */
+	if (leafSize > SPGIST_PAGE_CAPACITY &&
+		(isnull || !state->config.longValuesOK))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("index row size %zu exceeds maximum %zu for index \"%s\"",
@@ -1959,6 +1998,7 @@ spgdoinsert(Relation index, SpGistState *state,
 						SPGIST_PAGE_CAPACITY - sizeof(ItemIdData),
 						RelationGetRelationName(index)),
 				 errhint("Values larger than a buffer page cannot be indexed.")));
+	bestLeafSize = leafSize;
 
 	/* Initialize "current" to the appropriate root page */
 	current.blkno = isnull ? SPGIST_NULL_BLKNO : SPGIST_ROOT_BLKNO;
@@ -1974,6 +2014,14 @@ spgdoinsert(Relation index, SpGistState *state,
 	parent.offnum = InvalidOffsetNumber;
 	parent.node = -1;
 
+	/*
+	 * Before entering the loop, try to clear any pending interrupt condition.
+	 * If a query cancel is pending, we might as well accept it now not later;
+	 * while if a non-canceling condition is pending, servicing it here avoids
+	 * having to restart the insertion and redo all the work so far.
+	 */
+	CHECK_FOR_INTERRUPTS();
+
 	for (;;)
 	{
 		bool		isNew = false;
@@ -1981,9 +2029,18 @@ spgdoinsert(Relation index, SpGistState *state,
 		/*
 		 * Bail out if query cancel is pending.  We must have this somewhere
 		 * in the loop since a broken opclass could produce an infinite
-		 * picksplit loop.
+		 * picksplit loop.  However, because we'll be holding buffer lock(s)
+		 * after the first iteration, ProcessInterrupts() wouldn't be able to
+		 * throw a cancel error here.  Hence, if we see that an interrupt is
+		 * pending, break out of the loop and deal with the situation below.
+		 * Set result = false because we must restart the insertion if the
+		 * interrupt isn't a query-cancel-or-die case.
 		 */
-		CHECK_FOR_INTERRUPTS();
+		if (INTERRUPTS_PENDING_CONDITION())
+		{
+			result = false;
+			break;
+		}
 
 		if (current.blkno == InvalidBlockNumber)
 		{
@@ -2048,7 +2105,7 @@ spgdoinsert(Relation index, SpGistState *state,
 			int			nToSplit,
 						sizeToSplit;
 
-			leafTuple = spgFormLeafTuple(state, heapPtr, leafDatum, isnull);
+			leafTuple = spgFormLeafTuple(state, heapPtr, leafDatums, isnulls);
 			if (leafTuple->size + sizeof(ItemIdData) <=
 				SpGistPageGetFreeSpace(current.page, 1))
 			{
@@ -2102,16 +2159,20 @@ spgdoinsert(Relation index, SpGistState *state,
 			 * spgAddNode and spgSplitTuple cases will loop back to here to
 			 * complete the insertion operation.  Just in case the choose
 			 * function is broken and produces add or split requests
-			 * repeatedly, check for query cancel.
+			 * repeatedly, check for query cancel (see comments above).
 			 */
 	process_inner_tuple:
-			CHECK_FOR_INTERRUPTS();
+			if (INTERRUPTS_PENDING_CONDITION())
+			{
+				result = false;
+				break;
+			}
 
 			innerTuple = (SpGistInnerTuple) PageGetItem(current.page,
 														PageGetItemId(current.page, current.offnum));
 
-			in.datum = datum;
-			in.leafDatum = leafDatum;
+			in.datum = datums[spgKeyColumn];
+			in.leafDatum = leafDatums[spgKeyColumn];
 			in.level = level;
 			in.allTheSame = innerTuple->allTheSame;
 			in.hasPrefix = (innerTuple->prefixSize > 0);
@@ -2145,7 +2206,9 @@ spgdoinsert(Relation index, SpGistState *state,
 				if (out.resultType == spgAddNode)
 					elog(ERROR, "cannot add a node to an allTheSame inner tuple");
 				else if (out.resultType == spgMatchNode)
-					out.result.matchNode.nodeN = random() % innerTuple->nNodes;
+					out.result.matchNode.nodeN =
+						pg_prng_uint64_range(&pg_global_prng_state,
+											 0, innerTuple->nNodes - 1);
 			}
 
 			switch (out.resultType)
@@ -2160,9 +2223,58 @@ spgdoinsert(Relation index, SpGistState *state,
 					/* Replace leafDatum and recompute leafSize */
 					if (!isnull)
 					{
-						leafDatum = out.result.matchNode.restDatum;
-						leafSize = SGLTHDRSZ + sizeof(ItemIdData) +
-							SpGistGetTypeSize(&state->attLeafType, leafDatum);
+						leafDatums[spgKeyColumn] = out.result.matchNode.restDatum;
+						leafSize = SpGistGetLeafTupleSize(leafDescriptor,
+														  leafDatums, isnulls);
+						leafSize += sizeof(ItemIdData);
+					}
+
+					/*
+					 * Check new tuple size; fail if it can't fit, unless the
+					 * opclass says it can handle the situation by suffixing.
+					 *
+					 * However, the opclass can only shorten the leaf datum,
+					 * which may not be enough to ever make the tuple fit,
+					 * since INCLUDE columns might alone use more than a page.
+					 * Depending on the opclass' behavior, that could lead to
+					 * an infinite loop --- spgtextproc.c, for example, will
+					 * just repeatedly generate an empty-string leaf datum
+					 * once it runs out of data.  Actual bugs in opclasses
+					 * might cause infinite looping, too.  To detect such a
+					 * loop, check to see if we are making progress by
+					 * reducing the leafSize in each pass.  This is a bit
+					 * tricky though.  Because of alignment considerations,
+					 * the total tuple size might not decrease on every pass.
+					 * Also, there are edge cases where the choose method
+					 * might seem to not make progress for a cycle or two.
+					 * Somewhat arbitrarily, we allow up to 10 no-progress
+					 * iterations before failing.  (This limit should be more
+					 * than MAXALIGN, to accommodate opclasses that trim one
+					 * byte from the leaf datum per pass.)
+					 */
+					if (leafSize > SPGIST_PAGE_CAPACITY)
+					{
+						bool		ok = false;
+
+						if (state->config.longValuesOK && !isnull)
+						{
+							if (leafSize < bestLeafSize)
+							{
+								ok = true;
+								bestLeafSize = leafSize;
+								numNoProgressCycles = 0;
+							}
+							else if (++numNoProgressCycles < 10)
+								ok = true;
+						}
+						if (!ok)
+							ereport(ERROR,
+									(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+									 errmsg("index row size %zu exceeds maximum %zu for index \"%s\"",
+											leafSize - sizeof(ItemIdData),
+											SPGIST_PAGE_CAPACITY - sizeof(ItemIdData),
+											RelationGetRelationName(index)),
+									 errhint("Values larger than a buffer page cannot be indexed.")));
 					}
 
 					/*
@@ -2170,14 +2282,6 @@ spgdoinsert(Relation index, SpGistState *state,
 					 * "current" (which might reference an existing child
 					 * tuple, or might be invalid to force us to find a new
 					 * page for the tuple).
-					 *
-					 * Note: if the opclass sets longValuesOK, we rely on the
-					 * choose function to eventually shorten the leafDatum
-					 * enough to fit on a page.  We could add a test here to
-					 * complain if the datum doesn't get visibly shorter each
-					 * time, but that could get in the way of opclasses that
-					 * "simplify" datums in a way that doesn't necessarily
-					 * lead to physical shortening on every cycle.
 					 */
 					break;
 				case spgAddNode:
@@ -2228,5 +2332,21 @@ spgdoinsert(Relation index, SpGistState *state,
 		UnlockReleaseBuffer(parent.buffer);
 	}
 
-	return true;
+	/*
+	 * We do not support being called while some outer function is holding a
+	 * buffer lock (or any other reason to postpone query cancels).  If that
+	 * were the case, telling the caller to retry would create an infinite
+	 * loop.
+	 */
+	Assert(INTERRUPTS_CAN_BE_PROCESSED());
+
+	/*
+	 * Finally, check for interrupts again.  If there was a query cancel,
+	 * ProcessInterrupts() will be able to throw the error here.  If it was
+	 * some other kind of interrupt that can just be cleared, return false to
+	 * tell our caller to retry.
+	 */
+	CHECK_FOR_INTERRUPTS();
+
+	return result;
 }

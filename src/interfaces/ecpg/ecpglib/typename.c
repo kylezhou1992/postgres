@@ -4,12 +4,11 @@
 #include "postgres_fe.h"
 
 #include "catalog/pg_type_d.h"
-
-#include "ecpgtype.h"
 #include "ecpglib.h"
-#include "extern.h"
-#include "sqltypes.h"
+#include "ecpglib_extern.h"
+#include "ecpgtype.h"
 #include "sql3types.h"
+#include "sqltypes.h"
 
 /*
  * This function is used to generate the correct type names.
@@ -48,6 +47,8 @@ ecpg_type_name(enum ECPGttype typ)
 			return "bool";
 		case ECPGt_varchar:
 			return "varchar";
+		case ECPGt_bytea:
+			return "bytea";
 		case ECPGt_char_variable:
 			return "char";
 		case ECPGt_decimal:
@@ -130,11 +131,12 @@ sqlda_dynamic_type(Oid type, enum COMPAT_MODE compat)
 		case INTERVALOID:
 			return ECPGt_interval;
 		case INT8OID:
-#ifdef HAVE_LONG_LONG_INT_64
-			return ECPGt_long_long;
-#endif
-#ifdef HAVE_LONG_INT_64
+#if SIZEOF_LONG == 8
 			return ECPGt_long;
+#elif SIZEOF_LONG_LONG == 8
+			return ECPGt_long_long;
+#else
+#error "cannot find integer type of the same size as INT8OID"
 #endif
 			/* Unhandled types always return a string */
 		default:
